@@ -16,3 +16,9 @@ bin-release/
 # Project files, i.e. `.project`, `.actionScriptProperties` and `.flexProperties`
 # should NOT be excluded as they contain compiler settings and other important
 # information for Eclipse / Flash Builder.
+
+# SolidWorks 临时锁定文件
+~$*
+
+# 原始大体积 STEP（上板 55MB 超 Gitee 单文件 50MB 限制），以 PCB模型.zip 形式入库
+04-外壳设计/PCB模型/*.step
