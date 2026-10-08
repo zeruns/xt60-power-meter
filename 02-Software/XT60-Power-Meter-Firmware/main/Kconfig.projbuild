@@ -1,0 +1,45 @@
+# XT60 功率计应用层可调参数
+#
+# 查看 / 修改方式：
+#   idf.py menuconfig → 组件配置 → XT60 功率计应用配置
+# 保存后直接 idf.py build 即生效（menuconfig 会写入 sdkconfig）。
+#
+# 注意：本文件里的 default 只在"生成全新 sdkconfig"时起作用。
+#       若 sdkconfig 已存在，改这里的 default 不会影响已有配置，
+#       必须删除 sdkconfig 重新生成才会采用新的 default。
+#
+# app_tasks.c 直接使用 CONFIG_APP_SYS_MONITOR_* 宏，不再设本地默认值。
+
+menu "XT60 功率计应用配置"
+
+    config APP_SYS_MONITOR_PERIOD_MS
+        int "系统巡检输出周期（毫秒）"
+        range 500 60000
+        default 5000
+        help
+            巡检任务每隔这么久打印一次系统状态、内存水位与测量数据计数。
+            联调阶段可以调小（如 1000）以观察得更细致；
+            正式发布时可以调大或关闭该任务以减少日志量。
+
+    config APP_SYS_MONITOR_STACK
+        int "系统巡检任务栈大小（字节）"
+        range 2048 16384
+        default 4096
+        help
+            注意单位是「字节」而不是 FreeRTOS 文档常说的「字」
+            （ESP-IDF 的 StackType_t 是 uint8_t，栈相关参数统一按字节计）。
+
+            这个任务里会用到 snprintf 与日志格式化，栈需求比一般任务大。
+            实测：栈设为 3072 字节时，高水位显示仅剩余 824 字节（约 27%），
+            偏紧；因此默认值提高到 4096 字节，留出更安全的余量。
+            运行时可在日志里查看"巡检任务栈：剩余 X 字节 / 共 Y 字节"，
+            若剩余不足 25% 就继续调大。
+
+    config APP_SYS_MONITOR_PRIO
+        int "系统巡检任务优先级"
+        range 1 10
+        default 3
+        help
+            必须低于所有业务任务。它是观察者，绝不能抢占业务任务。
+
+endmenu
