@@ -7,7 +7,8 @@
  *   AIN1 —— 电流，PGA 增益 16x，前端 1mΩ 四端开尔文分流器
  * 引脚见 board_pins.h 的 BOARD_PIN_ADC_* 与 BOARD_PIN_ADC_CLK。
  *
- * 接口骨架，尚未实现。
+ * 实现要点见 src/ads131m02.c 文件头：SPI 时序（mode 1）、本板无片选(CS)的处理方式、
+ * 时钟来源 R27/R29 的说明，以及完整的「上板调试要点」。
  */
 #pragma once
 

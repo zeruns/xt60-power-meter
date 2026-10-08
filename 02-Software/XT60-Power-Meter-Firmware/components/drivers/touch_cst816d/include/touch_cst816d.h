@@ -5,7 +5,10 @@
  * 引脚：BOARD_PIN_TP_SCL / BOARD_PIN_TP_SDA / BOARD_PIN_TP_INT。
  * 中断 IO46 为 strapping 脚，初始化时须避免将其拉低。
  *
- * 接口骨架，尚未实现。
+ * 解析依据（已与厂商 STM32 参考例程 Touch_Test() 逐行核对一致）：
+ *   一次从寄存器 0 起连读 8 字节：
+ *   buf[3]==0x80 判按下；x = buf[4]；y = ((buf[5] & 0x0F) << 8) | buf[6]。
+ * 详见 src/touch_cst816d.c（含「上板调试要点」）。
  */
 #pragma once
 

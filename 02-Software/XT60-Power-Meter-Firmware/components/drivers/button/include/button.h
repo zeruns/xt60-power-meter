@@ -5,7 +5,11 @@
  * IO0 为 strapping 脚：复位期间须保持高电平，按住该键复位会进入下载模式，
  * 因此驱动须在启动早期忽略该键（仅记录，不触发业务动作）。
  *
- * 接口骨架，尚未实现。
+ * 实现要点（详见 src/button.c）：
+ *   用官方 esp_driver_gpio + esp_timer 周期轮询消抖，未使用托管组件
+ *   espressif/button（其 button_event_t 与本文件同名类型冲突，且需为
+ *   IO0 的 strapping 特性定制安全策略，理由见 src/button.c 文件头）。
+ * 注意：本驱动只提供事件回调，没有可供查询的读取接口。
  */
 #pragma once
 
