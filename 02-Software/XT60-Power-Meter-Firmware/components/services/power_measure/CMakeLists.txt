@@ -1,3 +1,4 @@
 idf_component_register(
+    SRCS "src/power_calc.c"
     INCLUDE_DIRS "include"
-    REQUIRES esp_driver_gpio ads131m02 data_store)
+    REQUIRES ads131m02 data_store)
