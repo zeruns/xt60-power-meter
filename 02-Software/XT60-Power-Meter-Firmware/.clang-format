@@ -1,0 +1,62 @@
+# ============================================================
+# XT60 功率计固件 —— clang-format 代码格式化规则
+#
+# 风格对齐 ESP-IDF 官方编码规范：
+#   4 空格缩进（不使用 Tab）、行宽上限 100 列、指针符号紧贴变量名、
+#   函数左花括号独占一行、控制语句左花括号同行（Linux 内核风格）
+#
+# Trae / VS Code 的 clangd 扩展会从被格式化文件所在目录逐级向上查找本文件，
+# 因此放在工程根目录即可对 main/ 与 components/ 全部源码生效。
+# ============================================================
+---
+Language:     Cpp
+BasedOnStyle: LLVM
+
+# ---------- 缩进与行宽 ----------
+IndentWidth:             4
+TabWidth:                4
+UseTab:                  Never
+ColumnLimit:             100
+ContinuationIndentWidth: 4
+
+# ---------- 指针/引用：紧贴变量名（ESP-IDF 风格 char *p） ----------
+PointerAlignment:      Right
+DerivePointerAlignment: false
+
+# ---------- 花括号 ----------
+# Linux：函数左花括号独占一行，if/for/while 等控制语句左花括号同行。
+# 这是 ESP-IDF 源码的实际风格。
+BreakBeforeBraces: Linux
+
+# ---------- 函数与代码块 ----------
+AllowShortFunctionsOnASingleLine: Inline
+AllowShortIfStatementsOnASingleLine: false
+AllowShortLoopsOnASingleLine: false
+AllowShortBlocksOnASingleLine: Never
+AllowShortCaseLabelsOnASingleLine: false
+IndentCaseLabels: false
+KeepEmptyLinesAtTheStartOfBlocks: false
+MaxEmptyLinesToKeep: 2
+
+# ---------- 空格 ----------
+SpaceAfterCStyleCast:   false
+SpaceBeforeParens:      ControlStatements
+SpaceAfterLogicalNot:   false
+SpacesBeforeTrailingComments: 2
+# 保留 { .field = value } 的设计ated initializer 写法（不加紧贴式 {.field=value}）
+Cpp11BracedListStyle:   false
+
+# ---------- 对齐 ----------
+# 引脚映射表依赖「跨空行/跨注释仍对齐」，否则会被切成多个对齐块而失去表格感
+AlignConsecutiveMacros:      AcrossEmptyLinesAndComments
+AlignConsecutiveAssignments: false
+AlignConsecutiveDeclarations: false
+AlignTrailingComments:       true
+
+# ---------- include ----------
+# 由人工维护分组顺序，格式化时不重排、不合并
+SortIncludes:  false
+IncludeBlocks: Preserve
+
+# ---------- 注释 ----------
+ReflowComments: true
