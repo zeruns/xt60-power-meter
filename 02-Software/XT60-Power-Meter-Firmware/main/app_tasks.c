@@ -6,6 +6,7 @@
 
 #include "data_store.h"
 #include "system_state.h"
+#include "ui.h"
 
 #include "esp_log.h"
 #include "esp_system.h"
@@ -91,6 +92,23 @@ static void task_sys_monitor(void *arg)
 
 esp_err_t app_tasks_start(void)
 {
+    /* ---- UI 任务 ----
+     * 门控条件：显示链路（lcd_nv3030b + lvgl_port）必须初始化成功。
+     * 走到这里说明启动表与硬件自检都已完成（见 app_init.c），
+     * 但 UI 只依赖显示链路，故仍单独检查 SYSTEM_FAULT_LCD：
+     *   · lvgl_port 未初始化时调用任何 LVGL API 都是未定义行为，必须先查故障位；
+     *   · 触摸故障（SYSTEM_FAULT_TOUCH）不阻止 UI 启动——界面仍可显示，只是不能触控。
+     * 注意：界面本身是在 ui 任务内部构建的（不在 app_main 的栈上），原因见 ui.c。 */
+    if ((system_state_get_fault_mask() & SYSTEM_FAULT_LCD) == 0) {
+        esp_err_t err = ui_init();
+        if (err != ESP_OK) {
+            /* UI 启动失败不阻断测量等业务任务，降级继续（无界面运行） */
+            ESP_LOGE(TAG, "UI 启动失败: %s -> 无界面运行", esp_err_to_name(err));
+        }
+    } else {
+        ESP_LOGW(TAG, "显示链路故障，跳过 UI 启动");
+    }
+
     /* xTaskCreatePinnedToCore 的最后一个参数就是绑定的核编号。
      * 相比 xTaskCreate（由调度器任意分配），显式绑核才能保证
      * "测量核不被通信任务打扰"这一设计目标。 */

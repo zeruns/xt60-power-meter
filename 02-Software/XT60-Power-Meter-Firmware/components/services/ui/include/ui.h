@@ -10,7 +10,8 @@
  *
  * 数据只通过 middleware/data_store 的快照读取，不直接访问驱动层。
  *
- * 接口骨架，尚未实现。
+ * 当前阶段：用 LVGL 官方 widgets demo 验证显示与触控；
+ *   正式界面就绪后替换为 src/screens/ 下的界面构建。
  */
 #pragma once
 

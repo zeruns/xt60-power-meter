@@ -1,4 +1,6 @@
 idf_component_register(
     SRCS "main.c" "app_init.c" "app_tasks.c"
     INCLUDE_DIRS "."
-    REQUIRES bsp event_bus data_store status_led buzzer system_state settings device_ctrl)
+    REQUIRES bsp event_bus data_store status_led buzzer system_state settings device_ctrl
+            button battery_adc aht20 imu_sc7a20h ads131m02
+            lcd_nv3030b touch_cst816d lvgl_port ui)
