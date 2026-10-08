@@ -18,6 +18,7 @@
 │ middleware/      中间件 / 适配层                     │
 │                  event_bus  data_store               │
 │                  lvgl_port  wifi_manager  web_console│
+│                  lvgl（LVGL 9.6 源码，已 vendor 入库） │
 ├─────────────────────────────────────────────────────┤
 │ drivers/         设备驱动层（每个外设一个组件）        │
 │                  status_led  ads131m02  lcd_nv3030b  │
@@ -25,6 +26,10 @@
 │                  buzzer  battery_adc  button         │
 ├─────────────────────────────────────────────────────┤
 │ bsp/             板级支持层（引脚唯一真相源）          │
+├─────────────────────────────────────────────────────┤
+│ 外部依赖：                                        │
+│   vendor 入库   components/middleware/lvgl（LVGL 源码）│
+│   组件管理器     managed_components/（esp_lcd_spd2010）│
 ├─────────────────────────────────────────────────────┤
 │ ESP-IDF v5.5 · FreeRTOS · ESP32-S3                   │
 └─────────────────────────────────────────────────────┘
@@ -44,6 +49,20 @@
 
 1. **业务代码里不得出现 `gpio_set_level` / `spi_device_*` / `i2c_master_*` 等裸外设调用**，必须经 `drivers` 封装；
 2. **引脚编号只允许出现在 `components/bsp/include/board_pins.h`**，其他文件一律引用 `BOARD_PIN_*` 宏。
+
+### 外部依赖的两种归属
+
+工程里的第三方代码只有两类，必须分清，否则容易踩「重名冲突 / 改了不生效」的坑：
+
+| 类别 | 位置 | 是否入库 | 升级方式 | 现有成员 |
+|---|---|---|---|---|
+| **vendor 入库** | `components/middleware/lvgl/` | **是**（纳入版本管理） | 手工替换整树 + 回看 Kconfig | LVGL 9.6.0~1 |
+| **组件管理器托管** | `managed_components/`（`idf_component.yml` 声明） | 否（`.gitignore` 已忽略） | 改 `idf_component.yml` 版本号后 `idf.py reconfigure` | `espressif/esp_lcd_spd2010`（及其依赖 `espressif/cmake_utilities`） |
+
+规则：
+- 一个组件**只能属于一类**。既然 LVGL 已 vendor 入库，其它组件就**不允许**再声明 `lvgl/lvgl` 依赖，
+  否则组件管理器会拉一份同名副本，与本地源码冲突（且本地改动会被覆盖）。
+- 托管组件的版本记录在 `dependencies.lock`（入库），保证换机器能复现同一版本。
 
 ---
 
@@ -103,24 +122,71 @@ SYSTEM_FAULT_CRITICAL_MASK = SYSTEM_FAULT_ADC | SYSTEM_FAULT_INFRA
 
 ### 初始化表
 
-`main/app_init.c` 用一张表描述启动步骤，每项登记自己的故障位：
+`main/app_init.c` 用一张表描述启动步骤，每项登记自己的故障位（下表为真实内容，共 15 项）：
 
 ```c
 static const init_step_t s_boot_steps[] = {
-    { "event_bus",    event_bus_init,    SYSTEM_FAULT_INFRA   },
-    { "status_led",   status_led_init,   SYSTEM_FAULT_LED     },
-    { "system_state", system_state_init, SYSTEM_FAULT_INFRA   },
-    { "device_ctrl",  device_ctrl_init,  SYSTEM_FAULT_LED     },
-    { "data_store",   data_store_init,   SYSTEM_FAULT_STORAGE },
+    /* 软件基础设施 */
+    { "event_bus",     event_bus_init,     SYSTEM_FAULT_INFRA   },  /* 关键 */
+    { "status_led",    status_led_init,    SYSTEM_FAULT_LED     },
+    { "buzzer",        buzzer_init,        SYSTEM_FAULT_BUZZER  },
+    { "system_state",  system_state_init,  SYSTEM_FAULT_INFRA   },  /* 关键 */
+    { "settings",      settings_init,      SYSTEM_FAULT_STORAGE },
+    { "device_ctrl",   device_ctrl_init,   SYSTEM_FAULT_LED     },
+    /* 数据通道 */
+    { "data_store",    data_store_init,    SYSTEM_FAULT_INFRA   },  /* 关键 */
+    /* 传感器与测量前端 */
+    { "button",        button_init,        SYSTEM_FAULT_BUTTON  },
+    { "battery_adc",   battery_adc_init,   SYSTEM_FAULT_BATTERY },
+    { "aht20",         aht20_init,         SYSTEM_FAULT_ENV     },
+    { "imu_sc7a20h",   imu_sc7a20h_init,   SYSTEM_FAULT_IMU     },
+    { "ads131m02",     ads131m02_init,     SYSTEM_FAULT_ADC     },  /* 关键 */
+    /* 显示与交互 */
+    { "lcd_nv3030b",   lcd_nv3030b_init,   SYSTEM_FAULT_LCD     },
+    { "touch_cst816d", touch_cst816d_init, SYSTEM_FAULT_TOUCH   },
+    { "lvgl_port",     lvgl_port_init,     SYSTEM_FAULT_LCD     },
 };
 ```
 
 容错规则：
 
-- **关键步骤失败**（故障位命中 `CRITICAL_MASK`）→ 跳过后续关键步骤，但**继续执行非关键步骤**（尽量保住屏幕 / WiFi 这些"救回通道"），最终进入 `FAULT` 状态且**不复位**；
+- **关键步骤失败**（故障位命中 `CRITICAL_MASK`，即 `SYSTEM_FAULT_ADC` 与 `SYSTEM_FAULT_INFRA`）→ 跳过后续关键步骤，但**继续执行非关键步骤**（尽量保住屏幕 / WiFi 这些"救回通道"），最终进入 `FAULT` 状态且**不复位**；
 - **非关键步骤失败** → 只登记故障位，系统降级继续运行。
 
-顺序约束：`event_bus` 必须最先（其他模块靠它通信）；`status_led` 必须早于 `system_state`（状态机初始化时会广播状态，`device_ctrl` 收到后要立刻设置指示灯）。
+顺序约束（四条，改表时必须保持）：
+
+1. `event_bus` 最先（其他模块靠它通信）；
+2. `status_led` 早于 `system_state` / `device_ctrl`（状态机初始化会广播状态，`device_ctrl` 收到后要立刻设置指示灯）；
+3. `buzzer` / `settings` 早于 `device_ctrl`（它初始化时会按当前状态同步输出并读取已保存的用户偏好）；
+4. 传感器与测量前端早于显示与交互（先把"数据怎么来"准备好，再启动"数据怎么显示"）。
+
+### 启动自检（阶段二）
+
+初始化的"成功"只代表寄存器配置写下去了，**不代表器件真能出数据**。典型反例：
+I2C 器件地址对但时序不对（能应答、读不出有效数据）；SPI ADC 的输入时钟缺失
+（配置全成功，但 DRDY# 永远不来）。
+
+因此在初始化表跑完之后、进入运行态之前，`app_init.c` 会再跑一轮**硬件自检**：
+对每个外设**真读一次数据**。
+
+| 自检项 | 探测方式 | 故障位 | 关键 |
+|---|---|---|---|
+| `ads131m02` | `ads131m02_read()` 能读到一帧 | `SYSTEM_FAULT_ADC` | **是** |
+| `aht20` | `aht20_read()` 且读数落在合理量程内 | `SYSTEM_FAULT_ENV` | 否 |
+| `imu_sc7a20h` | `imu_sc7a20h_get_orientation()` | `SYSTEM_FAULT_IMU` | 否 |
+| `battery_adc` | `battery_adc_read()` | `SYSTEM_FAULT_BATTERY` | 否 |
+| `touch_cst816d` | `touch_cst816d_read()`（此时未按下，未按下也算通过） | `SYSTEM_FAULT_TOUCH` | 否 |
+
+按键不在自检表内：驱动只提供事件回调，没有可供查询的读取接口。
+初始化阶段已失败的模块会被自检跳过（不再重复报同一个故障）。
+
+判定与听觉反馈：
+
+- **关键项失败** → 登记故障位、**不进入运行态**（状态保持 `FAULT`）、**不短鸣**；
+- **非关键项失败** → 登记故障位、以 `DEGRADED` 进入运行态、**不短鸣**；
+- **全部通过** → 进入运行态并**短鸣一声**。
+
+短鸣的语义被刻意定义为"全部就绪"：降级时鸣一声会误导用户。降级项由自检日志与指示灯双闪体现。
 
 ---
 
@@ -303,14 +369,72 @@ gcc -std=c11 -Wall -Wextra -I components/services/power_measure/include \
 
 | 外设 | 建议 | 原因 |
 |---|---|---|
-| LCD（NV3030B，QSPI） | 用 ESP32-S3 的 LCD 外设 + `esp_lcd`，**不要用 GPIO 模拟** | 硬件加速，省 CPU；LVGL 官方有现成后端 |
-| ADS131M02（SPI） | 独占 SPI2 | 测量链路不能被其他设备插入事务打断 |
+| LCD（NV3030B，QSPI） | 用 ESP32-S3 的 LCD 外设 + `esp_lcd`（占用 **SPI2**），**不要用 GPIO 模拟** | 硬件加速，省 CPU；LVGL 官方有现成后端 |
+| ADS131M02（SPI） | 独占 **SPI3** | 测量链路不能被其他设备插入事务打断。**为什么不是 SPI2**：SPI2 已被 LCD QSPI 占用，而 ESP32-S3 的一个 SPI 外设同一时刻只能映射一组引脚（LCD 在 IO15~18、ADC 在 IO9~12，无法共存）；「独占」的本意是"不被打断"，不是字面上的外设编号 |
 | 触摸 CST816D | I2C（IO5/IO6） | 独立总线，避免与传感器互相阻塞 |
 | AHT20 / SC7A20HTR | I2C（IO21/IO47） | 同一条总线，注意地址不冲突（0x38 / 0x19） |
 
 ### JTAG 占用
 
 IO19/IO20 是原生 USB-Serial/JTAG 的数据线。**调试期间这两个脚不能挪作他用**。
+
+### QSPI 面板命令封装（踩坑记录，改动显示驱动前必读）
+
+本屏的 QSPI 命令字是 32 位，且**必须由驱动自己把 opcode 打包进去**：
+
+```
+线上 32bit 命令字 = (opcode << 24) | (cmd << 8)
+     写命令 opcode = 0x02
+     写显存 opcode = 0x32
+```
+
+关键事实：`esp_lcd` 对 32 位命令**只做字节序反转**（`spi_lcd_prepare_cmd_buffer()`），
+**不会替你补 opcode**。所以直接 `esp_lcd_panel_io_tx_param(io, 0x2A, ...)` 发出去的是
+`00 00 00 2A`，面板会当作无效命令全部忽略 —— 连 `SLPOUT(0x11)` / `DISPON(0x29)`
+都不生效，表现为**整屏黑**（背光正常但没有任何内容）。
+
+本工程曾因此长期黑屏。现在该屏统一走官方组件 `espressif/esp_lcd_spd2010`，
+opcode 封装与约 200 条分页式初始化序列都由组件负责，**驱动里不要再手写命令表**。
+
+另有两条相关约束：
+
+- `spi_bus_config_t` 中 `mosi_io_num ≡ data0_io_num`、`miso_io_num ≡ data1_io_num`、
+  `quadwp_io_num ≡ data2_io_num`、`quadhd_io_num ≡ data3_io_num` 共用**匿名联合**。
+  QSPI 场景下只能写 `sclk_io_num / data0~3_io_num / max_transfer_sz`；
+  若同时写了 `quadwp/quadhd = -1`，后写的会覆盖 `data2/data3`，
+  等于只配了 2 根数据线（同样出不了图）。
+- `esp_lcd` 的颜色数据传输是**异步**的（内部 `spi_device_queue_trans`，
+  `spi_device_release_bus()` 不等 DMA 结束）。LVGL 适配层必须在
+  `lcd_nv3030b_register_flush_done_cb()` 的回调里才调 `lv_display_flush_ready()`，
+  否则 LVGL 会与 DMA 抢同一块绘图缓冲，表现为撕裂 / 花屏 / 整屏黑。
+
+### LVGL 与显示子系统的引入方式
+
+分工（详见 §1「外部依赖的两种归属」）：
+
+| 组件 | 职责 |
+|---|---|
+| `components/middleware/lvgl/` | LVGL 9.6 源码本体，**已 vendor 入库** |
+| `components/drivers/lcd_nv3030b/` | QSPI 总线 + 面板（官方 `esp_lcd_spd2010`）+ 背光 + 刷新完成回调 |
+| `components/drivers/touch_cst816d/` | 触摸读点（解析与厂商 STM32 参考例程一致） |
+| `components/middleware/lvgl_port/` | 注册显示/输入设备、心跳节拍、线程安全锁 |
+| `components/services/ui/` | 界面本身（当前用官方 widgets demo 验证） |
+
+**升级 LVGL 的步骤**（vendor 方式，不能只改版本号）：
+
+1. 临时在某个组件的 `idf_component.yml` 里声明目标版本（如 `lvgl/lvgl: "9.6.0~1"`）；
+2. `idf.py reconfigure`，让组件管理器把它下载到 `managed_components/lvgl__lvgl/`；
+3. 把该目录整树复制到 `components/middleware/lvgl/`，**再删掉临时依赖**与 `managed_components/` 下的副本
+   （不删会重名冲突）；
+4. 打开新版本自带的 `components/middleware/lvgl/Kconfig`，**逐项核对配置符号名是否变化**，
+   同步改 `sdkconfig.defaults`。已有前车之鉴：9.6 把内存池从 `LV_MEM_SIZE_KILOBYTES`（KB）
+   改成了 `LV_MEM_SIZE`（字节），沿用旧名会得到「DEPRECATED」且**不生效**；
+5. 核对代码用到的 API 未变（`lv_display_*` / `lv_indev_*` / `lv_demo_widgets` 等）；
+6. 删掉 `sdkconfig` 让它按 `sdkconfig.defaults` 重新生成，再全量编译。
+
+**界面构建必须在 UI 任务里做**（`services/ui`），不能放在 `app_main` 的任务上：
+`CONFIG_ESP_MAIN_TASK_STACK_SIZE` 只有 3584 字节，而 `lv_demo_widgets()` 这类构建
+会递归创建大量对象，很容易把主任务栈吃满导致溢出复位。
 
 ---
 
@@ -322,7 +446,9 @@ components/
 ├── bsp/                  引脚定义（board_pins.h）与板级初始化
 ├── drivers/<外设>/       每外设一组件：CMakeLists.txt + include/ + src/
 ├── middleware/           事件总线、数据仓库、LVGL 适配、WiFi、网页
+│   └── lvgl/             LVGL 9.6 源码（vendor 入库，组件名 lvgl）
 └── services/             状态机、测量、设备控制、配置、UI
+managed_components/       组件管理器托管的外部依赖（不入库、由 lock 复现）
 test/
 └── host/                 纯逻辑主机测试
 docs/                     架构与引脚文档
@@ -346,3 +472,17 @@ version.txt               固件版本号
 | 引脚 | `BOARD_PIN_*` | `BOARD_PIN_BUZZER` |
 
 代码风格由根目录 `.clang-format` 统一（4 空格缩进、100 列、指针右对齐、函数花括号独占一行）。
+
+---
+
+## 12. 后续里程碑（当前已知缺口）
+
+按优先级排列，均**尚未实现**，接口骨架已留好：
+
+| 缺口 | 现状 | 影响 |
+|---|---|---|
+| `services/power_measure` | 只有 `include/power_measure.h`，无实现 | **测量链路尚不完整**：`data_store` 目前没有写入者，界面/网页拿不到电压电流功率。启动自检只能验证 `ads131m02_read()` 能读到原始码值，还不构成完整测量 |
+| `middleware/wifi_manager` | 只有头文件 | 尚无联网与 OTA 通道（故障救回依赖它） |
+| `middleware/web_console` | 只有头文件 | 尚无网页控制台 |
+| 正式 UI | `services/ui` 当前跑 LVGL 官方 widgets demo | `src/screens/` 下的真实界面待建 |
+| IMU 自动转屏 | `imu_sc7a20h` 已能读朝向，`lcd_nv3030b_set_orientation()` 已就绪 | 两者的联动逻辑待接
