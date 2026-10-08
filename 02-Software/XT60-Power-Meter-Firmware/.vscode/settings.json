@@ -1,0 +1,34 @@
+{
+    "idf.currentSetup": "D:/Espressif/frameworks/esp-idf-v5.5.2/",
+    "idf.openOcdConfigs": [
+      "board/esp32s3-builtin.cfg"
+    ],
+    "idf.port": "COM6",
+    "idf.customExtraVars": {
+      "IDF_TARGET": "esp32s3"
+    },
+    "idf.flashType": "UART",
+
+    "clangd.path": "D:\\Espressif\\tools\\esp-clang\\esp-19.1.2_20250312\\esp-clang\\bin\\clangd.exe",
+    "clangd.arguments": [
+      "--background-index",
+      "--query-driver=**",
+      "--compile-commands-dir=e:\\Electronic\\80.Project\\XT60-Power-Meter\\02-Software\\XT60-Power-Meter-Firmware\\build"
+    ],
+
+    "[c]": {
+      "editor.defaultFormatter": "llvm-vs-code-extensions.vscode-clangd"
+    },
+    "[cpp]": {
+      "editor.defaultFormatter": "llvm-vs-code-extensions.vscode-clangd"
+    },
+    "editor.formatOnSave": false,
+
+    "editor.tabSize": 4,
+    "editor.insertSpaces": true,
+    "editor.detectIndentation": false,
+    "files.trimTrailingWhitespace": true,
+    "files.insertFinalNewline": true,
+
+    "C_Cpp.intelliSenseEngine": "disabled"
+}
