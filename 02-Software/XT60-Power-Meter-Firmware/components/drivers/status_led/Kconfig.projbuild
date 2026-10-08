@@ -1,0 +1,76 @@
+# 系统状态指示灯的可调参数
+#
+# 查看 / 修改方式：
+#   idf.py menuconfig → 组件配置 → 系统状态指示灯（SYS_LED）
+# 保存后直接 idf.py build 即生效（menuconfig 会写入 sdkconfig）。
+#
+# 注意：本文件里的 default 只在"生成全新 sdkconfig"时起作用。
+#       若 sdkconfig 已存在，改这里的 default 不会影响已有配置，
+#       必须删除 sdkconfig 重新生成才会采用新的 default。
+#
+# 驱动代码（status_led.c）直接使用 CONFIG_STATUS_LED_* 宏，不再设本地默认值，
+# 因此改动只有一个入口，不会出现"改了源码里的值却没效果"的情况。
+#
+# 四种闪烁模式的语义（与系统状态对应）：
+#   常亮        ← 初始化中（INIT）
+#   慢闪 1Hz    ← 正常运行（RUNNING）
+#   快闪 5Hz    ← 异常（FAULT）
+#   双闪+长灭   ← 降级运行（DEGRADED）
+
+menu "系统状态指示灯（SYS_LED）"
+
+    config STATUS_LED_SOLID_HOLD_MS
+        int "常亮模式的刷新周期（毫秒）"
+        range 100 5000
+        default 1000
+        help
+            指示灯在"常亮"模式下每隔这么久重新点亮一次。
+            视觉上就是一直亮着，调这个值没有实际观感差异，
+            保留可配置只是为了与"步进式闪烁"的实现保持一致。
+
+    config STATUS_LED_SLOW_ON_MS
+        int "慢闪：点亮时长（毫秒）"
+        range 50 5000
+        default 500
+        help
+            正常运行状态下的闪烁节奏。默认 500ms 亮 + 500ms 灭 = 1Hz。
+
+    config STATUS_LED_SLOW_OFF_MS
+        int "慢闪：熄灭时长（毫秒）"
+        range 50 5000
+        default 500
+
+    config STATUS_LED_FAST_ON_MS
+        int "快闪：点亮时长（毫秒）"
+        range 20 1000
+        default 100
+        help
+            异常状态下的闪烁节奏。默认 100ms 亮 + 100ms 灭 = 5Hz，
+            与慢闪有明显区分，便于现场一眼判断故障。
+
+    config STATUS_LED_FAST_OFF_MS
+        int "快闪：熄灭时长（毫秒）"
+        range 20 1000
+        default 100
+
+    config STATUS_LED_DEGRADED_ON_MS
+        int "降级双闪：单次点亮时长（毫秒）"
+        range 20 1000
+        default 120
+        help
+            降级运行（部分功能失效但仍可测量）时的提示节奏：
+            连续两次短闪，然后一段长静默，以此与慢闪/快闪区分。
+
+    config STATUS_LED_DEGRADED_OFF_MS
+        int "降级双闪：两次短闪之间的熄灭时长（毫秒）"
+        range 20 1000
+        default 120
+
+    config STATUS_LED_DEGRADED_GAP_MS
+        int "降级双闪：周期末长静默时长（毫秒）"
+        range 100 5000
+        default 820
+        help
+            这段较长的静默是"降级"与"慢闪"的关键视觉差异，不宜设得太短。
+
+endmenu
