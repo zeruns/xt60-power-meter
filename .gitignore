@@ -22,3 +22,10 @@ bin-release/
 
 # 原始大体积 STEP（上板 55MB 超 Gitee 单文件 50MB 限制），以 PCB模型.zip 形式入库
 04-外壳设计/PCB模型/*.step
+
+# IDE 工作目录（Trae 等，含本地分析文档与会话产物）
+.trae/
+
+# 数据手册中厂商例程压缩包的临时解压目录（保留原压缩包，解压目录不入库）
+example_extracted/
+example_stm32_extracted/
