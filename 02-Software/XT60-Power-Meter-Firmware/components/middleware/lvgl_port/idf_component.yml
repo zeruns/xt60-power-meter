@@ -1,0 +1,12 @@
+## lvgl_port 组件依赖
+##
+## 关于 LVGL 图形库的引入方式（重要）：
+##   LVGL 源码已 **vendor 进本仓库**，位于 components/middleware/lvgl/
+##   （版本 9.6.0~1）。因此这里**不再**声明 lvgl/lvgl 依赖——否则会与本地
+##   同名组件冲突，且组件管理器拉取的副本会覆盖本地源码。
+##   升级步骤见 docs/architecture.md「LVGL 与显示子系统的引入方式」。
+version: "1.0.0"
+description: "LVGL 适配层：注册 LCD/触摸设备、提供心跳与线程安全锁"
+
+dependencies:
+  idf: ">=5.5"

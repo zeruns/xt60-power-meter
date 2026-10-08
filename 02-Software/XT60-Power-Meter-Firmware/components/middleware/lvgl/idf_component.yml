@@ -1,0 +1,25 @@
+## 本文件来自 LVGL 官方组件清单（vendor 时保留），但做了两处本地调整：
+##
+## ① 保留了上游的 version / description / repository 元信息，便于追溯来源。
+## ② **删除了上游声明的 4 个可选依赖**（espressif/freetype、libjpeg-turbo、
+##    libpng、lz4）。上游用 `rules: if $CONFIG{LV_USE_XXX} == True` 做条件依赖，
+##    但这些 Kconfig 符号由被依赖组件自己引入，条件不成立时 IDF 会报警告
+##    「Kconfig variables were used in "if" clauses, but not defined」。
+##    本工程不使用这几个可选模块，故移除以免干扰构建输出。
+##    ⚠ 若将来要启用 LV_USE_FREETYPE / LV_USE_LIBPNG / LV_USE_LIBJPEG_TURBO /
+##       LV_USE_LZ4，请在此处重新加入对应的 espressif/* 依赖。
+##
+## 说明：本组件已 vendor 进本仓库（components/middleware/lvgl），
+##       因此其它组件**不要**再声明 lvgl/lvgl 依赖，否则会重名冲突。
+dependencies:
+  idf: ">=5.5"
+
+description: LVGL - Light and Versatile Graphics Library
+documentation: https://docs.lvgl.io/
+issues: https://github.com/lvgl/lvgl/issues
+repository: git://github.com/lvgl/lvgl.git
+repository_info:
+  commit_sha: 60b614c23c816ca5edc5f2840c9945eff7da0ad4
+  path: .
+url: https://lvgl.io/
+version: 9.6.0~1
