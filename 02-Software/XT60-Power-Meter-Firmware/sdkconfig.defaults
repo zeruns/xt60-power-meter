@@ -1,0 +1,31 @@
+# XT60 功率计固件——版本化默认配置
+# 注意：sdkconfig 本身不纳入版本管理，本文件是全新克隆时的配置基线。
+#       修改后需删除 sdkconfig 重新生成，或使用 idf.py reconfigure 生效。
+
+# ---------- 目标芯片 ----------
+CONFIG_IDF_TARGET="esp32s3"
+
+# ---------- 双核 ----------
+CONFIG_FREERTOS_UNICORE=n
+# 1 kHz 节拍，满足测量核 1 ms 采样周期
+CONFIG_FREERTOS_HZ=1000
+
+# ---------- 控制台 / 日志 ----------
+# 控制台走 USB-Serial/JTAG，与烧录共用同一串口
+CONFIG_ESP_CONSOLE_UART_DEFAULT=n
+CONFIG_ESP_CONSOLE_USB_SERIAL_JTAG=y
+CONFIG_LOG_DEFAULT_LEVEL_INFO=y
+
+# ---------- 八线 PSRAM（N16R8 模组） ----------
+CONFIG_SPIRAM=y
+CONFIG_SPIRAM_MODE_OCT=y
+CONFIG_SPIRAM_SPEED_80M=y
+
+# ---------- Flash 与分区表 ----------
+CONFIG_ESPTOOLPY_FLASHSIZE_16MB=y
+CONFIG_PARTITION_TABLE_CUSTOM=y
+CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="partitions.csv"
+
+# ---------- 任务与核绑定 ----------
+# WiFi 任务钉在 Core 0（与 UI / 交互同核），Core 1 留给 ADS131M02 采样
+CONFIG_ESP_WIFI_TASK_PINNED_TO_CORE_0=y
