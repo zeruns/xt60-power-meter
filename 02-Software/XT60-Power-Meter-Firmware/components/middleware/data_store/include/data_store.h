@@ -1,42 +1,104 @@
 /**
  * @file data_store.h
- * @brief 测量数据快照仓库（跨核数据交换）
+ * @brief 测量数据仓库：把测量核的结果安全地交给交互核使用
  *
- * 测量核（Core 1）写入最新快照与波形环形缓冲，
- * 交互核（Core 0）的 UI 与网页控制台只读快照，避免跨核共享可变状态。
+ * ─────────────────────────────────────────────────────────────
+ * 为什么需要这个模块？（跨核通信的核心难题）
+ * ─────────────────────────────────────────────────────────────
+ * 本工程双核分工：
+ *   Core 1（测量核）以 1kHz 频率不断写入"最新测量结果"
+ *   Core 0（交互核）以约 30Hz 的频率读取它来刷新屏幕
  *
- * 接口骨架，尚未实现。
+ * 直觉做法是加一把互斥锁（mutex）保护这份数据，但这里有两个问题：
+ *   ① 测量核不能被阻塞——1ms 周期很紧，等锁会破坏采样时序；
+ *   ② 读取的是一整个结构体（6 个 float，共 24 字节），
+ *      多字节数据在一次读写中「没有原子性」。
+ *
+ * 第 ② 点的危害很隐蔽：交互核可能在测量核刚写完电压、还没写电流时
+ * 就把整份数据读走，于是得到一个"新电压配旧电流"的错乱组合，
+ * 算出来的功率会瞬间跳变——UI 上表现为曲线毛刺，而且极难复现。
+ * 这类问题在专业上叫「数据撕裂（data tearing）」。
+ *
+ * ─────────────────────────────────────────────────────────────
+ * 解决方案：seqlock（顺序锁）
+ * ─────────────────────────────────────────────────────────────
+ * 维护一个序号 seq：
+ *   写入前 seq 变奇数（表示"正在写，数据不可信"）
+ *   写完   seq 变偶数（表示"数据完整，可以读"）
+ *
+ * 读取方：读序号 → 拷数据 → 再读序号。
+ *   两次序号相同且为偶数 → 说明拷贝期间没有发生写入，数据一定完整；
+ *   否则说明撞上了写入过程，直接重读一遍即可。
+ *
+ * 优点：完全无锁，写方永远不会被读方阻塞（写方优先级第一）；
+ *       读方偶尔重读一次，代价只有几十纳秒。
+ * 适用前提：写者只有一个（本工程就是测量核），读者可以有多个。
+ *
+ * 注意：这份数据是「单写者」模型。若将来出现第二个写者，
+ *       必须改为互斥锁方案，否则 seqlock 的正确性不再成立。
  */
 #pragma once
 
+#include <stdbool.h>
+#include <stdint.h>
+
 #include "esp_err.h"
 
-/** 实时测量快照 */
+/**
+ * @brief 实时测量快照
+ *
+ * 所有字段都是「一次测量得到的一组相关数据」，必须整体一致地读出，
+ * 这正是为什么需要上面描述的 seqlock 保护。
+ */
 typedef struct {
-    float voltage_v;     /**< 电压 (V) */
-    float current_a;     /**< 电流 (A) */
-    float power_w;       /**< 功率 (W) */
-    float energy_wh;     /**< 累计电能 (Wh) */
-    float temperature_c; /**< 内部温度 (℃) */
-    float humidity_pct;  /**< 内部湿度 (%) */
+    float voltage_v;     /**< 电压（V） */
+    float current_a;     /**< 电流（A） */
+    float power_w;       /**< 功率（W） */
+    float energy_wh;     /**< 累计电能（Wh） */
+    float temperature_c; /**< 机内温度（℃） */
+    float humidity_pct;  /**< 机内相对湿度（%） */
 } data_store_snapshot_t;
 
 /**
- * @brief 初始化数据仓库（分配快照缓冲与同步原语）
+ * @brief 初始化数据仓库
+ *
+ * 只做内部状态清零，不分配动态内存（整份数据是静态分配的）。
+ *
  * @return ESP_OK 成功
  */
 esp_err_t data_store_init(void);
 
 /**
- * @brief 写入最新快照（仅测量核调用）
- * @param snapshot 快照内容，不可为 NULL
- * @return ESP_OK 成功
+ * @brief 写入最新快照（只能由测量核调用）
+ *
+ * 本函数不会阻塞，任何时刻调用都能立即返回。
+ *
+ * @param snapshot 要写入的快照，不可为 NULL
+ * @return ESP_OK 成功；ESP_ERR_INVALID_ARG 参数为 NULL
  */
 esp_err_t data_store_update(const data_store_snapshot_t *snapshot);
 
 /**
- * @brief 读取最新快照（任意核可调用，内部保证读写一致性）
- * @param out 输出：快照内容，不可为 NULL
- * @return ESP_OK 成功；ESP_ERR_INVALID_STATE 尚无有效数据
+ * @brief 读取最新快照（交互核 / 任意任务可调用）
+ *
+ * 内部采用 seqlock 重试机制，保证读到的是一份「自洽」的数据，
+ * 不会出现新老字段混搭的情况。
+ *
+ * @param out 输出快照，不可为 NULL
+ * @return ESP_OK 成功读到一致数据
+ *         ESP_ERR_INVALID_ARG 参数为 NULL
+ *         ESP_ERR_INVALID_STATE 尚无任何数据写入过
+ *         ESP_ERR_TIMEOUT 连续重试仍未能读到一致数据（理论上极少发生，
+ *                         通常意味着写入过于频繁或系统异常）
  */
 esp_err_t data_store_get(data_store_snapshot_t *out);
+
+/**
+ * @brief 查询累计写入次数
+ *
+ * 用途：交互核可以据此判断"数据是否有更新"，避免重复处理同一份数据；
+ * 也便于在调试时确认测量核是否真的在跑。
+ *
+ * @return 自初始化以来 data_store_update() 被调用的总次数
+ */
+uint32_t data_store_update_count(void);
