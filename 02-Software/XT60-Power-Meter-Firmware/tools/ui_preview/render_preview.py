@@ -46,7 +46,12 @@ def text_w(s, f):
 issues = []
 
 def check_corner(name, x, y, w, h):
-    """检查矩形四顶点是否进入圆角遮罩（圆角半径 CORNER_R 的圆外区域）"""
+    """检查矩形四顶点是否**被圆角遮罩切掉**。
+
+    面板可见区 = 圆角矩形：在角部的小方块内，只有「到圆弧圆心距离 ≤ R」的点
+    是可见的，距离 > R 的点落在切角区（黑边），会被遮住。
+    （早期版本把这个判据写反了，导致"工具说没问题、真机仍被切"。）
+    """
     pts = [(x, y), (x + w, y), (x, y + h), (x + w, y + h)]
     for (px, py) in pts:
         near_left = px < CORNER_R
@@ -54,11 +59,11 @@ def check_corner(name, x, y, w, h):
         near_top = py < CORNER_R
         near_bot = py > H - CORNER_R
         if not ((near_left or near_right) and (near_top or near_bot)):
-            continue
+            continue  # 不在角部小方块内，必然可见
         ccx = CORNER_R if near_left else W - CORNER_R
         ccy = CORNER_R if near_top else H - CORNER_R
-        if (px - ccx) ** 2 + (py - ccy) ** 2 < (CORNER_R - 2) ** 2:
-            issues.append(f"[圆角] {name} 顶点({px},{py}) 落入圆角遮罩")
+        if (px - ccx) ** 2 + (py - ccy) ** 2 > CORNER_R ** 2:
+            issues.append(f"[圆角] {name} 顶点({px},{py}) 落在切角区（被遮住）")
 
 def draw_text(d, xy, s, size, color, bold=False, max_w=None, name="", align=None, width=None):
     f = font(size, bold)
@@ -95,9 +100,17 @@ C_ACCENT = (0x00, 0x66, 0xCC)
 C_BD = (0xE3, 0xE7, 0xEC)
 WHITE = (255, 255, 255)
 
-# ---------------- 共享状态栏 ----------------
+# ---------------- 共享状态栏（含页码点）----------------
 def draw_topbar(d, runtime="00:34:38", bat="88%", bat_col=C_V):
     draw_text(d, (28, 3), runtime, 14, (0x4A, 0x4F, 0x58), name="status.runtime")
+    # 中间：页码指示点（y 居中对齐到 22px 高的状态栏）
+    dotg_w = 16 + 2 * (6 + 7)
+    x = (W - dotg_w) // 2
+    for k in range(3):
+        wpx = 16 if k == 0 else 6
+        col = C_ACCENT if k == 0 else (0xC2, 0xC7, 0xCF)
+        d.rounded_rectangle([x, 8, x + wpx - 1, 13], radius=3, fill=col)
+        x += wpx + 7
     # 右侧：WiFi 图标 + 电池图标 + 百分比（右对齐到 284-28）
     txt = f"[B] {bat}"
     tw = text_w(txt, font(14))
@@ -106,60 +119,60 @@ def draw_topbar(d, runtime="00:34:38", bat="88%", bat_col=C_V):
     check_corner("statusbar", 28, 2, W - 56, 20)
 
 def draw_dots(d, cur=0):
-    x = (W - (16 + 2 * (6 + 7))) // 2
-    for k in range(3):
-        wpx = 16 if k == cur else 6
-        col = C_ACCENT if k == cur else (0xC2, 0xC7, 0xCF)
-        d.rounded_rectangle([x, 224, x + wpx - 1, 229], radius=3, fill=col)
-        x += wpx + 7
+    """兼容旧调用：已并入状态栏，这里不再单独绘制底部点阵"""
+    return
 
 # ---------------- 测量页（四行满宽彩条）----------------
-ROW_H, ROW_GAP, ROW_TOP, SAFE_X = 42, 3, 24, 16
-def render_measure(v="19.97670", i="0.01886", p="0.37683", e="0.11800",
-                   i_neg=False, runtime="00:34:38", bat="88%", bat_col=C_V):
-    img, d = new_canvas()
-    draw_topbar(d, runtime, bat, bat_col)
-    rows = [("电压", v, "V", C_V, False), ("电流", i, "A", C_I, True),
-            ("功率", p, "W", C_P, False), ("电能", e, "Wh", C_E, False)]
+ROW_H, ROW_GAP, ROW_TOP, SAFE_X = 44, 2, 22, 6
+ROW_W = W - 2 * SAFE_X
+ROW_PAD = 8
+ENV_Y = 214
+VAL_FONT = 32
+# 可用宽度 = 行宽 - 左右内边距 - 右侧(箭头20 + 3 + 单位22) - 间隔6
+VAL_MAX_W = ROW_W - 2 * ROW_PAD - (20 + 3 + 22) - 6
+
+def _rows(d, rows):
     for k, (nm, val, unit, col, arrow) in enumerate(rows):
         y = ROW_TOP + k * (ROW_H + ROW_GAP)
-        d.rounded_rectangle([SAFE_X, y, W - SAFE_X - 1, y + ROW_H - 1], radius=6, fill=col)
-        check_corner(f"row{k}", SAFE_X, y, W - 2 * SAFE_X, ROW_H)
-        # 左：5 位小数大数字（Bold 24）
-        vw = draw_text(d, (SAFE_X + 10, y + 7), val, 24, WHITE, bold=True,
-                       max_w=W - 2 * SAFE_X - 20 - 60, name=f"row{k}.value")
-        # 右：箭头 + 单位（右对齐到 行右内边距 10，与固件 flex 右对齐一致）
-        rx = W - SAFE_X - 10
+        d.rounded_rectangle([SAFE_X, y, SAFE_X + ROW_W - 1, y + ROW_H - 1], radius=6, fill=col)
+        check_corner(f"row{k}", SAFE_X, y, ROW_W, ROW_H)
+        # 左：大数字（Bold 32），垂直居中
+        b = font(VAL_FONT, True).getbbox(val)
+        vh = b[3] - b[1]
+        vw = draw_text(d, (SAFE_X + ROW_PAD, y + (ROW_H - vh) // 2 - b[1]), val, VAL_FONT,
+                       WHITE, bold=True, max_w=VAL_MAX_W, name=f"row{k}.value")
+        # 右：单位（右对齐到右内边距）；箭头在单位左侧
+        rx = SAFE_X + ROW_W - ROW_PAD
         uw = text_w(unit, font(14, True))
-        draw_text(d, (rx - uw, y + 13), unit, 14, WHITE, bold=True,
-                  max_w=40, name=f"row{k}.unit")
+        ub = font(14, True).getbbox(unit)
+        draw_text(d, (rx - uw, y + (ROW_H - (ub[3] - ub[1])) // 2 - ub[1]), unit, 14, WHITE,
+                  bold=True, max_w=40, name=f"row{k}.unit")
         if arrow:
-            a = "◀" if i_neg else "▶"
-            aw = text_w(a, font(20))
-            draw_text(d, (rx - uw - 6 - aw, y + 9), a, 20, WHITE,
-                      max_w=20, name=f"row{k}.arrow")
-    ey = ROW_TOP + 4 * (ROW_H + ROW_GAP) + 2
-    draw_text(d, (SAFE_X, ey), "32.5C  30%RH", 12, C_GRAY, name="env")
-    draw_dots(d, 0)
+            a = "◀" if arrow == "neg" else "▶"
+            ab = font(20).getbbox(a)
+            draw_text(d, (rx - uw - 6 - (ab[2] - ab[0]), y + (ROW_H - (ab[3] - ab[1])) // 2 - ab[1]),
+                      a, 20, WHITE, max_w=28, name=f"row{k}.arrow")
+
+def render_measure(v="19.97670", i="0.01886", p="0.37683", e="0.11800",
+                   i_neg=False, env="32.5C  30%RH", runtime="00:34:38", bat="88%", bat_col=C_V):
+    img, d = new_canvas()
+    draw_topbar(d, runtime, bat, bat_col)
+    rows = [("电压", v, "V", C_V, False), ("电流", i, "A", C_I, "neg" if i_neg else "pos"),
+            ("功率", p, "W", C_P, False), ("电能", e, "Wh", C_E, False)]
+    _rows(d, rows)
+    # 环境温湿度：底部居中（整体宽度 284，文字居中）
+    draw_text(d, (0, ENV_Y), env, 14, C_GRAY, name="env", align="center", width=W)
     save(img, "measure.png")
 
 def render_measure_neg():
     """负电流 + 大数据量（检查溢出与箭头方向）"""
     img, d = new_canvas()
     draw_topbar(d, "12:34:56", "15%", C_P)
-    rows = [("电压", "123.45678", "V", C_V, False), ("电流", "-12.34567", "A", C_I, True),
-            ("功率", "1523.45678", "W", C_P, False), ("电能", "12345.67890", "Wh", C_E, False)]
-    for k, (nm, val, unit, col, arrow) in enumerate(rows):
-        y = ROW_TOP + k * (ROW_H + ROW_GAP)
-        d.rounded_rectangle([SAFE_X, y, W - SAFE_X - 1, y + ROW_H - 1], radius=6, fill=col)
-        draw_text(d, (SAFE_X + 10, y + 7), val, 24, WHITE, bold=True,
-                  max_w=W - 2 * SAFE_X - 20 - 60, name=f"neg{k}.value")
-        rx = W - SAFE_X - 10
-        uw = draw_text(d, (rx, y + 13), unit, 14, WHITE, bold=True, max_w=40)
-        if arrow:
-            draw_text(d, (rx - uw - 6 - 14, y + 9), "◀", 20, WHITE, max_w=20)
-    draw_text(d, (SAFE_X, ROW_TOP + 4 * (ROW_H + ROW_GAP) + 2), "-5.0C  99%RH", 12, C_GRAY)
-    draw_dots(d, 0)
+    rows = [("电压", "123.45678", "V", C_V, False), ("电流", "-12.34567", "A", C_I, "neg"),
+            ("功率", "1523.45678", "W", C_P, False), ("电能", "99999.99999", "Wh", C_E, False)]
+    _rows(d, rows)
+    draw_text(d, (0, ENV_Y), "--.-C  --%RH", 14, C_GRAY, name="env.placeholder",
+              align="center", width=W)
     save(img, "measure_edge.png")
 
 # ---------------- 波形页 ----------------

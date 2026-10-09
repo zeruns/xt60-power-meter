@@ -492,17 +492,30 @@ static void task_aux(void *arg)
     (void)arg;
     TickType_t last = xTaskGetTickCount();
     uint32_t ticks = 0;
+    uint32_t aht_fail = 0;
 
     for (;;) {
         vTaskDelayUntil(&last, pdMS_TO_TICKS(PM_AUX_PERIOD_MS));
 
         aht20_reading_t env;
-        if (aht20_read(&env) == ESP_OK) {
+        esp_err_t aerr = aht20_read(&env);
+        if (aerr == ESP_OK) {
+            if (aht_fail != 0) {
+                ESP_LOGI(TAG, "AHT20 读取恢复正常（此前连续失败 %u 次）", (unsigned)aht_fail);
+                aht_fail = 0;
+            }
             xSemaphoreTake(s_aux_data.mutex, portMAX_DELAY);
             s_aux_data.temp_c = env.temperature_c;
             s_aux_data.humidity_pct = env.humidity_pct;
             s_aux_data.temp_valid = true;
             xSemaphoreGive(s_aux_data.mutex);
+        } else {
+            /* 前 3 次与之后每 15 次（30s）打印一次，避免刷屏又能定位问题 */
+            if (aht_fail < 3 || (aht_fail % 15u) == 0) {
+                ESP_LOGW(TAG, "AHT20 读取失败（第 %u 次）: %s", (unsigned)(aht_fail + 1),
+                         esp_err_to_name(aerr));
+            }
+            aht_fail++;
         }
 
         uint32_t bat_mv = 0;

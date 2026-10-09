@@ -2,29 +2,31 @@
  * @file screen_measure.c
  * @brief 测量数据页：四行满宽彩色条（参考桌面 USB 表的经典版式）
  *
- * 版式（284×240，面板四角圆角 R≈22，故内容左右各内缩 16px、首末行避开圆角）：
- *   ┌ x=16 ────────────────── x=268 ┐
- *   │ 00:34:38            (WiFi) 88%│ 状态栏（由 ui_nav 共享浮层绘制）
- *   │┌────────────────────────────┐ │ y=22  高 46
- *   ││ 19.97670              V    │ │ 电压：绿色底
- *   │└────────────────────────────┘ │
- *   │┌────────────────────────────┐ │ y=70
- *   ││ 0.01886              ▶A    │ │ 电流：蓝色底（箭头指示方向）
- *   │└────────────────────────────┘ │
- *   │┌────────────────────────────┐ │ y=118
- *   ││ 0.37683              W     │ │ 功率：红色底
- *   │└────────────────────────────┘ │
- *   │┌────────────────────────────┐ │ y=166
- *   ││ 0.11800              Wh    │ │ 电能：紫色底
- *   │└────────────────────────────┘ │
- *   │ 32.5℃ 30%RH                   │ 环境小字（指示点之上）
- *   └───────────────────────────────┘
+ * 版式（284×240，面板四角圆角 R≈22）：
+ *   ┌ x=6 ───────────────────── x=277 ┐
+ *   │ 00:34:38    •••    (WiFi) 88%  │ 状态栏（ui_nav 共享浮层，22px 高）
+ *   │┌──────────────────────────────┐│ y=22  高 44
+ *   ││ 19.97670                    V││ 电压：绿底
+ *   │└──────────────────────────────┘│
+ *   │┌──────────────────────────────┐│ y=68
+ *   ││ 0.01886                   ▶A ││ 电流：蓝底（箭头示方向）
+ *   │└──────────────────────────────┘│
+ *   │┌──────────────────────────────┐│ y=114
+ *   ││ 0.37683                     W││ 功率：红底
+ *   │└──────────────────────────────┘│
+ *   │┌──────────────────────────────┐│ y=160
+ *   ││ 0.11800                    Wh││ 电能：紫底
+ *   │└──────────────────────────────┘│
+ *   │          32.5℃  30%RH          │ 环境温湿度（底部居中）
+ *   └────────────────────────────────┘
  *
  * 设计说明：
- *   · 白字 + 彩色底 + 5 位小数：与同类产品（RYC/UM34）一致，远看也能读数；
- *   · 单位小字贴右边缘，与数字拉开，避免"数字变了撞到单位"；
- *   · 电流带方向箭头：横屏朝右为正向（▶），负向为 ◀；
- *   · 数字字号 26px Bold + 单位 12px：在 46px 行高内既醒目又不溢出。
+ *   · 数字用 32px Bold 白字填满 44px 行高（"贴近容器大小"，远看可读）；
+ *   · 行左右只留 6px：四行都落在 y=22~204 的垂直中段，该区域内面板
+ *     圆角不侵入，因此可以像成品表一样做到近满宽；
+ *   · 单位小字（Bold 14）贴右内边距，电流行单位左侧再放方向箭头；
+ *   · 5 位小数固定宽度：最坏 11 字符（99999.99999）在 Bold 32 下约 200px，
+ *     小于可用 211px，不会撞到单位。
  */
 #include "screen_measure.h"
 
@@ -41,11 +43,16 @@
 #define COL_E  lv_color_hex(0x7D3CB5) /* 电能 紫 */
 #define COL_ENV lv_color_hex(0x6B7280)
 
-/** 内容左右安全边距（避开面板圆角） */
-#define SAFE_X 16
-#define ROW_H 42
-#define ROW_GAP 3
-#define ROW_TOP 24
+/** 内容左右边距：四行都在垂直中段，圆角不侵入，故可做到近满宽 */
+#define SAFE_X 6
+#define ROW_W (284 - 2 * SAFE_X)
+#define ROW_H 44
+#define ROW_GAP 2
+#define ROW_TOP 22
+/** 行内左右内边距 */
+#define ROW_PAD 8
+/** 环境温湿度文字的垂直位置（底部居中，见 ui_nav 已把页码点上移） */
+#define ENV_Y 214
 
 typedef struct {
     lv_obj_t *row;   /**< 彩色条本体 */
@@ -65,22 +72,23 @@ static void create_row(lv_obj_t *parent, int y, lv_color_t bg, metric_t *m, bool
 {
     lv_obj_t *row = lv_obj_create(parent);
     lv_obj_remove_style_all(row);
-    lv_obj_set_size(row, 284 - 2 * SAFE_X, ROW_H);
+    lv_obj_set_size(row, ROW_W, ROW_H);
     lv_obj_set_pos(row, SAFE_X, y);
     lv_obj_set_style_bg_color(row, bg, 0);
     lv_obj_set_style_bg_opa(row, LV_OPA_COVER, 0);
     lv_obj_set_style_radius(row, 6, 0);
-    lv_obj_set_style_pad_hor(row, 10, 0);
+    lv_obj_set_style_pad_hor(row, ROW_PAD, 0);
+    lv_obj_set_style_pad_ver(row, 0, 0);
     lv_obj_set_scrollable(row, false);
     lv_obj_set_flex_flow(row, LV_FLEX_FLOW_ROW);
     lv_obj_set_flex_align(row, LV_FLEX_ALIGN_SPACE_BETWEEN, LV_FLEX_ALIGN_CENTER,
                           LV_FLEX_ALIGN_CENTER);
     m->row = row;
 
-    /* 左：大数字（白字，5 位小数固定） */
+    /* 左：大数字（白字，5 位小数固定），32px Bold 填满 44px 行高 */
     m->value = lv_label_create(row);
     lv_label_set_text(m->value, "0.00000");
-    lv_obj_set_style_text_font(m->value, lvgl_port_get_font_bold(LVGL_PORT_FONT_24), 0);
+    lv_obj_set_style_text_font(m->value, lvgl_port_get_font_bold(LVGL_PORT_FONT_32), 0);
     lv_obj_set_style_text_color(m->value, lv_color_white(), 0);
 
     /* 右：箭头（可选）+ 单位 */
@@ -120,11 +128,14 @@ void screen_measure_create(lv_obj_t *tile)
     create_row(tile, ROW_TOP + 2 * (ROW_H + ROW_GAP), COL_P, &s_p, false);
     create_row(tile, ROW_TOP + 3 * (ROW_H + ROW_GAP), COL_E, &s_e, false);
 
+    /* 环境温湿度：底部居中（页码点已移到状态栏，底部整条留给它） */
     s_lbl_env = lv_label_create(tile);
     lv_label_set_text(s_lbl_env, "--.-℃  --%RH");
-    lv_obj_set_style_text_font(s_lbl_env, lvgl_port_get_font(LVGL_PORT_FONT_12), 0);
+    lv_obj_set_style_text_font(s_lbl_env, lvgl_port_get_font(LVGL_PORT_FONT_14), 0);
     lv_obj_set_style_text_color(s_lbl_env, COL_ENV, 0);
-    lv_obj_set_pos(s_lbl_env, SAFE_X, ROW_TOP + 4 * (ROW_H + ROW_GAP) + 2);
+    lv_obj_set_width(s_lbl_env, 284);
+    lv_obj_set_style_text_align(s_lbl_env, LV_TEXT_ALIGN_CENTER, 0);
+    lv_obj_set_pos(s_lbl_env, 0, ENV_Y);
 }
 
 /** 固定 5 位小数格式化（NaN/超范围时给出安全文本，避免显示 inf） */
@@ -171,8 +182,13 @@ void screen_measure_refresh(const data_store_snapshot_t *snap)
     lv_label_set_text(s_e.value, buf);
     lv_label_set_text(s_e.unit, "Wh");
 
+    /* AHT20 尚未读出有效值时（两路都是 0）显示占位符，而不是误导性的 0 */
     char env[40];
-    snprintf(env, sizeof(env), "%.1f℃  %.0f%%RH", (double)snap->temperature_c,
-             (double)snap->humidity_pct);
+    if (snap->temperature_c == 0.0f && snap->humidity_pct == 0.0f) {
+        snprintf(env, sizeof(env), "--.-℃  --%%RH");
+    } else {
+        snprintf(env, sizeof(env), "%.1f℃  %.0f%%RH", (double)snap->temperature_c,
+                 (double)snap->humidity_pct);
+    }
     lv_label_set_text(s_lbl_env, env);
 }

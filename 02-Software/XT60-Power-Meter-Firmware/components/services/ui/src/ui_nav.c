@@ -1,11 +1,14 @@
 /**
  * @file ui_nav.c
- * @brief 三页导航实现：tileview 三页 + 固定共享状态栏 + 底部指示点 + 按键路由
+ * @brief 三页导航实现：tileview 三页 + 固定共享状态栏（含页码点）+ 按键路由
  *
  * 层级（都在 screen 上，z 序按创建顺序）：
  *   tileview（三页内容，可横滑）
  *   → 共享状态栏（白底浮层，不拦截触摸，三页始终可见）
- *   → 底部页面指示点（不拦截触摸）
+ *
+ * 状态栏内容（左→中→右）：运行时间 | 页码指示点 | WiFi + 电池。
+ *   页码点原先放在屏幕底部中央，现移到状态栏中间——因为测量页要把环境
+ *   温湿度显示移到底部居中，两者会重叠。
  *
  * 性能约定（重要）：数据刷新**只刷当前可见页**。
  *   之前两页都刷，波形页的 chart 每帧都要重算/重绘，占用大量 CPU 与
@@ -30,7 +33,6 @@
 #define DOT_W_CUR 16
 #define DOT_H_CUR 6
 #define DOT_GAP 7
-#define DOT_Y 224
 /** 状态栏内容左右内缩：面板顶部两角为圆角，文字必须离开圆角区域 */
 #define TOPBAR_SAFE_X 28
 
@@ -78,6 +80,34 @@ static lv_color_t battery_color(uint8_t pct, bool has_data)
 }
 
 /**
+ * @brief 页码指示点（放在状态栏中间）
+ *
+ * 原先是屏幕底部中央的独立浮层；测量页要在底部居中显示环境温湿度，
+ * 故并入状态栏，避免与温湿度文字重叠。
+ */
+static void create_dots(lv_obj_t *parent)
+{
+    lv_obj_t *dotbar = lv_obj_create(parent);
+    lv_obj_remove_style_all(dotbar);
+    lv_obj_set_size(dotbar, DOT_W_CUR + 2 * (DOT_SIZE + DOT_GAP), DOT_H_CUR);
+    lv_obj_set_clickable(dotbar, false);
+    lv_obj_set_scrollable(dotbar, false);
+    lv_obj_set_flex_flow(dotbar, LV_FLEX_FLOW_ROW);
+    lv_obj_set_flex_align(dotbar, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER,
+                          LV_FLEX_ALIGN_CENTER);
+    lv_obj_set_style_pad_column(dotbar, DOT_GAP, 0);
+
+    for (int i = 0; i < UI_PAGE_MAX; i++) {
+        s_dots[i] = lv_obj_create(dotbar);
+        lv_obj_remove_style_all(s_dots[i]);
+        lv_obj_set_clickable(s_dots[i], false);
+        lv_obj_set_scrollable(s_dots[i], false);
+        lv_obj_set_size(s_dots[i], (i == UI_PAGE_MEASURE) ? DOT_W_CUR : DOT_SIZE, DOT_SIZE);
+        lv_obj_set_style_bg_opa(s_dots[i], LV_OPA_COVER, 0);
+    }
+}
+
+/**
  * @brief 固定在屏幕顶部的共享状态栏（白底，触摸穿透，三页通用）
  */
 static void create_topbar(lv_obj_t *scr)
@@ -101,6 +131,9 @@ static void create_topbar(lv_obj_t *scr)
     lv_obj_set_style_text_font(s_lbl_runtime, lvgl_port_get_font(LVGL_PORT_FONT_14), 0);
     lv_obj_set_style_text_color(s_lbl_runtime, lv_color_hex(0x4A4F58), 0);
     lv_obj_set_clickable(s_lbl_runtime, false);
+
+    /* 中间：页码指示点 */
+    create_dots(bar);
 
     lv_obj_t *right = lv_obj_create(bar);
     lv_obj_remove_style_all(right);
@@ -226,26 +259,6 @@ void ui_nav_build(void)
     screen_settings_create(s_tiles[UI_PAGE_SETTINGS]);
 
     create_topbar(scr);
-
-    lv_obj_t *dotbar = lv_obj_create(scr);
-    lv_obj_remove_style_all(dotbar);
-    lv_obj_set_size(dotbar, DOT_W_CUR + 2 * (DOT_SIZE + DOT_GAP), 12);
-    lv_obj_set_pos(dotbar, (284 - (DOT_W_CUR + 2 * (DOT_SIZE + DOT_GAP))) / 2, DOT_Y);
-    lv_obj_set_clickable(dotbar, false);
-    lv_obj_set_scrollable(dotbar, false);
-    lv_obj_set_flex_flow(dotbar, LV_FLEX_FLOW_ROW);
-    lv_obj_set_flex_align(dotbar, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER,
-                          LV_FLEX_ALIGN_CENTER);
-    lv_obj_set_style_pad_column(dotbar, DOT_GAP, 0);
-
-    for (int i = 0; i < UI_PAGE_MAX; i++) {
-        s_dots[i] = lv_obj_create(dotbar);
-        lv_obj_remove_style_all(s_dots[i]);
-        lv_obj_set_clickable(s_dots[i], false);
-        lv_obj_set_scrollable(s_dots[i], false);
-        lv_obj_set_size(s_dots[i], (i == UI_PAGE_MEASURE) ? DOT_W_CUR : DOT_SIZE, DOT_SIZE);
-        lv_obj_set_style_bg_opa(s_dots[i], LV_OPA_COVER, 0);
-    }
     update_dots();
 
     s_current = (ui_page_t)0;

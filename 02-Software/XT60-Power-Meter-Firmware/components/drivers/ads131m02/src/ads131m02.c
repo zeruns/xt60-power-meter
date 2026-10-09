@@ -3,8 +3,9 @@
  * @brief ADS131M02 双通道 24bit 同步采样 ΔΣ ADC 驱动实现（SPI + DRDY 中断）
  *
  * 器件：TI ADS131M02，2 通道同步采样 24bit ΔΣ ADC。
- *   AIN0 —— 电压，PGA 增益 1x（前端 101:1 精密分压 R33 100kΩ / R39 1kΩ）
- *   AIN1 —— 电流，PGA 增益 16x（1mΩ 四端开尔文分流器）
+ *   AIN0 —— **电流**，PGA 增益 16x（1mΩ 四端开尔文分流器 ISENSE±）
+ *   AIN1 —— **电压**，PGA 增益 1x（U7 电压跟随器 + 101:1 精密分压 R33 100kΩ / R39 1kΩ）
+ * ⚠ 通道与直觉相反，依据上板原理图 V2 的实际接法；GAIN1 = 0x04，详见 ADS_GAIN1_VALUE 注释。
  * 引脚：见 board_pins.h 的 BOARD_PIN_ADC_*。
  *
  * 阅读顺序建议：
@@ -149,18 +150,26 @@ static const char *TAG = "ads131m02";
  * ============================================================ */
 #define ADS_REG_ID    0x00u /**< 器件 ID（只读，手册典型值见 ADS_DEV_ID_TYPICAL） */
 #define ADS_REG_CLOCK 0x03u /**< 时钟/采样率：CH_EN、TBM、OSR[2:0]、PWR[1:0] */
-#define ADS_REG_GAIN1 0x04u /**< 增益：CH0 = [3:0]，CH1 = [7:4] */
+#define ADS_REG_GAIN1 0x04u /**< 增益：CH0 = PGAGAIN0[2:0]（低 3 位），CH1 = PGAGAIN1[2:0]（bit6:4） */
 /**
- * CH0 = 1x（电压）、CH1 = 16x（电流）→ 0x37。
+ * CH0(AIN0) = 16x（电流）、CH1(AIN1) = 1x（电压）→ 0x04。
  *
- * ⚠ TI 的增益编码是反向表（ADS131M02 手册 §8.6.5 Table 8-19），不是线性表：
- *   0000=128x  0001=64x  0010=32x  0011=16x
- *   0100=8x    0101=4x   0110=2x   0111=1x
- * 因此 CH0(低 4 位)=0111 → 1x；CH1(高 4 位)=0011 → 16x。
- * （曾误按线性表写成 0x40：实际配置成 CH0=128x / CH1=8x，导致电压通道
- *   满幅削顶、电流读数偏差 2 倍——上板诊断日志已确认此问题。）
+ * ⚠ 两处曾出错，都在此注释固化（依据：手册 §8.6.5 Table 8-18 + 原理图 V2）：
+ *
+ * 1) 增益编码是**线性表**，不是反向表（手册 Table 8-18 原文）：
+ *      PGAGAINn[2:0]: 000b=1, 001b=2, 010b=4, 011b=8, 100b=16, 101b=32, 110b=64, 111b=128
+ *
+ * 2) **通道接法与直觉相反**（见 01-Hardware/02-上板原理图_V2.pdf）：
+ *      AIN0P/AIN0N（CH0）← ISENSE+ / ISENSE-，即**电流**（1mΩ 四端分流器，需 16x）
+ *      AIN1P/AIN1N（CH1）← 电压跟随器 U7 输出 / VOUT-，即**电压**（101:1 分压，需 1x）
+ *    原理图标注亦印证：电压量程 121V@1x、电流量程 ±75A@16x。
+ *
+ *    曾误写 0x40（把 CH0 当电压、CH1 当电流），导致电压/电流互换；
+ *    还曾误按"反向增益表"写 0x37，把电流通道设成 8x、电压通道设成 128x。
+ *
+ * CH1 = 000b → 1x（bit6:4）；CH0 = 100b → 16x（bit2:0）=> 0x04。
  */
-#define ADS_GAIN1_VALUE 0x0037u
+#define ADS_GAIN1_VALUE 0x0004u
 /** 器件 ID 手册典型值；作为本驱动最可靠的通信验证锚点（已上板实测一致） */
 #define ADS_DEV_ID_TYPICAL 0x2205u
 
@@ -579,7 +588,7 @@ esp_err_t ads131m02_init(void)
     }
     vTaskDelay(pdMS_TO_TICKS(ADS_CMD_GAP_MS));
 
-    /* ---- ⑨ 写 GAIN1：CH0 = 1x（电压）/ CH1 = 16x（电流） ----
+    /* ---- ⑨ 写 GAIN1：CH0 = 16x（电流）/ CH1 = 1x（电压） ----
      * ads_write_reg() 会校验 WREG 应答字，写入未生效（如未解锁）会明确报错。 */
     err = ads_write_reg(ADS_REG_GAIN1, ADS_GAIN1_VALUE);
     if (err != ESP_OK) {
@@ -651,35 +660,53 @@ esp_err_t ads131m02_init(void)
      *   THRSHLD_LSB ：DCBLOCK[3:0]（0=直流阻断滤波器关闭，本工程读直流必须为 0）。
      * 任何一项与预期不符，都会直接导致"读数不对"，因此开机就查。 */
     {
-        uint16_t mode = 0, status = 0, ch0cfg = 0, ch1cfg = 0, thr = 0;
+        uint16_t mode = 0, status = 0, ch0cfg = 0, ch1cfg = 0, thr = 0, gain = 0;
         bool ok = true;
         ok &= (ads_read_reg(0x02u, &mode) == ESP_OK);
         ok &= (ads_read_reg(0x01u, &status) == ESP_OK);
         ok &= (ads_read_reg(0x09u, &ch0cfg) == ESP_OK);
-        ok &= (ads_read_reg(0x0Au, &ch1cfg) == ESP_OK);
+        ok &= (ads_read_reg(0x0Eu, &ch1cfg) == ESP_OK); /* 0x0E = CH1_CFG（0x0A 是 CH0_OCAL_MSB） */
         ok &= (ads_read_reg(0x08u, &thr) == ESP_OK);
+        ok &= (ads_read_reg(ADS_REG_GAIN1, &gain) == ESP_OK);
         if (ok) {
             const uint16_t wlen_mode = (uint16_t)((mode >> 8) & 0x03u);
             const uint16_t wlen_stat = (uint16_t)((status >> 8) & 0x03u);
             uint16_t dcblock = (uint16_t)(thr & 0x0Fu);
             uint16_t mux0 = (uint16_t)(ch0cfg & 0x03u);
+            uint16_t mux1 = (uint16_t)(ch1cfg & 0x03u);
+            /* GAIN1: PGAGAIN1[2:0] = bit6:4（CH1=电压）, PGAGAIN0[2:0] = bit2:0（CH0=电流）
+             * 线性编码：000b=1x 001b=2x 010b=4x 011b=8x 100b=16x 101b=32x 110b=64x 111b=128x */
+            static const uint16_t gain_lut[8] = { 1, 2, 4, 8, 16, 32, 64, 128 };
+            const uint16_t g0 = (uint16_t)(gain & 0x07u);          /* CH0 = 电流 */
+            const uint16_t g1 = (uint16_t)((gain >> 4) & 0x07u);   /* CH1 = 电压 */
             /* MODE bit13 = REG_CRC_EN，bit12 = RX_CRC_EN；bit4 = TIMEOUT */
             const bool crc_on = ((mode >> 12) & 0x03u) != 0u;
             ESP_LOGI(TAG, "寄存器体检: MODE=0x%04X(字长=%s CRC=%s 超时保护=%s) "
                           "STATUS=0x%04X(字长=%s DRDY=%u%u) "
+                          "GAIN1=0x%04X(CH0电流=%ux CH1电压=%ux) "
                           "CH0_CFG=0x%04X(MUX0=%u) CH1_CFG=0x%04X(MUX1=%u) DCBLOCK=%u",
                      mode, (wlen_mode == 1) ? "24bit" : "非24bit(异常)",
                      crc_on ? "开(一帧4字!)" : "关",
                      ((mode >> 4) & 0x01u) ? "开" : "关",
                      status, (wlen_stat == 1) ? "24bit" : "异常",
                      (unsigned)((status >> 1) & 1u), (unsigned)(status & 1u),
-                     ch0cfg, mux0, ch1cfg, (unsigned)(ch1cfg & 0x03u), dcblock);
+                     gain, gain_lut[g0], gain_lut[g1],
+                     ch0cfg, mux0, ch1cfg, mux1, dcblock);
+            if (g0 != 4u) {
+                ESP_LOGE(TAG, "CH0(电流通道) PGA 增益 = %ux，应为 16x（PGAGAIN0=100b）", gain_lut[g0]);
+            }
+            if (g1 != 0u) {
+                ESP_LOGE(TAG, "CH1(电压通道) PGA 增益 = %ux，应为 1x（PGAGAIN1=000b）", gain_lut[g1]);
+            }
             if (wlen_mode != 1 || wlen_stat != 1) {
                 ESP_LOGE(TAG, "字长不是 24bit：一帧字数与驱动假设不符，采样数据会错位，"
                               "请把 WLENGTH 改为 01b");
             }
             if (mux0 != 0u) {
                 ESP_LOGE(TAG, "CH0 MUX=%u 不是外部 AIN0 输入（应为 00b）", mux0);
+            }
+            if (mux1 != 0u) {
+                ESP_LOGE(TAG, "CH1 MUX=%u 不是外部 AIN1 输入（应为 00b）", mux1);
             }
             if (dcblock != 0u) {
                 ESP_LOGW(TAG, "DCBLOCK=%u 非 0：直流阻断滤波器已启用，直流电压/电流会被滤掉，"
@@ -695,7 +722,7 @@ esp_err_t ads131m02_init(void)
     }
 
     s_initialized = true;
-    ESP_LOGI(TAG, "初始化完成（%s mode1 %d Hz，CH0=1x 电压 / CH1=16x 电流，ODR=%u SPS，DRDY#=IO%d）",
+    ESP_LOGI(TAG, "初始化完成（%s mode1 %d Hz，CH0=16x 电流 / CH1=1x 电压，ODR=%u SPS，DRDY#=IO%d）",
              ADS_SPI_HOST_NAME, ADS_SPI_CLK_HZ, ADS_ODR_HZ, BOARD_PIN_ADC_DRDY);
     return ESP_OK;
 fail_dev:
@@ -747,10 +774,13 @@ esp_err_t ads131m02_read(ads131m02_sample_t *out)
     esp_err_t err = ads_xfer_raw(tx, rx, ADS_FRAME_WORDS);
 
     if (err == ESP_OK) {
-        /* rx[0] 是 STATUS，rx[1]/rx[2] 为 CH0/CH1 的 24bit 补码 */
+        /* rx[0] 是 STATUS，rx[1]/rx[2] 为 24bit 补码。
+         * ⚠ 通道接法与直觉相反（见原理图 V2）：
+         *   rx[1] = CH0 = AIN0 = ISENSE± = **电流**
+         *   rx[2] = CH1 = AIN1 = 分压/跟随器 = **电压** */
         out->status = (uint32_t)(rx[0] >> 8);
-        out->voltage_raw = ads_sign_extend24(rx[1]); /* CH0 = AIN0 = 电压 */
-        out->current_raw = ads_sign_extend24(rx[2]); /* CH1 = AIN1 = 电流 */
+        out->current_raw = ads_sign_extend24(rx[1]); /* CH0 = AIN0 = 电流 */
+        out->voltage_raw = ads_sign_extend24(rx[2]); /* CH1 = AIN1 = 电压 */
     }
 
     xSemaphoreGive(s_bus_mutex);
