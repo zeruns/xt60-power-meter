@@ -122,7 +122,7 @@ SYSTEM_FAULT_CRITICAL_MASK = SYSTEM_FAULT_ADC | SYSTEM_FAULT_INFRA
 
 ### 初始化表
 
-`main/app_init.c` 用一张表描述启动步骤，每项登记自己的故障位（下表为真实内容，共 15 项）：
+`main/app_init.c` 用一张表描述启动步骤，每项登记自己的故障位（下表为真实内容，共 17 项）：
 
 ```c
 static const init_step_t s_boot_steps[] = {
@@ -140,8 +140,10 @@ static const init_step_t s_boot_steps[] = {
     { "battery_adc",   battery_adc_init,   SYSTEM_FAULT_BATTERY },
     { "aht20",         aht20_init,         SYSTEM_FAULT_ENV     },
     { "imu_sc7a20h",   imu_sc7a20h_init,   SYSTEM_FAULT_IMU     },
-    { "ads131m02",     ads131m02_init,     SYSTEM_FAULT_ADC     },  /* 关键 */
+    { "ads131m02",     ads131m02_init,     SYSTEM_FAULT_ADC     },  /* 关键，4kSPS */
+    { "power_measure", power_measure_init, SYSTEM_FAULT_ADC     },  /* 测量服务：NVS/波形缓冲 */
     /* 显示与交互 */
+    { "fs_storage",    fs_storage_init,    SYSTEM_FAULT_STORAGE },  /* /spiffs 挂载，字体在此 */
     { "lcd_nv3030b",   lcd_nv3030b_init,   SYSTEM_FAULT_LCD     },
     { "touch_cst816d", touch_cst816d_init, SYSTEM_FAULT_TOUCH   },
     { "lvgl_port",     lvgl_port_init,     SYSTEM_FAULT_LCD     },
@@ -417,8 +419,43 @@ opcode 封装与约 200 条分页式初始化序列都由组件负责，**驱动
 | `components/middleware/lvgl/` | LVGL 9.6 源码本体，**已 vendor 入库** |
 | `components/drivers/lcd_nv3030b/` | QSPI 总线 + 面板（官方 `esp_lcd_spd2010`）+ 背光 + 刷新完成回调 |
 | `components/drivers/touch_cst816d/` | 触摸读点（解析与厂商 STM32 参考例程一致） |
-| `components/middleware/lvgl_port/` | 注册显示/输入设备、心跳节拍、线程安全锁 |
-| `components/services/ui/` | 界面本身（当前用官方 widgets demo 验证） |
+| `components/middleware/lvgl_port/` | 注册显示/输入设备、心跳、线程安全锁、字体（SPIFFS→PSRAM） |
+| `components/middleware/fs_storage/` | storage 分区挂为 `/spiffs`，字体镜像（`spiffs_create_partition_image`） |
+| `components/services/ui/` | 启动页 + 测量/波形/设置三页（tileview/chart/roller 官方组件） |
+| `components/services/power_measure/` | 4kHz 采样、RMS/功率/电能、三级波形缓冲、NVS 掉电保存 |
+
+### 字体方案（OFL Noto Sans SC，文件系统存放）
+
+- 字体**不嵌入 app**：`tools/fonts/make_fonts.py` 从 google/fonts 下载 Noto Sans SC
+  可变 TTF，实例化 Regular(400)/Bold(700) 两个字重，按 **ASCII + GB2312 一级字库
+  3755 字 + 全角标点/单位符号** 子集化，输出到
+  `components/middleware/fs_storage/spiffs_image/fonts/`（约 1.1MB/个），构建时
+  打入 SPIFFS 镜像随 `idf.py flash` 烧入 `storage` 分区（partitions.csv，7.5MB）。
+- `lvgl_port_init`（启动表中位于 fs_storage 之后、测量任务启动之前）用标准
+  `fopen` 把两个 TTF **整读入 PSRAM**，再用 `lv_tiny_ttf_create_data()` 建
+  7 档字号 ×2 字重；之后渲染只走内存，**运行期对 flash 零访问**。
+  这样避免了渲染中 SPIFFS 读（spi_flash 读会挂起 MSPI cache）与 NVS 擦除/
+  LCD DMA 交错的 cache 故障窗口。文件缺失时回退内置 montserrat14（仅 ASCII）。
+- **不要改回 `lv_tiny_ttf_create_file()` 边渲染边读**，除非重新评估 cache 安全。
+- NVS 定时擦除期间 4kHz DRDY 中断仍持续，故必须开 `CONFIG_GPIO_ISR_IRAM_SAFE`。
+
+### 测量链路（4kSPS）
+
+- ADS131M02 CLOCK 寄存器在 init 中显式写 **0x030E**（两通道使能 / HR / OSR=1024）
+  并回读校验：f_MOD=4.096MHz，ODR=4000 SPS（寄存器位定义见 ads131m02.c 注释，
+  出自手册 §8.6.4）。
+- Core1 采样任务由 DRDY 自节奏，每样本做标定换算并写 PSRAM 三级环形缓冲：
+  tier0 4000Hz×4000（1s）、tier1 400Hz×24000（60s）、tier2 10Hz×6000（10min）；
+  每 800 样本（200ms）输出一帧 V/I 真有效值、平均功率与积分电能到 data_store。
+- 温湿度/电池由 Core0 辅助任务 2s 采集一次，在块边界由采样任务合并进快照
+  （维持 data_store 单写者）；电能/运行时间每 30s 落 NVS，启动恢复。
+
+### 按键事件（状态机 + 主机单测）
+
+`button` 驱动 10ms 采样 GPIO，语义判定全部在纯逻辑 `button_fsm.c`（消抖 20ms /
+双击窗口 300ms / 长按 800ms），事件为单击/双击/长按开始/长按释放；该文件无平台
+依赖，随 `test/host/run_host_tests.ps1` 在 PC 上做单元测试。esp_timer 回调只
+向 UI 任务的消息队列投递事件，**回调内禁止碰 LVGL**。
 
 **升级 LVGL 的步骤**（vendor 方式，不能只改版本号）：
 
@@ -433,8 +470,8 @@ opcode 封装与约 200 条分页式初始化序列都由组件负责，**驱动
 6. 删掉 `sdkconfig` 让它按 `sdkconfig.defaults` 重新生成，再全量编译。
 
 **界面构建必须在 UI 任务里做**（`services/ui`），不能放在 `app_main` 的任务上：
-`CONFIG_ESP_MAIN_TASK_STACK_SIZE` 只有 3584 字节，而 `lv_demo_widgets()` 这类构建
-会递归创建大量对象，很容易把主任务栈吃满导致溢出复位。
+`CONFIG_ESP_MAIN_TASK_STACK_SIZE` 只有 3584 字节，而 tileview 三页 + chart 等
+界面构建会递归创建大量对象，很容易把主任务栈吃满导致溢出复位（UI 任务栈 12KB）。
 
 ---
 

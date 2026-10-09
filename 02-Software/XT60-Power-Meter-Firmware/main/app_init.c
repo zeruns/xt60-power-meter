@@ -24,9 +24,11 @@
 #include "data_store.h"
 #include "device_ctrl.h"
 #include "event_bus.h"
+#include "fs_storage.h"
 #include "imu_sc7a20h.h"
 #include "lcd_nv3030b.h"
 #include "lvgl_port.h"
+#include "power_measure.h"
 #include "settings.h"
 #include "status_led.h"
 #include "system_state.h"
@@ -107,8 +109,16 @@ static const init_step_t s_boot_steps[] = {
     /* 测量前端 ADC（SPI3 独占）：整个设备的核心，坏了就没有测量数据，
      * 因此用 SYSTEM_FAULT_ADC —— 该位在 SYSTEM_FAULT_CRITICAL_MASK 中 → 关键 */
     { "ads131m02", ads131m02_init, SYSTEM_FAULT_ADC },
+    /* 测量服务：载入 NVS 电能/标定、分配 PSRAM 波形缓冲（不启动任务，
+     * 任务在 app_tasks_start 中于 Core1 启动）。它不可用 = 无法测量，
+     * 与 ADC 同属关键位。 */
+    { "power_measure", power_measure_init, SYSTEM_FAULT_ADC },
 
     /* ---- 显示与交互 ---- */
+    /* 资源文件系统：storage 分区挂为 /spiffs（UI 字体在上面）。
+     * 挂载失败不阻止显示（lvgl_port 会回退内置 ASCII 字体），非关键。
+     * 必须早于 lvgl_port——字体在 lvgl_port_init() 中从文件加载。 */
+    { "fs_storage", fs_storage_init, SYSTEM_FAULT_STORAGE },
     /* LCD 面板（NV3030B，QSPI）：坏了只是"没有显示"，测量不受影响 → 非关键。
      * 须先于 lvgl_port——LVGL 适配层要注册显示设备。 */
     { "lcd_nv3030b", lcd_nv3030b_init, SYSTEM_FAULT_LCD },

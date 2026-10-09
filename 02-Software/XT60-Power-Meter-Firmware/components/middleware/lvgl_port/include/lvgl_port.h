@@ -26,14 +26,15 @@
 esp_err_t lvgl_port_init(void);
 
 /* ============================================================
- * 中文字体管理（tiny_ttf + 嵌入子集化 TTF）
+ * 中文字体管理（tiny_ttf + SPIFFS 文件字体）
  *
- * 字体数据：components/middleware/lvgl_port/fonts/notosanssc_subset.ttf
- *   由 simhei.ttf 子集化而来，仅收录本工程 UI 用到的 CJK 字符（约 25KB）。
- *   重新生成：见同目录下的 README（若有）或用 fonttools subset。
+ * 字体文件：storage（SPIFFS）分区 /spiffs/fonts/ 下的
+ *   notosc_reg.ttf / notosc_bold.ttf（Noto Sans SC，OFL 授权，
+ *   GB2312 一级字库子集，由 tools/fonts/make_fonts.py 生成）。
  *
- * 字号策略：在 lvgl_port_init() 里一次性创建若干常用字号的 lv_font_t，
- *   UI 层直接取用，避免每次渲染都重建字体（tiny_ttf 建字体较重）。
+ * 字体放文件系统而非嵌入 app：不占程序分区空间，且可独立更新。
+ * 每个字号/字重都在 lvgl_port_init() 中一次性创建，UI 直接取指针。
+ * 文件缺失时回退内置 montserrat14（仅 ASCII），界面不崩溃。
  * ============================================================ */
 
 /** 常用字号枚举（按需增减） */
@@ -49,11 +50,28 @@ typedef enum {
 } lvgl_port_font_size_t;
 
 /**
- * @brief 获取指定字号的中文字体指针
+ * @brief 获取指定字号的常规字重中文字体
  * @param size 字号（见 lvgl_port_font_size_t）
- * @return 字体指针；若未初始化或字号非法返回 NULL
+ * @return 字体指针；文件字体不可用时回退内置 ASCII 字体，不返回 NULL（参数非法除外）
  */
 const lv_font_t *lvgl_port_get_font(lvgl_port_font_size_t size);
+
+/**
+ * @brief 获取指定字号的粗体中文字体（标题/大数值用）
+ * @param size 字号
+ * @return 字体指针；回退规则同 lvgl_port_get_font()
+ */
+const lv_font_t *lvgl_port_get_font_bold(lvgl_port_font_size_t size);
+
+/**
+ * @brief 查询显示器已完成上屏的 flush 次数
+ *
+ * 用途：开机时背光保持关闭，UI 任务在「首帧真正渲染上屏」后再打开背光，
+ * 这样用户看到的第一帧就是完整的启动画面，不会先看到黑屏或局部条带。
+ *
+ * @return 累计 flush 完成次数（单调递增）
+ */
+uint32_t lvgl_port_flush_count(void);
 
 /**
  * @brief 切换显示旋转（同步面板方向、LVGL 分辨率与触摸坐标映射）

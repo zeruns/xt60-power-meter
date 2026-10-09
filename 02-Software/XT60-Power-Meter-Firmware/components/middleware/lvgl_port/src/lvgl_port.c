@@ -21,6 +21,7 @@
  */
 #include <stddef.h>
 #include <stdint.h>
+#include <stdio.h>
 
 #include "freertos/FreeRTOS.h"
 #include "freertos/semphr.h"
@@ -35,9 +36,18 @@
 #include "lvgl_port.h"
 #include "touch_cst816d.h"
 
-/* 嵌入的子集化中文字体（由 EMBED_FILES 自动生成符号） */
-extern const uint8_t notosanssc_subset_ttf_start[] asm("_binary_notosanssc_subset_ttf_start");
-extern const uint8_t notosanssc_subset_ttf_end[]   asm("_binary_notosanssc_subset_ttf_end");
+/* ---- 中文字体（tiny_ttf，文件存放于 SPIFFS、启动时整体读入 PSRAM） ----
+ * 为什么不直接用 lv_tiny_ttf_create_file() 边渲染边读：
+ *   字形未命中时会在 lv_refr 渲染过程中发起 SPIFFS→spi_flash 读，
+ *   每次读都会短暂关闭 MSPI cache；在本板 4kHz DRDY 中断 + QSPI LCD DMA
+ *   并发的环境下，cache 挂起/恢复窗口与渲染代码交错会引发 Cache error。
+ * 做法：字体文件仍放在 storage（SPIFFS）分区（不占 app 程序空间），
+ *   lvgl_port_init 时一次性读入 PSRAM（2.2MB，8MB PSRAM 余量充足），
+ *   之后全部渲染走内存，运行时对 flash 零访问。
+ *   此加载发生在测量任务启动之前，无并发擦除/采样，时机安全。
+ * 文件缺失时回退内置 montserrat14（仅 ASCII），界面不崩。 */
+#define LVGL_PORT_FONT_REG_PATH  "/spiffs/fonts/notosc_reg.ttf"
+#define LVGL_PORT_FONT_BOLD_PATH "/spiffs/fonts/notosc_bold.ttf"
 
 static const char *TAG = "lvgl_port";
 
@@ -52,15 +62,70 @@ static lv_display_t *s_display = NULL;         /**< 显示设备 */
 static lv_indev_t *s_indev = NULL;             /**< 输入设备 */
 static void *s_draw_buf = NULL;                /**< 渲染缓冲（DMA 内部 RAM） */
 static bool s_inited = false;                  /**< 防重复初始化标志 */
+/** 累计完成上屏的 flush 次数（ISR 内自增）：UI 层据此判断"首帧已上屏"，
+ *  然后才打开背光——避免开机先看到黑屏/局部条带再跳到启动画面。 */
+static volatile uint32_t s_flush_count = 0;
 
 /** 当前显示旋转档位（与面板 MADCTL 保持同步；触摸映射按它查表） */
 static lcd_nv3030b_rotation_t s_rotation = LCD_NV3030B_ROT_90;
 
-/* ---- 中文字体（tiny_ttf） ---- */
 /** 各字号对应的像素高度（与枚举 lvgl_port_font_size_t 一一对应） */
 static const int s_font_px[LVGL_PORT_FONT_MAX] = { 12, 14, 16, 20, 24, 32, 40 };
-/** 已创建的字体指针（NULL 表示该字号未创建） */
-static lv_font_t *s_fonts[LVGL_PORT_FONT_MAX] = { 0 };
+/** 字重下标 */
+enum {
+    FONT_WEIGHT_REG = 0,
+    FONT_WEIGHT_BOLD,
+    FONT_WEIGHT_MAX,
+};
+/** 已创建的字体指针 [字重][字号]；NULL 表示未创建（取用方需判空） */
+static lv_font_t *s_fonts[FONT_WEIGHT_MAX][LVGL_PORT_FONT_MAX] = { 0 };
+/** 从 SPIFFS 整读入 PSRAM 的字体数据（运行期常驻，单位字节） */
+static uint8_t *s_font_data[FONT_WEIGHT_MAX] = { 0 };
+static size_t s_font_data_len[FONT_WEIGHT_MAX] = { 0 };
+
+/**
+ * @brief 把 SPIFFS 上的 TTF 整个读入 PSRAM
+ * @return ESP_OK 成功；文件不存在/读取失败/内存不足返回错误（不致命）
+ */
+static esp_err_t load_font_file(const char *path, uint8_t **out_data, size_t *out_len)
+{
+    *out_data = NULL;
+    *out_len = 0;
+
+    FILE *f = fopen(path, "rb");
+    if (f == NULL) {
+        ESP_LOGW(TAG, "字体文件打不开: %s（将回退内置 ASCII 字体）", path);
+        return ESP_ERR_NOT_FOUND;
+    }
+    if (fseek(f, 0, SEEK_END) != 0) {
+        fclose(f);
+        return ESP_FAIL;
+    }
+    long sz = ftell(f);
+    if (sz <= 0) {
+        fclose(f);
+        return ESP_FAIL;
+    }
+    rewind(f);
+
+    uint8_t *buf = heap_caps_malloc((size_t)sz, MALLOC_CAP_SPIRAM);
+    if (buf == NULL) {
+        ESP_LOGE(TAG, "PSRAM 分配 %ld 字节存字体失败", sz);
+        fclose(f);
+        return ESP_ERR_NO_MEM;
+    }
+    size_t got = fread(buf, 1, (size_t)sz, f);
+    fclose(f);
+    if (got != (size_t)sz) {
+        ESP_LOGE(TAG, "字体读取不完整: %s（%u/%ld）", path, (unsigned)got, sz);
+        free(buf);
+        return ESP_FAIL;
+    }
+
+    *out_data = buf;
+    *out_len = (size_t)sz;
+    return ESP_OK;
+}
 
 /**
  * @brief 显存写入完成回调：通知 LVGL「绘图缓冲已可复用」
@@ -74,7 +139,13 @@ static lv_font_t *s_fonts[LVGL_PORT_FONT_MAX] = { 0 };
  */
 static void flush_done_cb(void *user_ctx)
 {
+    s_flush_count++;
     lv_display_flush_ready((lv_display_t *)user_ctx);
+}
+
+uint32_t lvgl_port_flush_count(void)
+{
+    return s_flush_count;
 }
 
 /**
@@ -226,20 +297,45 @@ esp_err_t lvgl_port_init(void)
     /* 3. LVGL 内核 */
     lv_init();
 
-    /* 3.1 中文字体：从嵌入的子集化 TTF 创建各字号字体。
-     *     tiny_ttf 会按需光栅化字形并缓存；字号在 init 阶段一次性建好，
-     *     UI 层直接取指针，避免运行时反复创建。 */
+    /* 3.1 中文字体：SPIFFS 文件 → PSRAM 内存，再按字号用 tiny_ttf 创建。
+     *     常规/粗体 × 7 档；文件读不出的字重留空，取用方回退 montserrat14。
+     *     只在 init（测量任务启动前）读 flash，运行期渲染零 flash 访问。 */
     {
-        const uint8_t *ttf_data = notosanssc_subset_ttf_start;
-        size_t ttf_size = (size_t)(notosanssc_subset_ttf_end - notosanssc_subset_ttf_start);
-        for (int i = 0; i < LVGL_PORT_FONT_MAX; i++) {
-            s_fonts[i] = lv_tiny_ttf_create_data(ttf_data, ttf_size, s_font_px[i]);
-            if (s_fonts[i] == NULL) {
-                ESP_LOGW(TAG, "创建 %dpx 中文字体失败", s_font_px[i]);
+        static const struct {
+            uint8_t weight;
+            const char *path;
+        } faces[FONT_WEIGHT_MAX] = {
+            [FONT_WEIGHT_REG] = { FONT_WEIGHT_REG, LVGL_PORT_FONT_REG_PATH },
+            [FONT_WEIGHT_BOLD] = { FONT_WEIGHT_BOLD, LVGL_PORT_FONT_BOLD_PATH },
+        };
+        int ok_count = 0;
+        for (int w = 0; w < FONT_WEIGHT_MAX; w++) {
+            if (load_font_file(faces[w].path, &s_font_data[w], &s_font_data_len[w]) != ESP_OK) {
+                continue;
+            }
+            for (int i = 0; i < LVGL_PORT_FONT_MAX; i++) {
+                s_fonts[w][i] =
+                    lv_tiny_ttf_create_data(s_font_data[w], s_font_data_len[w], s_font_px[i]);
+                if (s_fonts[w][i] != NULL) {
+                    ok_count++;
+                } else {
+                    ESP_LOGW(TAG, "字重 %d 创建 %dpx 字体失败", w, s_font_px[i]);
+                }
             }
         }
-        ESP_LOGI(TAG, "中文字体已加载（TTF %u 字节，%d 个字号）",
-                 (unsigned)ttf_size, LVGL_PORT_FONT_MAX);
+        ESP_LOGI(TAG, "中文字体加载完成：%d/%d 个（2 字重 × %d 字号，SPIFFS→PSRAM 内存渲染）",
+                 ok_count, FONT_WEIGHT_MAX * LVGL_PORT_FONT_MAX, LVGL_PORT_FONT_MAX);
+    }
+
+    /* 3.2 字体回退链：Noto 子集含汉字但不含 LVGL 的 FontAwesome 图标符号
+     *     （电池/WiFi/设置等在 U+F000 私用区）。把内置 montserrat14 挂为
+     *     fallback：中文走 Noto，图标符号走 montserrat，两者都不出方块。 */
+    for (int w = 0; w < FONT_WEIGHT_MAX; w++) {
+        for (int i = 0; i < LVGL_PORT_FONT_MAX; i++) {
+            if (s_fonts[w][i] != NULL) {
+                s_fonts[w][i]->fallback = &lv_font_montserrat_14;
+            }
+        }
     }
 
     /* 4. 显示设备：按当前旋转档位的逻辑分辨率创建（默认 ROT_90 横屏 284x240）
@@ -262,6 +358,16 @@ esp_err_t lvgl_port_init(void)
     lv_display_set_flush_cb(s_display, display_flush_cb);
     lv_display_set_buffers(s_display, s_draw_buf, NULL, (uint32_t)buf_size,
                            LV_DISPLAY_RENDER_MODE_PARTIAL);
+
+    /* 4.0 用中文字体重建默认主题：msgbox/list/roller/键盘等官方控件默认字体
+     *     原本是 montserrat14（不含中文，显示成方块）。重建后这些控件全部
+     *     默认使用 16px Noto（其 fallback 已挂 montserrat14，图标仍正常）。
+     *     主题重建会触发一次全树样式刷新，此时还没有任何业务界面。 */
+    if (s_fonts[FONT_WEIGHT_REG][LVGL_PORT_FONT_16] != NULL) {
+        lv_theme_default_init(s_display, lv_color_hex(0x0066CC), lv_color_hex(0x8A8F99),
+                              false /*浅色主题*/,
+                              s_fonts[FONT_WEIGHT_REG][LVGL_PORT_FONT_16]);
+    }
 
     /* 4.1 注册显存写入完成回调（必须在第一次 flush 之前）：
      * 单缓冲 PARTIAL 模式下，只有它才能在 DMA 真正结束后放行 LVGL 复用缓冲，
@@ -367,10 +473,28 @@ void lvgl_port_unlock(void)
     }
 }
 
-const lv_font_t *lvgl_port_get_font(lvgl_port_font_size_t size)
+/**
+ * @brief 取字体的内部实现：文件字体失败时回退内置 montserrat14（仅 ASCII）
+ */
+static const lv_font_t *get_font(int weight, lvgl_port_font_size_t size)
 {
-    if (size < 0 || size >= LVGL_PORT_FONT_MAX) {
+    if (size < 0 || size >= LVGL_PORT_FONT_MAX || weight < 0 || weight >= FONT_WEIGHT_MAX) {
         return NULL;
     }
-    return s_fonts[size];
+    lv_font_t *font = s_fonts[weight][size];
+    if (font != NULL) {
+        return font;
+    }
+    /* SPIFFS 未挂载 / 字体文件缺失：回退内置 ASCII 字体，保证界面不崩 */
+    return &lv_font_montserrat_14;
+}
+
+const lv_font_t *lvgl_port_get_font(lvgl_port_font_size_t size)
+{
+    return get_font(FONT_WEIGHT_REG, size);
+}
+
+const lv_font_t *lvgl_port_get_font_bold(lvgl_port_font_size_t size)
+{
+    return get_font(FONT_WEIGHT_BOLD, size);
 }

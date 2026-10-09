@@ -476,7 +476,12 @@ esp_err_t lcd_nv3030b_init(void)
 
     s_initialized = true;
 
-    /* ---- ⑦ 先刷清屏色（阻塞等 DMA），再点亮背光 ---- */
+    /* ---- ⑦ 先刷清屏色（阻塞等 DMA），**暂不点背光** ----
+     * 背光由上层（lvgl_port）在第一帧真正上屏后才打开：
+     * 本驱动 init 到 LVGL 首帧之间还有一段时间（自检、字体加载等），
+     * 这段窗口里面板只有清屏色/未定义内容，此时若已开背光，用户会先看到
+     * 「黑底 + 局部条带」再跳到启动画面。保持背光关闭，用户看到的第一帧
+     * 就是完整的启动画面。上层可通过 lcd_nv3030b_set_backlight() 打开。 */
     s_clear_sem = xSemaphoreCreateBinary();
     if (s_clear_sem == NULL) {
         ESP_LOGE(TAG, "创建清屏同步信号量失败");
@@ -490,7 +495,6 @@ esp_err_t lcd_nv3030b_init(void)
         s_initialized = false;
         goto fail_panel;
     }
-    (void)lcd_nv3030b_set_backlight(100);
 
 #if (LCD_BOOT_TEST_PATTERN_MS > 0)
     err = panel_draw_test_pattern();

@@ -148,11 +148,40 @@ static const char *TAG = "ads131m02";
  * 寄存器
  * ============================================================ */
 #define ADS_REG_ID    0x00u /**< 器件 ID（只读，手册典型值见 ADS_DEV_ID_TYPICAL） */
-#define ADS_REG_GAIN1 0x04u /**< 增益：CH0 = [2:0]，CH1 = [6:4]（000=1x，100=16x） */
-/** CH0 = 1x（电压）、CH1 = 16x（电流） */
-#define ADS_GAIN1_VALUE 0x0040u
+#define ADS_REG_CLOCK 0x03u /**< 时钟/采样率：CH_EN、TBM、OSR[2:0]、PWR[1:0] */
+#define ADS_REG_GAIN1 0x04u /**< 增益：CH0 = [3:0]，CH1 = [7:4] */
+/**
+ * CH0 = 1x（电压）、CH1 = 16x（电流）→ 0x37。
+ *
+ * ⚠ TI 的增益编码是反向表（ADS131M02 手册 §8.6.5 Table 8-19），不是线性表：
+ *   0000=128x  0001=64x  0010=32x  0011=16x
+ *   0100=8x    0101=4x   0110=2x   0111=1x
+ * 因此 CH0(低 4 位)=0111 → 1x；CH1(高 4 位)=0011 → 16x。
+ * （曾误按线性表写成 0x40：实际配置成 CH0=128x / CH1=8x，导致电压通道
+ *   满幅削顶、电流读数偏差 2 倍——上板诊断日志已确认此问题。）
+ */
+#define ADS_GAIN1_VALUE 0x0037u
 /** 器件 ID 手册典型值；作为本驱动最可靠的通信验证锚点（已上板实测一致） */
 #define ADS_DEV_ID_TYPICAL 0x2205u
+
+/* ============================================================
+ * CLOCK 寄存器位定义（手册 §8.6.4 Table 8-17，复位值 0x030E）
+ *   bit9    CH1_EN / bit8 CH0_EN：两通道均使能；
+ *   bit5    TBM：0 = OSR 由 bit[4:2] 决定（1 = Turbo，OSR 固定 64）；
+ *   bit[4:2] OSR[2:0]：011 = 1024；
+ *   bit[1:0] PWR[1:0]：10 = HR（高分辨率，11 同为 HR，保持复位值 10）。
+ *
+ * HR 模式 f_MOD = f_CLKIN/2 = 4.096MHz，ODR = f_MOD/OSR = 4000 Hz。
+ * 虽然芯片复位默认值就是 0x030E（即 4kSPS），仍显式写入并回读，
+ * 防止上游程序/异常状态改过该寄存器，保证采样率确定。
+ * ============================================================ */
+#define ADS_CLOCK_CH_EN_MASK  0x0300u /**< CH1_EN | CH0_EN */
+#define ADS_CLOCK_OSR_SHIFT   2
+#define ADS_CLOCK_OSR_1024    (0x03u << ADS_CLOCK_OSR_SHIFT) /**< OSR[2:0]=011 */
+#define ADS_CLOCK_PWR_HR      (0x02u)                         /**< PWR[1:0]=10 HR */
+#define ADS_CLOCK_VALUE       (ADS_CLOCK_CH_EN_MASK | ADS_CLOCK_OSR_1024 | ADS_CLOCK_PWR_HR)
+/** 配置后的输出数据率（Hz） */
+#define ADS_ODR_HZ            4000u
 
 /* ============================================================
  * 时序参数
@@ -574,6 +603,28 @@ esp_err_t ads131m02_init(void)
                       "请按文件头调试要点排查",
                  gain1_readback, ADS_GAIN1_VALUE);
     }
+    vTaskDelay(pdMS_TO_TICKS(ADS_CMD_GAP_MS));
+
+    /* ---- ⑩.1 写 CLOCK：HR 模式 + OSR=1024 -> 输出数据率 4kSPS ----
+     * 该值虽与芯片复位默认相同，仍显式配置并回读，确保采样率是确定值
+     * （位定义见 ADS_CLOCK_VALUE 上方注释，出自手册 §8.6.4 Table 8-17）。 */
+    err = ads_write_reg(ADS_REG_CLOCK, ADS_CLOCK_VALUE);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "CLOCK(采样率) 写入未确认: %s", esp_err_to_name(err));
+    }
+    vTaskDelay(pdMS_TO_TICKS(ADS_CMD_GAP_MS));
+
+    uint16_t clock_readback = 0;
+    err = ads_read_reg(ADS_REG_CLOCK, &clock_readback);
+    if (err == ESP_OK) {
+        if (clock_readback == ADS_CLOCK_VALUE) {
+            ESP_LOGI(TAG, "CLOCK 回读 0x%04X：HR 模式 OSR=1024，ODR=%u SPS", clock_readback,
+                     ADS_ODR_HZ);
+        } else {
+            ESP_LOGW(TAG, "CLOCK 回读 0x%04X 与目标 0x%04X 不符（实际 ODR 可能不是 %u SPS）",
+                     clock_readback, ADS_CLOCK_VALUE, ADS_ODR_HZ);
+        }
+    }
 
     /* ---- ⑪ 通信判定：读器件 ID（手册典型值 0x2205） ----
      * 这是本驱动最可靠的通信锚点：ID 寄存器只读、值固定，
@@ -590,11 +641,63 @@ esp_err_t ads131m02_init(void)
                  dev_id, ADS_DEV_ID_TYPICAL);
     }
 
-    s_initialized = true;
-    ESP_LOGI(TAG, "初始化完成（%s mode1 %d Hz，CH0=1x 电压 / CH1=16x 电流，DRDY#=IO%d）",
-             ADS_SPI_HOST_NAME, ADS_SPI_CLK_HZ, BOARD_PIN_ADC_DRDY);
-    return ESP_OK;
+    /* ---- ⑫ 寄存器体检：把决定"读数怎么解释"的位逐一打印出来 ----
+     * 这一步是"核查驱动与硬件是否一致"的依据（对应手册 §8.6）：
+     *   MODE(02h)   ：WLENGTH（字长，必须 24bit）、CRC 是否启用（启用则一帧变 4 字）、
+     *                 DRDY_SEL / DRDY_FMT（DRDY 行为）；
+     *   STATUS(01h) ：WLENGTH 回读、RESET/F_RESYNC（是否发生过复位/重同步）、
+     *                 DRDY0/DRDY1（哪些通道有新数据）；
+     *   CH0/CH1_CFG ：MUX（必须 00=外部 AIN 输入）、DCBLK（默认关闭）、PHASE；
+     *   THRSHLD_LSB ：DCBLOCK[3:0]（0=直流阻断滤波器关闭，本工程读直流必须为 0）。
+     * 任何一项与预期不符，都会直接导致"读数不对"，因此开机就查。 */
+    {
+        uint16_t mode = 0, status = 0, ch0cfg = 0, ch1cfg = 0, thr = 0;
+        bool ok = true;
+        ok &= (ads_read_reg(0x02u, &mode) == ESP_OK);
+        ok &= (ads_read_reg(0x01u, &status) == ESP_OK);
+        ok &= (ads_read_reg(0x09u, &ch0cfg) == ESP_OK);
+        ok &= (ads_read_reg(0x0Au, &ch1cfg) == ESP_OK);
+        ok &= (ads_read_reg(0x08u, &thr) == ESP_OK);
+        if (ok) {
+            const uint16_t wlen_mode = (uint16_t)((mode >> 8) & 0x03u);
+            const uint16_t wlen_stat = (uint16_t)((status >> 8) & 0x03u);
+            uint16_t dcblock = (uint16_t)(thr & 0x0Fu);
+            uint16_t mux0 = (uint16_t)(ch0cfg & 0x03u);
+            /* MODE bit13 = REG_CRC_EN，bit12 = RX_CRC_EN；bit4 = TIMEOUT */
+            const bool crc_on = ((mode >> 12) & 0x03u) != 0u;
+            ESP_LOGI(TAG, "寄存器体检: MODE=0x%04X(字长=%s CRC=%s 超时保护=%s) "
+                          "STATUS=0x%04X(字长=%s DRDY=%u%u) "
+                          "CH0_CFG=0x%04X(MUX0=%u) CH1_CFG=0x%04X(MUX1=%u) DCBLOCK=%u",
+                     mode, (wlen_mode == 1) ? "24bit" : "非24bit(异常)",
+                     crc_on ? "开(一帧4字!)" : "关",
+                     ((mode >> 4) & 0x01u) ? "开" : "关",
+                     status, (wlen_stat == 1) ? "24bit" : "异常",
+                     (unsigned)((status >> 1) & 1u), (unsigned)(status & 1u),
+                     ch0cfg, mux0, ch1cfg, (unsigned)(ch1cfg & 0x03u), dcblock);
+            if (wlen_mode != 1 || wlen_stat != 1) {
+                ESP_LOGE(TAG, "字长不是 24bit：一帧字数与驱动假设不符，采样数据会错位，"
+                              "请把 WLENGTH 改为 01b");
+            }
+            if (mux0 != 0u) {
+                ESP_LOGE(TAG, "CH0 MUX=%u 不是外部 AIN0 输入（应为 00b）", mux0);
+            }
+            if (dcblock != 0u) {
+                ESP_LOGW(TAG, "DCBLOCK=%u 非 0：直流阻断滤波器已启用，直流电压/电流会被滤掉，"
+                              "本工程读直流必须为 0", dcblock);
+            }
+            if (crc_on) {
+                ESP_LOGE(TAG, "SPI CRC 已启用：一帧变为 STATUS+CH0+CH1+CRC 四个字，"
+                              "驱动需同步改造，否则数据错位");
+            }
+        } else {
+            ESP_LOGW(TAG, "寄存器体检失败（读寄存器出错），跳过");
+        }
+    }
 
+    s_initialized = true;
+    ESP_LOGI(TAG, "初始化完成（%s mode1 %d Hz，CH0=1x 电压 / CH1=16x 电流，ODR=%u SPS，DRDY#=IO%d）",
+             ADS_SPI_HOST_NAME, ADS_SPI_CLK_HZ, ADS_ODR_HZ, BOARD_PIN_ADC_DRDY);
+    return ESP_OK;
 fail_dev:
     if (isr_handler_added) {
         gpio_isr_handler_remove(BOARD_PIN_ADC_DRDY);
@@ -644,11 +747,17 @@ esp_err_t ads131m02_read(ads131m02_sample_t *out)
     esp_err_t err = ads_xfer_raw(tx, rx, ADS_FRAME_WORDS);
 
     if (err == ESP_OK) {
-        /* rx[0] 是 STATUS，本驱动暂不使用；CH0 / CH1 为 24bit 补码 */
+        /* rx[0] 是 STATUS，rx[1]/rx[2] 为 CH0/CH1 的 24bit 补码 */
+        out->status = (uint32_t)(rx[0] >> 8);
         out->voltage_raw = ads_sign_extend24(rx[1]); /* CH0 = AIN0 = 电压 */
         out->current_raw = ads_sign_extend24(rx[2]); /* CH1 = AIN1 = 电流 */
     }
 
     xSemaphoreGive(s_bus_mutex);
     return err;
+}
+
+uint32_t ads131m02_get_sample_rate_hz(void)
+{
+    return s_initialized ? ADS_ODR_HZ : 0;
 }

@@ -6,9 +6,15 @@
  * 因此驱动须在启动早期忽略该键（仅记录，不触发业务动作）。
  *
  * 实现要点（详见 src/button.c）：
- *   用官方 esp_driver_gpio + esp_timer 周期轮询消抖，未使用托管组件
- *   espressif/button（其 button_event_t 与本文件同名类型冲突，且需为
+ *   用官方 esp_driver_gpio + esp_timer 周期轮询（10ms），语义判定
+ *   （消抖/单击/双击/长按）由纯逻辑状态机 button_fsm.h 完成，未使用托管
+ *   组件 espressif/button（其 button_event_t 与本文件同名类型冲突，且需为
  *   IO0 的 strapping 特性定制安全策略，理由见 src/button.c 文件头）。
+ *
+ * 事件时序（详见 button_fsm.h）：
+ *   · SINGLE_CLICK 在释放后 300ms 双击窗口超时后才派发（有意延迟）；
+ *   · DOUBLE_CLICK 为第二次释放后窗口超时派发；
+ *   · LONG_PRESS_START 按住 800ms 派发一次，松开派发 LONG_PRESS_RELEASE。
  * 注意：本驱动只提供事件回调，没有可供查询的读取接口。
  */
 #pragma once
@@ -22,11 +28,12 @@ typedef enum {
     BUTTON_ID_MAX,      /**< 按键数量哨兵 */
 } button_id_t;
 
-/** 按键事件类型 */
+/** 按键事件类型（与 button_fsm 的语义事件一一对应） */
 typedef enum {
-    BUTTON_EVENT_SHORT_PRESS = 0, /**< 短按（按下并释放） */
-    BUTTON_EVENT_LONG_PRESS,      /**< 长按达到阈值 */
-    BUTTON_EVENT_RELEASE,         /**< 释放 */
+    BUTTON_EVENT_SINGLE_CLICK = 0,  /**< 单击（双击窗口超时后确认） */
+    BUTTON_EVENT_DOUBLE_CLICK,      /**< 双击 */
+    BUTTON_EVENT_LONG_PRESS_START,  /**< 长按达到阈值（仅一次） */
+    BUTTON_EVENT_LONG_PRESS_RELEASE,/**< 长按后松开 */
 } button_event_t;
 
 /**
@@ -34,11 +41,14 @@ typedef enum {
  * @param id       产生事件的按键
  * @param event    事件类型
  * @param user_ctx 注册时传入的用户上下文
+ *
+ * 注意：回调运行在 esp_timer 任务上下文，禁止阻塞/长耗时操作，
+ * 也不要直接操作 LVGL；请向业务任务投递消息。
  */
 typedef void (*button_event_cb_t)(button_id_t id, button_event_t event, void *user_ctx);
 
 /**
- * @brief 初始化按键驱动（配置 GPIO 输入与消抖）
+ * @brief 初始化按键驱动（配置 GPIO 输入、消抖轮询与状态机）
  * @return ESP_OK 成功
  */
 esp_err_t button_init(void);

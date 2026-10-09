@@ -76,3 +76,8 @@ Desktop.ini
 *.workspace # General workspace files, can be from various tools
 *.suo       # Visual Studio Solution User Options
 *.sln.docstates # Visual Studio
+
+# 字体工具下载的可变字体缓存（体积大，可由 make_fonts.py 重新下载）
+tools/fonts/.cache/
+# UI 预览脚本生成的截图输出
+tools/ui_preview/out/

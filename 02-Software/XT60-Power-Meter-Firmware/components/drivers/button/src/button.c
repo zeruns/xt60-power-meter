@@ -1,14 +1,14 @@
 /**
  * @file button.c
- * @brief 实体按键驱动实现（GPIO 输入 + 消抖 + 短按/长按/释放事件）
+ * @brief 实体按键驱动实现（GPIO 输入 + 周期采样 + 状态机事件判定）
  *
  * 器件：K1 = IO0（兼 BOOT），K2 = IO4，均为低电平有效（按下接地）。
  * 引脚见 board_pins.h 的 BOARD_PIN_KEY_BOOT / BOARD_PIN_KEY_USER。
  *
  * 阅读顺序建议：
- *   ① button_init()      —— 配 GPIO 输入 + 启动周期消抖定时器；
- *   ② button_tick()      —— 每 15ms 采样一次，做消抖与事件判定；
- *   ③ dispatch()         —— 把事件回调派发给上层（在 esp_timer 任务上下文）。
+ *   ① button_init()    —— 配 GPIO 输入 + 启动 10ms 周期采样定时器；
+ *   ② button_tick()    —— 每 10ms 采样一次，喂给纯逻辑状态机并派发事件；
+ *   ③ button_fsm.h/.c  —— 消抖 / 单击 / 双击 / 长按的时序判定（可主机单测）。
  *
  * ============================================================
  * 为什么用 esp_driver_gpio + esp_timer 自实现，而非托管组件 espressif/button
@@ -16,7 +16,7 @@
  * 1. 类型冲突：托管组件 iot_button.h 也定义了名为 button_event_t 的类型，
  *    与本工程固定接口 button.h 的 button_event_t 同名不同义，两者在同一编译
  *    单元内会重定义报错。本接口为既定契约，不可改名。
- * 2. 需求差异：本接口的事件模型（SHORT/LONG/RELEASE）与 IO0 strapping 脚
+ * 2. 需求差异：本接口的事件模型（单击/双击/长按）与 IO0 strapping 脚
  *    「启动早期忽略」的安全要求，都需要定制映射。
  * 故按官方底层驱动 esp_driver_gpio + esp_timer 实现，与 status_led 风格一致，
  * 无额外托管依赖。esp_driver_gpio 本身即 ESP-IDF 官方驱动组件。
@@ -27,17 +27,14 @@
  * IO0 复位期间须为高，按住复位会进入下载模式。因此：
  *   · 本驱动只把 IO0 配成「输入 + 上拉」，永不主动驱动它，不影响 strapping；
  *   · 「启动早期忽略」：若该键在初始化时正处于按下态（即复位期间被按住），
- *     则在它第一次被释放之前不派发任何事件（仅内部记录），避免把复位误触
- *     当成业务按键动作。释放后即恢复正常检测。
+ *     则在它第一次被释放之前不向状态机喂任何电平（仅内部记录），避免把复位
+ *     误触当成业务按键动作。释放后初始化状态机并恢复正常检测。
  *
  * ============================================================
- * 上板调试要点（按键无反应/误触发时排查）
+ * 回调上下文约束
  * ============================================================
- *   · 无反应：核对 IO0/IO4 电平（按下应为低）、上拉电阻、按键是否虚焊。
- *   · 一次按下触发多次：多为机械抖动，增大 BUTTON_DEBOUNCE_TICKS。
- *   · 长按误判为短按：调 BUTTON_LONG_PRESS_MS 阈值。
- *   · 回调上下文：回调在 esp_timer 任务里执行，禁止阻塞/长延时，
- *     需要耗时操作请自行投递到业务任务（如 event_bus）。
+ *   回调在 esp_timer 任务里执行，禁止阻塞/长延时，禁止直接调用 LVGL API。
+ *   UI 层的做法是把事件投递到自己的消息队列，在 UI 任务里消费。
  * ============================================================
  */
 #include "button.h"
@@ -45,6 +42,7 @@
 #include <string.h>
 
 #include "board_pins.h"
+#include "button_fsm.h"
 
 #include "driver/gpio.h"
 #include "esp_log.h"
@@ -53,23 +51,17 @@
 /** 日志标签 */
 static const char *TAG = "button";
 
-/* 消抖与长按参数 */
-#define BUTTON_POLL_MS         15  /**< 采样周期（毫秒） */
-#define BUTTON_DEBOUNCE_TICKS  2   /**< 连续稳定采样次数才认作有效电平（≈30ms） */
-#define BUTTON_LONG_PRESS_MS   800 /**< 长按阈值（毫秒） */
+/** 采样周期（毫秒）。状态机的时序阈值全部基于该时基（可整除 20/300/800） */
+#define BUTTON_POLL_MS 10
 
 /** 单个按键的运行状态 */
 typedef struct {
     gpio_num_t pin;              /**< 绑定的 GPIO */
     const char *name;            /**< 名称，仅用于日志 */
-    bool suppress_until_release; /**< strapping 安全：首次释放前不派发事件 */
+    bool suppress_until_release; /**< strapping 安全：首次释放前不喂状态机 */
+    bool fsm_ready;              /**< 状态机是否已开始喂样本 */
 
-    bool raw_pressed;      /**< 上次采样的原始按下态（未消抖） */
-    bool stable_pressed;   /**< 消抖后的稳定按下态 */
-    int debounce_cnt;      /**< 连续同态采样计数 */
-
-    int64_t press_start_us; /**< 本次按下的起始时刻（微秒） */
-    bool long_fired;        /**< 本次按下是否已派发过长按 */
+    button_fsm_t fsm; /**< 纯逻辑按键状态机 */
 
     button_event_cb_t cb; /**< 事件回调 */
     void *cb_ctx;         /**< 回调用户上下文 */
@@ -85,29 +77,44 @@ static esp_timer_handle_t s_timer = NULL;
 static bool s_initialized = false;
 
 /**
- * @brief 派发事件给注册的回调
+ * @brief 把状态机事件映射为驱动事件并派发给注册的回调
  *
  * 在 esp_timer 任务上下文执行，回调不得阻塞。
  */
-static void dispatch(button_state_t *btn, button_event_t event)
+static void dispatch_fsm_event(button_state_t *btn, button_fsm_event_t ev)
 {
-    if (btn->suppress_until_release) {
-        /* 启动早期忽略期：仅记录，不触发业务动作 */
-        ESP_LOGD(TAG, "%s 按键事件 %d 被忽略（strapping 启动保护中）", btn->name, event);
+    button_event_t event;
+    switch (ev) {
+    case BUTTON_FSM_SINGLE_CLICK:
+        event = BUTTON_EVENT_SINGLE_CLICK;
+        break;
+    case BUTTON_FSM_DOUBLE_CLICK:
+        event = BUTTON_EVENT_DOUBLE_CLICK;
+        break;
+    case BUTTON_FSM_LONG_PRESS_START:
+        event = BUTTON_EVENT_LONG_PRESS_START;
+        break;
+    case BUTTON_FSM_LONG_PRESS_RELEASE:
+        event = BUTTON_EVENT_LONG_PRESS_RELEASE;
+        break;
+    case BUTTON_FSM_NONE:
+    default:
         return;
     }
+
     if (btn->cb != NULL) {
         btn->cb((button_id_t)(btn - s_buttons), event, btn->cb_ctx);
     }
 }
 
 /**
- * @brief 消抖定时器周期回调：采样 + 事件判定
+ * @brief 采样定时器周期回调：读电平 → strapping 过滤 → 喂状态机 → 派发事件
  */
 static void button_tick(void *arg)
 {
     (void)arg;
-    int64_t now = esp_timer_get_time();
+    /* 毫秒时间戳（允许回绕，状态机内部按有符号差值处理） */
+    uint32_t now_ms = (uint32_t)(esp_timer_get_time() / 1000);
 
     for (int i = 0; i < BUTTON_ID_MAX; i++) {
         button_state_t *btn = &s_buttons[i];
@@ -115,49 +122,26 @@ static void button_tick(void *arg)
         /* 低电平有效：读到 0 即按下 */
         bool pressed = (gpio_get_level(btn->pin) == 0);
 
-        /* ---- 消抖：连续 BUTTON_DEBOUNCE_TICKS 次同态才更新稳定态 ---- */
-        if (pressed == btn->raw_pressed) {
-            btn->debounce_cnt++;
-        } else {
-            btn->raw_pressed = pressed;
-            btn->debounce_cnt = 0;
-        }
-
-        if (btn->debounce_cnt < BUTTON_DEBOUNCE_TICKS || pressed == btn->stable_pressed) {
-            /* 尚未稳定，或稳定态未变化：只做长按计时维持 */
-            if (btn->stable_pressed && !btn->long_fired &&
-                (now - btn->press_start_us) >= (int64_t)BUTTON_LONG_PRESS_MS * 1000) {
-                btn->long_fired = true;
-                dispatch(btn, BUTTON_EVENT_LONG_PRESS);
+        /* ---- strapping 启动保护：首次释放前完全不喂状态机 ---- */
+        if (btn->suppress_until_release) {
+            if (!pressed) {
+                btn->suppress_until_release = false;
+                btn->fsm_ready = true;
+                button_fsm_init(&btn->fsm);
+                ESP_LOGD(TAG, "%s 首次释放，解除启动保护，按键状态机开始工作", btn->name);
+            } else {
+                ESP_LOGD(TAG, "%s 启动保护期内保持按下，忽略", btn->name);
             }
             continue;
         }
 
-        /* ---- 稳定态发生翻转 ---- */
-        btn->stable_pressed = pressed;
-
-        if (pressed) {
-            /* 按下沿：记录起始时刻，进入 strapping 保护判定 */
-            btn->press_start_us = now;
-            btn->long_fired = false;
-            if (btn->suppress_until_release) {
-                /* 复位期间被按住的键：维持忽略，等释放 */
-                ESP_LOGD(TAG, "%s 在启动保护期内按下，忽略", btn->name);
-            }
-        } else {
-            /* 释放沿：解除启动保护（首次释放即恢复），并派发释放/短按 */
-            bool was_suppressed = btn->suppress_until_release;
-            btn->suppress_until_release = false;
-
-            if (!was_suppressed) {
-                dispatch(btn, BUTTON_EVENT_RELEASE);
-                if (!btn->long_fired) {
-                    dispatch(btn, BUTTON_EVENT_SHORT_PRESS);
-                }
-            } else {
-                ESP_LOGD(TAG, "%s 首次释放，解除启动保护，后续按键恢复正常", btn->name);
-            }
+        if (!btn->fsm_ready) {
+            btn->fsm_ready = true;
+            button_fsm_init(&btn->fsm);
         }
+
+        button_fsm_event_t ev = button_fsm_update(&btn->fsm, pressed, now_ms);
+        dispatch_fsm_event(btn, ev);
     }
 }
 
@@ -194,6 +178,7 @@ esp_err_t button_init(void)
                      esp_err_to_name(err));
             return err;
         }
+        button_fsm_init(&s_buttons[i].fsm);
     }
 
     /* ---- ③ strapping 保护的精确化 ----
@@ -205,12 +190,13 @@ esp_err_t button_init(void)
     for (int i = 0; i < BUTTON_ID_MAX; i++) {
         if (s_buttons[i].suppress_until_release && gpio_get_level(s_buttons[i].pin) != 0) {
             s_buttons[i].suppress_until_release = false;
+            s_buttons[i].fsm_ready = true;
             ESP_LOGI(TAG, "%s 启动时未按下，无需 strapping 保护", s_buttons[i].name);
         }
     }
 
-    /* ---- ④ 启动周期消抖定时器 ----
-     * 用周期 esp_timer 轮询而非 GPIO 中断：两个按键消抖本就是周期采样，
+    /* ---- ④ 启动周期采样定时器 ----
+     * 用周期 esp_timer 轮询而非 GPIO 中断：按键判定本就是周期采样，
      * 无 ISR，简单可靠，且与 status_led 的定时器用法一致。 */
     const esp_timer_create_args_t timer_cfg = {
         .callback = button_tick,
@@ -220,20 +206,21 @@ esp_err_t button_init(void)
     };
     esp_err_t err = esp_timer_create(&timer_cfg, &s_timer);
     if (err != ESP_OK) {
-        ESP_LOGE(TAG, "消抖定时器创建失败: %s", esp_err_to_name(err));
+        ESP_LOGE(TAG, "采样定时器创建失败: %s", esp_err_to_name(err));
         return err;
     }
     err = esp_timer_start_periodic(s_timer, BUTTON_POLL_MS * 1000);
     if (err != ESP_OK) {
-        ESP_LOGE(TAG, "消抖定时器启动失败: %s", esp_err_to_name(err));
+        ESP_LOGE(TAG, "采样定时器启动失败: %s", esp_err_to_name(err));
         esp_timer_delete(s_timer);
         s_timer = NULL;
         return err;
     }
 
     s_initialized = true;
-    ESP_LOGI(TAG, "初始化完成（%d 个按键，消抖 %d×%dms，长按阈值 %dms）", BUTTON_ID_MAX,
-             BUTTON_DEBOUNCE_TICKS, BUTTON_POLL_MS, BUTTON_LONG_PRESS_MS);
+    ESP_LOGI(TAG, "初始化完成（%d 个按键，采样 %dms，消抖 %dms，双击窗口 %dms，长按 %dms）",
+             BUTTON_ID_MAX, BUTTON_POLL_MS, BUTTON_FSM_DEBOUNCE_MS, BUTTON_FSM_DOUBLE_GAP_MS,
+             BUTTON_FSM_LONG_MS);
     return ESP_OK;
 }
 
@@ -243,7 +230,7 @@ esp_err_t button_register_callback(button_id_t id, button_event_cb_t cb, void *u
         return ESP_ERR_INVALID_ARG;
     }
     if (!s_initialized) {
-        /* 尚未初始化：无法写入状态机，明确报错避免静默丢失 */
+        /* 尚未初始化：无法写入状态，明确报错避免静默丢失 */
         return ESP_ERR_INVALID_STATE;
     }
 

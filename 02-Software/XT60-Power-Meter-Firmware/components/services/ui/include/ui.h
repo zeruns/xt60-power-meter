@@ -2,16 +2,12 @@
  * @file ui.h
  * @brief LVGL 界面层（与非 UI 代码物理隔离）
  *
- * 规划的子目录：
- *   src/screens/   主界面、曲线、设置、校准、关于
- *   src/widgets/   自定义 LVGL 控件
- *   src/theme/     主题与样式
- *   assets/        字体、图标、图片等 LVGL 资源
+ * 结构：
+ *   src/screens/  启动画面、测量页、波形页、设置页、波形设置滑板
+ *   src/ui_nav    三页 tileview 导航、页面指示点、按键路由
  *
  * 数据只通过 middleware/data_store 的快照读取，不直接访问驱动层。
- *
- * 当前阶段：用 LVGL 官方 widgets demo 验证显示与触控；
- *   正式界面就绪后替换为 src/screens/ 下的界面构建。
+ * 按键事件由 button 驱动回调投递队列，在 UI 任务内消费。
  */
 #pragma once
 

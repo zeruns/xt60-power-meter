@@ -16,8 +16,9 @@
 
 /** 一次同步采样结果（ADC 原始码值） */
 typedef struct {
-    int32_t voltage_raw; /**< AIN0 原始码值 */
-    int32_t current_raw; /**< AIN1 原始码值 */
+    int32_t voltage_raw; /**< AIN0 原始码值（24bit 符号扩展） */
+    int32_t current_raw; /**< AIN1 原始码值（24bit 符号扩展） */
+    uint32_t status;     /**< 本帧 STATUS 字（高 16bit 有效，见手册 §8.6.2） */
 } ads131m02_sample_t;
 
 /**
@@ -32,3 +33,14 @@ esp_err_t ads131m02_init(void);
  * @return ESP_OK 成功；ESP_ERR_TIMEOUT 等待 DRDY# 超时
  */
 esp_err_t ads131m02_read(ads131m02_sample_t *out);
+
+/**
+ * @brief 查询配置的输出数据率（ODR）
+ *
+ * init() 会把 CLOCK 寄存器显式配置为 HR 模式 + OSR=1024：
+ *   f_MOD = f_CLKIN / 2 = 8.192MHz / 2 = 4.096MHz
+ *   ODR   = f_MOD / OSR = 4.096MHz / 1024 = 4000 Hz（本工程默认采样率）
+ *
+ * @return 采样率（Hz）；驱动未初始化时返回 0
+ */
+uint32_t ads131m02_get_sample_rate_hz(void);

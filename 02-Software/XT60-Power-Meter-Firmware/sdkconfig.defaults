@@ -144,35 +144,27 @@ CONFIG_LV_COLOR_DEPTH_16=y
 #   既不用软件逐像素交换、性能也更好。
 #   对应 LVGL 9 的 lv_display_set_color_format(LV_COLOR_FORMAT_RGB565_SWAPPED)。
 CONFIG_LV_COLOR_FORMAT_RGB565_SWAPPED=y
-# 启用官方 widgets demo：UI 组件先用它验证显示与触控，
-# 正式界面（services/ui 的 screens/）就绪后可关闭本项
-CONFIG_LV_USE_DEMO_WIDGETS=y
-# 显示 FPS 与 CPU 占用（demo/调试期观察性能；正式发布可关闭）
-# ⚠ LV_USE_PERF_MONITOR 位于 Kconfig 的 `if LV_USE_SYSMON` 块内，
-#   必须同时打开 LV_USE_SYSMON，否则该项被条件屏蔽、屏幕上看不到任何显示。
-CONFIG_LV_USE_SYSMON=y
-CONFIG_LV_USE_PERF_MONITOR=y
-# 显示位置：默认是右下角，这里按习惯放到右上角
-CONFIG_LV_PERF_MONITOR_ALIGN_TOP_RIGHT=y
-# 中文字体方案：tiny_ttf + 嵌入子集化 TTF（components/middleware/lvgl_port/fonts/）
-#   为什么不用内置 Source Han Sans CJK：
-#     ① 内置字体只收录约 1200 个常用 CJK 字符，"率/博/客/软/件/版"等字缺失，
-#        显示为方框（tofu）；
-#     ② 字号固定（仅 14/16px），无法做更大的标题。
-#   tiny_ttf 基于 stb_truetype，运行时从嵌入的 TTF 按需渲染任意字号，
-#   TTF 仅子集化本工程用到的字符（约 25KB），内存与 Flash 开销都很小。
+# 正式测量界面已上线，不再编译官方 widgets demo
+# CONFIG_LV_USE_DEMO_WIDGETS is not set
+# 关闭 FPS/CPU 性能监视器与 sysmon（不再需要屏幕角标）
+# CONFIG_LV_USE_SYSMON is not set
+# CONFIG_LV_USE_PERF_MONITOR is not set
+# 中文字体方案：tiny_ttf，字体文件放 SPIFFS（storage 分区，挂载于 /spiffs）
+#   字体由 tools/fonts/make_fonts.py 生成（Noto Sans SC Regular/Bold，
+#   GB2312 一级字库子集，OFL 授权），构建时打入 SPIFFS 镜像随固件烧入，
+#   不占 app 程序分区空间。lvgl_port_init 时用标准 fopen 把两个 TTF 整读入
+#   PSRAM（约 2.2MB），之后渲染走内存，运行期对 flash 零访问（避免渲染中
+#   读 SPIFFS 与 flash 擦除/LCD DMA 交错引发的 cache 故障）。
+#   文件缺失时 lvgl_port 回退内置 montserrat14（仅 ASCII）。
+#   tiny_ttf 运行时只使用内存接口 lv_tiny_ttf_create_data，不需要文件支持。
 CONFIG_LV_USE_TINY_TTF=y
-# 不需要从文件系统加载 TTF（字体已嵌入 Flash），关闭 FILE_SUPPORT 减少代码
 # CONFIG_LV_TINY_TTF_FILE_SUPPORT is not set
 CONFIG_LV_TINY_TTF_CACHE_GLYPH_CNT=64
 CONFIG_LV_TINY_TTF_CACHE_KERNING_CNT=16
 # LVGL 内存池大小（lv_malloc 的堆）。
 # ⚠ 符号名注意：LVGL 9.6 已废弃 LV_MEM_SIZE_KILOBYTES（KB），改为
 #   LV_MEM_SIZE（字节，默认 65536）。写旧名会得到「DEPRECATED」且不生效。
-# 为什么要加大到 128KB：组件默认 64KB 跑 lv_demo_widgets() 会在
-#   LV_ASSERT_MALLOC（本工程已开启该断言）处耗尽内存池并挂死，
-#   现象是「上电先白屏后黑屏、界面不刷新」。厂商 TK018F3716 例程
-#   用的就是 128KB，这里对齐该实测可用值。
+# 正式界面（tileview + chart + 三级对象）与此前 demo 实测同档，保持 128KB。
 # 该内存池是静态数组，占用内部 RAM（S3 有 512KB，可承受）。
 CONFIG_LV_MEM_SIZE=131072
 
@@ -187,3 +179,12 @@ CONFIG_ESP_SYSTEM_EVENT_TASK_STACK_SIZE=4096
 # 网页控制台需要 HTTP 服务端 + WebSocket 同时占用多个 socket，
 # 默认 10 个偏少，加大到 16
 CONFIG_LWIP_MAX_SOCKETS=16
+
+# ============================================================
+# Flash 擦除窗口与中断安全（必须）
+# ============================================================
+# NVS 定时落盘（电能/运行时间）会擦除 Flash，期间两条 CPU 的 cache 短暂关闭；
+# 此时 ADS131M02 的 DRDY# 仍以 4kHz 产生 GPIO 下降沿中断。GPIO ISR 派发服务
+# 默认链接在 Flash 中，若在 cache 关闭窗口被挂起触发会引发 Cache error 崩溃。
+# 把 GPIO ISR 服务整体放 IRAM 后，任意 Flash 擦除期间 GPIO 中断均安全。
+CONFIG_GPIO_ISR_IRAM_SAFE=y

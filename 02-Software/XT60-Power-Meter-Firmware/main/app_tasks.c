@@ -5,6 +5,7 @@
 #include "app_tasks.h"
 
 #include "data_store.h"
+#include "power_measure.h"
 #include "system_state.h"
 #include "ui.h"
 
@@ -92,6 +93,19 @@ static void task_sys_monitor(void *arg)
 
 esp_err_t app_tasks_start(void)
 {
+    /* ---- 测量任务（最先启动，绑 Core1）----
+     * 4kSPS 由 ADS131M02 DRDY 自节奏驱动；ADC 关键故障时 init 已判失败，
+     * 能走到这里说明测量链路初始化通过。启动失败不阻断 UI 与巡检，
+     * 但会记录错误日志（此时通常是任务内存不足，属系统级异常）。 */
+    if ((system_state_get_fault_mask() & SYSTEM_FAULT_ADC) == 0) {
+        esp_err_t err = power_measure_start();
+        if (err != ESP_OK) {
+            ESP_LOGE(TAG, "测量任务启动失败: %s", esp_err_to_name(err));
+        }
+    } else {
+        ESP_LOGW(TAG, "测量前端故障，跳过测量任务启动");
+    }
+
     /* ---- UI 任务 ----
      * 门控条件：显示链路（lcd_nv3030b + lvgl_port）必须初始化成功。
      * 走到这里说明启动表与硬件自检都已完成（见 app_init.c），
