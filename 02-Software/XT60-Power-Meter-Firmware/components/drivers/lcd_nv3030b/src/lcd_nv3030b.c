@@ -117,6 +117,20 @@ static bool s_initialized = false;
 static lcd_nv3030b_flush_done_cb_t s_flush_done_cb = NULL;
 static void *s_flush_done_ctx = NULL;
 
+/* ---------------- 句柄导出（供官方 esp_lvgl_port 注册显示） ----------------
+ * 改用 ESP 官方 espressif/esp_lvgl_port 后，显示设备由它调用
+ * lvgl_port_add_disp() 注册（它需要 panel / panel IO 句柄自行刷屏），
+ * 故把内部持有的两个句柄暴露出去；未初始化时返回 NULL。 */
+esp_lcd_panel_handle_t lcd_nv3030b_get_panel_handle(void)
+{
+    return s_panel;
+}
+
+esp_lcd_panel_io_handle_t lcd_nv3030b_get_io_handle(void)
+{
+    return s_io;
+}
+
 /* ============================================================
  * 旋转（MADCTL 0x36）
  *
@@ -380,20 +394,13 @@ esp_err_t lcd_nv3030b_init(void)
 
     esp_err_t err = ESP_OK;
 
-    /* ---- ① 复位脚：输出 + 默认高（不复位） ---- */
-    const gpio_config_t rst_cfg = {
-        .pin_bit_mask = 1ULL << BOARD_PIN_LCD_RST,
-        .mode = GPIO_MODE_OUTPUT,
-        .pull_up_en = GPIO_PULLUP_DISABLE,
-        .pull_down_en = GPIO_PULLDOWN_DISABLE,
-        .intr_type = GPIO_INTR_DISABLE,
-    };
-    err = gpio_config(&rst_cfg);
-    if (err != ESP_OK) {
-        ESP_LOGE(TAG, "复位脚 IO%d 配置失败: %s", BOARD_PIN_LCD_RST, esp_err_to_name(err));
-        return err;
-    }
-    gpio_set_level(BOARD_PIN_LCD_RST, 1);
+    /* ---- ① 复位脚：由 esp_lcd 托管，这里不再手动配置 ----
+     * 历史写法是先在此外 gpio_config() 把 RST 拉高，随后又在 panel_cfg 里
+     * 把同一引脚以 reset_gpio_num 交给 esp_lcd —— 等于重复占用同一 GPIO。
+     * V6.1 的 GPIO 驱动新增了冲突检测，会因此打印
+     * “gpio: conflict found for GPIO[7]” 告警。esp_lcd 在
+     * esp_lcd_panel_reset() 内部会自行把该引脚配为输出并输出复位脉冲，
+     * 因此此处无需（也不应）再手动配置。 */
 
     /* ---- ② 建 QSPI 总线（4 根数据线） ----
      * 只写 sclk/data0~3：它们在 spi_bus_config_t 里与旧字段 mosi/miso/

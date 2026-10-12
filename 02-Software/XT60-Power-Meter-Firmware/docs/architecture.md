@@ -18,7 +18,7 @@
 │ middleware/      中间件 / 适配层                     │
 │                  event_bus  data_store               │
 │                  lvgl_port  wifi_manager  web_console│
-│                  lvgl（LVGL 9.6 源码，已 vendor 入库） │
+│                  lvgl、esp_lvgl_port（组件管理器托管） │
 ├─────────────────────────────────────────────────────┤
 │ drivers/         设备驱动层（每个外设一个组件）        │
 │                  status_led  ads131m02  lcd_nv3030b  │
@@ -50,19 +50,25 @@
 1. **业务代码里不得出现 `gpio_set_level` / `spi_device_*` / `i2c_master_*` 等裸外设调用**，必须经 `drivers` 封装；
 2. **引脚编号只允许出现在 `components/bsp/include/board_pins.h`**，其他文件一律引用 `BOARD_PIN_*` 宏。
 
-### 外部依赖的两种归属
+### 外部依赖：统一由组件管理器托管
 
-工程里的第三方代码只有两类，必须分清，否则容易踩「重名冲突 / 改了不生效」的坑：
+工程里的第三方代码**全部由 ESP 组件管理器托管**（落在 `managed_components/`，由各组件目录下的 `idf_component.yml` 声明）：
 
-| 类别 | 位置 | 是否入库 | 升级方式 | 现有成员 |
-|---|---|---|---|---|
-| **vendor 入库** | `components/middleware/lvgl/` | **是**（纳入版本管理） | 手工替换整树 + 回看 Kconfig | LVGL 9.6.0~1 |
-| **组件管理器托管** | `managed_components/`（`idf_component.yml` 声明） | 否（`.gitignore` 已忽略） | 改 `idf_component.yml` 版本号后 `idf.py reconfigure` | `espressif/esp_lcd_spd2010`（及其依赖 `espressif/cmake_utilities`） |
+| 组件 | 声明位置 | 版本 |
+|---|---|---|
+| `lvgl/lvgl` | `components/middleware/lvgl_port/idf_component.yml` | 9.6.0~1 |
+| `espressif/esp_lvgl_port` | 同上 | 2.9.0 |
+| `espressif/esp_lcd_spd2010` | `components/drivers/lcd_nv3030b/idf_component.yml` | 1.0.2（及其依赖 `espressif/cmake_utilities`） |
 
 规则：
-- 一个组件**只能属于一类**。既然 LVGL 已 vendor 入库，其它组件就**不允许**再声明 `lvgl/lvgl` 依赖，
-  否则组件管理器会拉一份同名副本，与本地源码冲突（且本地改动会被覆盖）。
-- 托管组件的版本记录在 `dependencies.lock`（入库），保证换机器能复现同一版本。
+- **不再 vendor 任何第三方源码**（早期 LVGL 曾 vendor 到 `components/middleware/lvgl/`，现已移除）。
+- 托管组件的版本记录在 `dependencies.lock`（入库），保证换机器能复现同一版本；升级时改
+  `idf_component.yml` 的版本号后 `idf.py reconfigure` 即可。
+- 托管组件的 CMake 目标名为「`<命名空间>__<组件名>`」（如 `lvgl__lvgl`、`espressif__esp_lvgl_port`），
+  `REQUIRES` 里必须用这个全名。
+- ⚠ **组件重名规避**：官方 `espressif/esp_lvgl_port` 的 CMake 会探测名为 `button` 的组件并编译其
+  iot_button 适配（`esp_lvgl_port_button.c`）。因此本工程的按键驱动组件命名为 `key_button`，
+  **不能**叫 `button`，否则会被按 iot_button 的 API 编译而报错。
 
 ---
 
@@ -416,10 +422,10 @@ opcode 封装与约 200 条分页式初始化序列都由组件负责，**驱动
 
 | 组件 | 职责 |
 |---|---|
-| `components/middleware/lvgl/` | LVGL 9.6 源码本体，**已 vendor 入库** |
-| `components/drivers/lcd_nv3030b/` | QSPI 总线 + 面板（官方 `esp_lcd_spd2010`）+ 背光 + 刷新完成回调 |
+| `lvgl/lvgl`（组件管理器托管） | LVGL 9.6 源码本体 |
+| `components/drivers/lcd_nv3030b/` | QSPI 总线 + 面板（官方 `esp_lcd_spd2010`）+ 背光 + 导出 panel/io 句柄 |
 | `components/drivers/touch_cst816d/` | 触摸读点（解析与厂商 STM32 参考例程一致） |
-| `components/middleware/lvgl_port/` | 注册显示/输入设备、心跳、线程安全锁、字体（SPIFFS→PSRAM） |
+| `components/middleware/lvgl_port/` | 应用侧适配：字体（SPIFFS→PSRAM）、触摸 indev、首帧计数、旋转；LVGL 内核/任务/心跳/锁/显示由官方 `espressif/esp_lvgl_port` 提供 |
 | `components/middleware/fs_storage/` | storage 分区挂为 `/spiffs`，字体镜像（`spiffs_create_partition_image`） |
 | `components/services/ui/` | 启动页 + 测量/波形/设置三页（tileview/chart/roller 官方组件） |
 | `components/services/power_measure/` | 4kHz 采样、RMS/功率/电能、三级波形缓冲、NVS 掉电保存 |

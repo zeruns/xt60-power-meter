@@ -1,12 +1,17 @@
-## lvgl_port 组件依赖
+## lvgl_port 组件依赖（改用 ESP 官方组件管理器托管）
 ##
-## 关于 LVGL 图形库的引入方式（重要）：
-##   LVGL 源码已 **vendor 进本仓库**，位于 components/middleware/lvgl/
-##   （版本 9.6.0~1）。因此这里**不再**声明 lvgl/lvgl 依赖——否则会与本地
-##   同名组件冲突，且组件管理器拉取的副本会覆盖本地源码。
-##   升级步骤见 docs/architecture.md「LVGL 与显示子系统的引入方式」。
+## 变更说明（相对早期“vendor 入库”方案）：
+##   · LVGL 图形库不再 vendor 进本仓库，改为声明 lvgl/lvgl 由组件管理器
+##     从 https://components.espressif.com 拉取；
+##   · LVGL 的移植层改用 ESP 官方组件 espressif/esp_lvgl_port。
+##   两者的精确版本记录在工程根目录 dependencies.lock 中，保证跨机器可复现。
+##
+## 注意：一旦声明 lvgl/lvgl，工程内不得再存在同名本地组件（components/**/lvgl），
+## 否则组件管理器会因重名冲突而报错。
 version: "1.0.0"
 description: "LVGL 适配层：注册 LCD/触摸设备、提供心跳与线程安全锁"
 
 dependencies:
   idf: ">=5.5"
+  lvgl/lvgl: "^9"
+  espressif/esp_lvgl_port: "^2"

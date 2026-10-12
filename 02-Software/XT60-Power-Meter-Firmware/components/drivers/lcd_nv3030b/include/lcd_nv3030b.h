@@ -18,6 +18,8 @@
 #include <stdbool.h>
 
 #include "esp_err.h"
+#include "esp_lcd_panel_io.h"
+#include "esp_lcd_panel_ops.h"
 
 /** 面板物理玻璃尺寸（竖屏原生 240 宽 × 284 高，NV3030B 控制器 240×320 的子集） */
 #define LCD_NV3030B_PHYS_W 240
@@ -141,3 +143,19 @@ esp_err_t lcd_nv3030b_register_flush_done_cb(lcd_nv3030b_flush_done_cb_t cb, voi
  */
 esp_err_t lcd_nv3030b_draw_bitmap(int x_start, int y_start, int x_end, int y_end,
                                   const void *color_data);
+
+/**
+ * @brief 获取底层 esp_lcd 面板句柄
+ *
+ * 供 ESP 官方组件 espressif/esp_lvgl_port 的 lvgl_port_add_disp() 使用
+ * （它需要 panel / panel IO 句柄自行完成刷屏与传输完成回调）。
+ *
+ * @return 面板句柄；未初始化时返回 NULL
+ */
+esp_lcd_panel_handle_t lcd_nv3030b_get_panel_handle(void);
+
+/**
+ * @brief 获取底层 esp_lcd 面板 IO 句柄
+ * @return 面板 IO 句柄；未初始化时返回 NULL
+ */
+esp_lcd_panel_io_handle_t lcd_nv3030b_get_io_handle(void);

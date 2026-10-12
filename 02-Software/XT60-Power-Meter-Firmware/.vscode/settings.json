@@ -1,9 +1,9 @@
 {
-    "idf.currentSetup": "D:/Espressif/frameworks/esp-idf-v5.5.2/",
+    "idf.currentSetup": "D:\\Espressif\\v6.1\\esp-idf",
     "idf.openOcdConfigs": [
       "board/esp32s3-builtin.cfg"
     ],
-    "idf.port": "COM6",
+    "idf.port": "COM3",
     "idf.customExtraVars": {
       "IDF_TARGET": "esp32s3"
     },

@@ -120,9 +120,11 @@ CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="partitions.csv"
 
 # 把崩溃现场写入 Flash 的 coredump 分区。
 # 野外设备不会有人守着串口，没有它就无法定位偶发崩溃。
+# 注意：V6.1 中数据格式（ELF）与校验算法（SHA256）已改为由
+# ESP_COREDUMP_ENABLE 自动 select，不再是用户可设置项；
+# 此处若仍写 ESP_COREDUMP_DATA_FORMAT_ELF / ESP_COREDUMP_CHECKSUM_CRC32
+# 会被报为 unknown kconfig symbol（旧名 CRC32 亦已被 SHA256 取代）。
 CONFIG_ESP_COREDUMP_ENABLE_TO_FLASH=y
-CONFIG_ESP_COREDUMP_DATA_FORMAT_ELF=y
-CONFIG_ESP_COREDUMP_CHECKSUM_CRC32=y
 # panic 后延迟 3 秒再复位：留出时间把完整日志打到串口（默认 0 秒会来不及打完）
 CONFIG_ESP_SYSTEM_PANIC_PRINT_REBOOT=y
 CONFIG_ESP_SYSTEM_PANIC_REBOOT_DELAY_SECONDS=3
@@ -133,7 +135,7 @@ CONFIG_ESP_SYSTEM_PANIC_REBOOT_DELAY_SECONDS=3
 CONFIG_ESP_BROWNOUT_DET=y
 
 # ============================================================
-# LVGL 图形库（组件 lvgl，已 vendor 入库到 components/middleware/lvgl）
+# LVGL 图形库（组件 lvgl/lvgl，由 ESP 组件管理器托管，见 dependencies.lock）
 # ============================================================
 # 颜色深度 16bit（RGB565）：与面板驱动的像素格式一致
 CONFIG_LV_COLOR_DEPTH_16=y
@@ -186,5 +188,7 @@ CONFIG_LWIP_MAX_SOCKETS=16
 # NVS 定时落盘（电能/运行时间）会擦除 Flash，期间两条 CPU 的 cache 短暂关闭；
 # 此时 ADS131M02 的 DRDY# 仍以 4kHz 产生 GPIO 下降沿中断。GPIO ISR 派发服务
 # 默认链接在 Flash 中，若在 cache 关闭窗口被挂起触发会引发 Cache error 崩溃。
-# 把 GPIO ISR 服务整体放 IRAM 后，任意 Flash 擦除期间 GPIO 中断均安全。
-CONFIG_GPIO_ISR_IRAM_SAFE=y
+# 把 GPIO 控制/中断函数放 IRAM 后，任意 Flash 擦除期间 GPIO 中断均安全。
+# 注意：V6.1 已把该选项由 GPIO_ISR_IRAM_SAFE 更名为 GPIO_CTRL_FUNC_IN_IRAM，
+# 沿用旧名会被报为 unknown kconfig symbol 并静默失效（等于失去本保护）。
+CONFIG_GPIO_CTRL_FUNC_IN_IRAM=y

@@ -127,7 +127,7 @@ static const init_step_t s_boot_steps[] = {
     { "touch_cst816d", touch_cst816d_init, SYSTEM_FAULT_TOUCH },
     /* LVGL 适配层：注册显示/输入设备并启动心跳。失败则 UI 无法工作，
      * 故与 LCD 共用 SYSTEM_FAULT_LCD 故障位，UI 启动门控据此判断。 */
-    { "lvgl_port", lvgl_port_init, SYSTEM_FAULT_LCD },
+    { "lvgl_port", lvgl_port_app_init, SYSTEM_FAULT_LCD },
 };
 
 /** 初始化步骤个数 */

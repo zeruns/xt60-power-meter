@@ -91,11 +91,10 @@ static void drain_key_queue(void)
  * LVGL 递归建对象极易栈溢出；本任务栈 12KB，职责边界清晰。
  *
  * 主循环节奏（重要）：
- *   固定 20ms 一拍调用 lv_timer_handler()（保证动画/输入流畅），
- *   每 10 拍（200ms）刷新一次数据 → 稳定的 5Hz 刷新率。
- *   ⚠ 不要用"lv_timer_handler() 的返回值来累加计时并延时"那种写法：
- *     返回值最大可能到数百毫秒，会把数据刷新周期拉长成几百毫秒甚至 1 秒，
- *     表现为"数据（尤其选长波形窗时）更新变慢"。用固定节拍就与它无关了。
+ *   LVGL 的 lv_timer_handler() 与心跳已由 ESP 官方 esp_lvgl_port 的内部任务
+ *   驱动（见 middleware/lvgl_port 组件），本任务**不再自行调用** lv_timer_handler()，
+ *   只负责：① 启动画面计时与进度更新；② 每 200ms 刷新一次数据（稳定 5Hz）；
+ *   ③ 消费按键队列。所有 LVGL 访问仍在 lvgl_port_lock() 保护下进行。
  */
 static void task_ui(void *arg)
 {
@@ -117,7 +116,6 @@ static void task_ui(void *arg)
     while (elapsed_ms < UI_SPLASH_HOLD_MS) {
         if (lvgl_port_lock(UI_HANDLER_WAIT_MAX_MS)) {
             splash_set_progress(elapsed_ms * 100u / UI_SPLASH_HOLD_MS);
-            (void)lv_timer_handler();
             lvgl_port_unlock();
         }
         /* 首帧真正上屏后才打开背光：避免开机先看到黑屏/局部条带（见 lcd 驱动注释） */
@@ -174,7 +172,6 @@ static void task_ui(void *arg)
                 }
             }
 
-            (void)lv_timer_handler();
             lvgl_port_unlock();
         }
         vTaskDelayUntil(&last, pdMS_TO_TICKS(UI_LOOP_PERIOD_MS));
