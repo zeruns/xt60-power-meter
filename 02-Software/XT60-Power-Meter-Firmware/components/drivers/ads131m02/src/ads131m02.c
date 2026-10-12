@@ -57,8 +57,8 @@
  *     若实焊的是 R27，ADC 就没有时钟：DRDY# 永远不来，ads131m02_read() 会恒返回
  *     ESP_ERR_TIMEOUT。此时需要另行实现 IO14 的 8.192MHz 输出
  *     （LEDC 无法精确产生该频率，建议用 MCPWM 或 RMT 分频）。
- *   · 【通信锚点】init 里发 RESET 命令后，正常响应字应为 0xFF22。日志若打印
- *     「RESET 响应 0xXXXX 与预期不符」，说明 SPI 通路或字序有问题。
+ *   · 【通信锚点】复位后读 ID 寄存器，其高字节固定为 0x22（手册复位值 22xxh，
+ *     低 8 位“可能变化”）。ID 读不到/高字节不对，说明 SPI 通路或字序有问题。
  *   · 【响应槽位】寄存器访问的响应在「命令帧之后那一帧」的首字（rx[3]）。
  *     若读回值随每次上电变化（像转换数据），说明时钟的字数没凑够整帧、
  *     没走到响应帧——这是本驱动曾踩过的坑，见 ADS_XFER_MAX_WORDS 注释。
@@ -125,7 +125,6 @@ static const char *TAG = "ads131m02";
  * 命令编码（手册 Table 8-11）
  * ============================================================ */
 #define ADS_CMD_NULL   0x0000u /**< 空命令：响应为 STATUS 寄存器 */
-#define ADS_CMD_RESET  0x0011u /**< 复位（响应理论值 0xFF22，实测为命令回显，不作判定） */
 #define ADS_CMD_UNLOCK 0x0655u /**< 解锁寄存器写保护（与 LOCK 0x0555 成对） */
 
 /**
@@ -567,21 +566,13 @@ esp_err_t ads131m02_init(void)
     gpio_set_level(BOARD_PIN_ADC_RST, 1);
     vTaskDelay(pdMS_TO_TICKS(ADS_POWERUP_MS));
 
-    /* ---- ⑦ 软件复位命令 + 通信验证 ----
-     * 说明：上面第⑥步已用 RESET# 引脚做过硬复位；这里的软件 RESET 命令是
-     * 手册推荐的初始化步骤。它的响应理论上是固定值 0xFF22，但实测取到的是
-     * 命令回显 0x0011（软件复位期间器件内部状态机在重启，响应帧不稳定）。
-     * 因此**不拿它做通信判定**，只记 DEBUG；真正的通信锚点是下面 ID 寄存器的
-     * 回读值（手册典型值 0x2205），它对不上才说明 SPI 通路有问题。 */
-    uint16_t reset_resp = 0;
-    err = ads_send_cmd(ADS_CMD_RESET, &reset_resp);
-    if (err != ESP_OK) {
-        goto fail_dev;
-    }
-    ESP_LOGD(TAG, "RESET 命令响应字 = 0x%04X（仅参考，不作判定）", reset_resp);
-    vTaskDelay(pdMS_TO_TICKS(ADS_CMD_GAP_MS));
-
-    /* ---- ⑧ 解锁寄存器写保护（WREG 前必须，否则写入被静默丢弃） ---- */
+    /* ---- ⑦ 解锁寄存器写保护（WREG 前必须，否则写入被静默丢弃） ----
+     * 不在此处额外发软件 RESET 命令的原因（依据手册 §8.4.1.3 / §8.5.1.11）：
+     *   软件 RESET(0011h) 只在“整帧时钟完整”时才被锁存，帧不完整时器件只会
+     *   回显 0011h 且不复位；而本工程 CRC 关闭、每帧固定 3 字，早期实测也确实
+     *   只收到回显。第⑥步的 SYNC/RESET# 引脚硬复位（低电平 2ms ≥ 手册要求的
+     *   2048·tCLKIN≈250µs，随后等待 50ms ≫ tPOR/tREGACQ）已经完整完成复位，
+     *   再发一个无法保证被锁存的软件 RESET 反而产生误导，故省略。 */
     err = ads_send_cmd(ADS_CMD_UNLOCK, NULL);
     if (err != ESP_OK) {
         goto fail_dev;
@@ -635,19 +626,20 @@ esp_err_t ads131m02_init(void)
         }
     }
 
-    /* ---- ⑪ 通信判定：读器件 ID（手册典型值 0x2205） ----
-     * 这是本驱动最可靠的通信锚点：ID 寄存器只读、值固定，
-     * 能正确读回即说明 SPI 模式、字序、DRDY 帧同步都正常。 */
+    /* ---- ⑪ 通信判定：读器件 ID ----
+     * 手册 ID 寄存器（00h）复位值标注为 22xxh：高字节（含 CHANCNT）固定为 0x22，
+     * 低 8 位为保留位且“可能变化（subject to change）”。因此只校验高字节 0x22，
+     * 不把低 8 位写死（早期代码精确比对 0x2205，换硅片版本会误报警告）。 */
     uint16_t dev_id = 0;
     err = ads_read_reg(ADS_REG_ID, &dev_id);
     if (err != ESP_OK) {
         goto fail_dev;
     }
-    if (dev_id == ADS_DEV_ID_TYPICAL) {
-        ESP_LOGI(TAG, "通信验证通过（器件 ID 0x%04X，与手册一致）", dev_id);
+    if ((dev_id & 0xFF00u) == (ADS_DEV_ID_TYPICAL & 0xFF00u)) {
+        ESP_LOGI(TAG, "通信验证通过（器件 ID=0x%04X，高字节与手册 0x22 一致）", dev_id);
     } else {
-        ESP_LOGW(TAG, "器件 ID 回读 0x%04X，与手册典型值 0x%04X 不符（排查见文件头调试要点）",
-                 dev_id, ADS_DEV_ID_TYPICAL);
+        ESP_LOGW(TAG, "器件 ID 回读 0x%04X，高字节应为 0x22（手册复位值 22xxh），"
+                      "排查见文件头调试要点", dev_id);
     }
 
     /* ---- ⑫ 寄存器体检：把决定"读数怎么解释"的位逐一打印出来 ----

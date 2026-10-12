@@ -24,7 +24,11 @@
  *   WHO_AM_I (0x0F)   ：器件 ID，LIS2DH12=0x11；SC7A20H 多为 0x11 或 0x13。
  *   CTRL_REG1 (0x20)  ：ODR[7:4] | LPen[3] | Z/Y/Xen[2:0]。ODR=0b0101(100Hz)，
  *                       三轴使能=0b111 -> 0x57。
- *   CTRL_REG4 (0x23)  ：BDU[7] | FS[5:4] | HR[3]。BDU=1(块更新)、FS=00(±2g) -> 0x80。
+ *   CTRL_REG4 (0x23)  ：bit7=BDU(块更新) | bit[6]=BLE(字节序) | bit[5:4]=FS | bit3=DLPF0
+ *                       | bit[2:1]=ST | bit0=SIM。BDU=1、FS=00(±2g) -> 0x80。
+ *                       注意与 LIS2DH12 的差异：本芯片的 HR（高性能/12bit）位不在
+ *                       0x23，而在 CTRL_REG0(0x1F) 的 bit0（复位默认 0=正常模式）。
+ *                       本驱动仅用主导轴/符号判朝向（与分辨率无关），无需使能 HR。
  *   OUT_X_L (0x28)~OUT_Z_H (0x2D)：6 字节三轴数据，低字节在前，16bit 补码。
  *   连续读：寄存器地址最高位置 1（0x80|0x28=0xA8）触发地址自增。
  *

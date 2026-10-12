@@ -39,6 +39,7 @@
  * ============================================================
  */
 #include "aht20.h"
+#include "aht20_calc.h"
 
 #include <string.h>
 
@@ -207,12 +208,23 @@ esp_err_t aht20_read(aht20_reading_t *out)
         return ESP_ERR_TIMEOUT;
     }
 
-    /* ---- ④ 解析 20bit 湿度 / 温度 ----
+    /* ---- ④ CRC8 校验（手册 §5.2：对前 6 字节 CRC8，初值 0xFF/多项式 0x31） ----
+     * 总线干扰或读时序错位会导致数据损坏；校验不过直接判失败，避免把错误温湿度
+     * 当作有效数据上报（错误数据比“本次读不到”危害更大）。 */
+    if (aht20_crc8(buf, AHT20_READ_LEN - 1) != buf[AHT20_READ_LEN - 1]) {
+        ESP_LOGW(TAG, "AHT20 数据 CRC8 校验失败（计算=0x%02X 器件=0x%02X），丢弃本次读数",
+                 aht20_crc8(buf, AHT20_READ_LEN - 1), buf[AHT20_READ_LEN - 1]);
+        return ESP_ERR_INVALID_CRC;
+    }
+
+    /* ---- ⑤ 解析 20bit 湿度 / 温度 ----
      * 湿度 = (b1<<12 | b2<<4 | b3>>4)，温度 = ((b3&0x0F)<<16 | b4<<8 | b5) */
     uint32_t raw_h = ((uint32_t)buf[1] << 12) | ((uint32_t)buf[2] << 4) | ((uint32_t)buf[3] >> 4);
     uint32_t raw_t = (((uint32_t)buf[3] & 0x0F) << 16) | ((uint32_t)buf[4] << 8) | buf[5];
 
-    out->humidity_pct = (float)raw_h * 100.0f / 1048576.0f;      /* / 2^20 * 100 */
+    /* 湿度物理量程钳制 0~100%RH（温度为机内环境量，保留原值不钳制） */
+    out->humidity_pct =
+        aht20_clamp_rh((float)raw_h * 100.0f / 1048576.0f);       /* / 2^20 * 100 */
     out->temperature_c = (float)raw_t * 200.0f / 1048576.0f - 50.0f; /* / 2^20 * 200 - 50 */
 
     return ESP_OK;

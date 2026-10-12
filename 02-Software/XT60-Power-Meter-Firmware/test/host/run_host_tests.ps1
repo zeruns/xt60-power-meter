@@ -9,7 +9,8 @@
 
     当前测试套件：
       · test_power_calc.c —— 功率换算纯逻辑（power_calc.c）
-      · test_button_fsm.c —— 按键状态机纯逻辑（button_fsm.c）
+      · test_button_fsm.c —— 按键状态机纯逻辑（key_button/button_fsm.c）
+      · test_aht20_calc.c —— AHT20 CRC8 校验与湿度量程钳制（aht20_calc.c）
 
     注意：本文件必须以「UTF-8 带 BOM」保存。Windows PowerShell 5.1 在没有
     BOM 时会按系统本地编码（中文 Windows 为 GBK）解析，导致中文乱码/报错。
@@ -38,10 +39,12 @@ if (-not $compiler) {
 }
 
 # 测试套件表：名称 → 测试文件 + 源文件 + 额外包含目录
-$driversInc = Join-Path $projectDir 'components\drivers\button\include'
-$calcInc    = Join-Path $projectDir 'components\services\power_measure\include'
-$fsmSrc     = Join-Path $projectDir 'components\drivers\button\src\button_fsm.c'
-$calcSrc    = Join-Path $projectDir 'components\services\power_measure\src\power_calc.c'
+$keyButtonInc = Join-Path $projectDir 'components\drivers\key_button\include'
+$aht20Inc     = Join-Path $projectDir 'components\drivers\aht20\include'
+$calcInc      = Join-Path $projectDir 'components\services\power_measure\include'
+$fsmSrc       = Join-Path $projectDir 'components\drivers\key_button\src\button_fsm.c'
+$calcSrc      = Join-Path $projectDir 'components\services\power_measure\src\power_calc.c'
+$aht20CalcSrc = Join-Path $projectDir 'components\drivers\aht20\src\aht20_calc.c'
 
 $suites = @(
     @{
@@ -54,7 +57,13 @@ $suites = @(
         Name    = 'button_fsm'
         TestSrc = Join-Path $here 'test_button_fsm.c'
         Srcs    = @($fsmSrc)
-        Incs    = @($driversInc)
+        Incs    = @($keyButtonInc)
+    },
+    @{
+        Name    = 'aht20_calc'
+        TestSrc = Join-Path $here 'test_aht20_calc.c'
+        Srcs    = @($aht20CalcSrc)
+        Incs    = @($aht20Inc)
     }
 )
 
