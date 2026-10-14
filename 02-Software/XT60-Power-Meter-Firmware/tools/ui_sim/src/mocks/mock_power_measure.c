@@ -23,8 +23,8 @@ static power_measure_calib_t s_calib = {
     .current_offset = 0.0f,
 };
 
-/** 各窗口点数（与真机窗口映射一致的口径） */
-static const uint32_t s_win_points[PM_WAVE_WINDOW_MAX] = { 4000, 4000, 12000, 24000, 1200, 6000 };
+/** 各窗口时长（毫秒）——与真机 s_window_map 口径一致 */
+static const uint32_t s_win_ms[PM_WAVE_WINDOW_MAX] = { 1000, 10000, 30000, 60000, 120000, 600000 };
 
 esp_err_t power_measure_init(void)
 {
@@ -82,14 +82,13 @@ const char *pm_wave_mode_name(pm_wave_mode_t mode)
     return (mode < PM_WAVE_MODE_MAX) ? names[mode] : "?";
 }
 
-/** @brief 第 idx 个样本的假数据（无索引上限，供各窗口复用） */
-static void fake_point(int idx, float *v, float *i, float *p, float *e)
+/** @brief 给定「窗口内相对时刻 t（秒）」的假数据 */
+static void fake_point_at(float t, float *v, float *i, float *p, float *e)
 {
-    float t = (float)idx / 4000.0f;
-    *v = 19.97670f + 0.0040f * sinf(6.2831853f * 2.0f * t);
-    *i = 0.018860f + 0.00040f * sinf(6.2831853f * 3.0f * t + 1.0f);
+    *v = 19.97670f + 0.0040f * sinf(6.2831853f * 0.5f * t);
+    *i = 0.018860f + 0.00040f * sinf(6.2831853f * 0.7f * t + 1.0f);
     *p = (*v) * (*i);
-    *e = 0.11800f + 0.0000005f * (float)idx;
+    *e = 0.11800f + 0.0000005f * (t * 4000.0f);
 }
 
 static void mode_fields(pm_wave_mode_t mode, int *fa, int *fb, bool *has_b)
@@ -113,20 +112,19 @@ int pm_wave_copy(pm_wave_window_t win, pm_wave_mode_t mode, float *a, float *b, 
     bool has_b;
     mode_fields(mode, &fa, &fb, &has_b);
 
-    uint32_t n = s_win_points[win];
-    int stride = ((int)n > max_points) ? (int)((n + (uint32_t)max_points - 1u) / (uint32_t)max_points) : 1;
-
-    int got = 0;
-    for (uint32_t idx = 0; idx < n && got < max_points; idx += (uint32_t)stride) {
+    /* 与真机同一时间槽契约：槽 j = 屏幕第 j 列，右端(max_points-1)=现在，
+     * 每槽固定 = 窗长/槽数。模拟器假定窗口已填满，故每槽都有数据。 */
+    const float step_s = ((float)s_win_ms[win] / 1000.0f) / (float)max_points;
+    for (int j = 0; j < max_points; j++) {
+        const float t = (float)(max_points - 1 - j) * step_s;
         float vals[4];
-        fake_point((int)idx, &vals[0], &vals[1], &vals[2], &vals[3]);
-        a[got] = vals[fa];
+        fake_point_at(t, &vals[0], &vals[1], &vals[2], &vals[3]);
+        a[j] = vals[fa];
         if (has_b && b != NULL) {
-            b[got] = vals[fb];
+            b[j] = vals[fb];
         }
-        got++;
     }
-    return got;
+    return max_points;
 }
 
 bool pm_wave_get_range(pm_wave_window_t win, pm_wave_mode_t mode, float *a_min, float *a_max,

@@ -51,8 +51,8 @@ static const char *TAG = "power_measure";
 /* ============================================================
  * 采样与计算参数
  * ============================================================ */
-#define PM_SAMPLE_RATE_HZ  4000u                 /**< ADC 输出数据率（与驱动配置一致） */
-#define PM_BLOCK_SAMPLES   800u                  /**< 标称 4kHz 下 200ms 的样本数（仅作历史参考） */
+#define PM_SAMPLE_RATE_HZ  500u                  /**< ADC 输出数据率（与驱动 CLOCK OSR=8x 档配置一致） */
+#define PM_BLOCK_SAMPLES   100u                  /**< 标称 500Hz 下 200ms 的样本数（仅作历史参考） */
 #define PM_BLOCK_PERIOD_MS (1000u * PM_BLOCK_SAMPLES / PM_SAMPLE_RATE_HZ) /**< 块周期：墙钟 200ms */
 #define PM_BLOCK_PER_SEC   (PM_SAMPLE_RATE_HZ / PM_BLOCK_SAMPLES) /**< 每秒块数 = 5 */
 
@@ -71,10 +71,13 @@ static const char *TAG = "power_measure";
 
 /* ---- 波形三级缓冲 ---- */
 typedef struct {
-    float v; /**< 电压 V */
-    float i; /**< 电流 A */
-    float p; /**< 功率 W */
-    float e; /**< 电能 Wh（该点时刻的累计值） */
+    float v;         /**< 电压 V */
+    float i;         /**< 电流 A */
+    float p;         /**< 功率 W */
+    float e;         /**< 电能 Wh（该点时刻的累计值） */
+    uint32_t t_ms;   /**< 采样时间戳（ms，自启动）。用于把样本按「真实时间」
+                      *   对齐到屏幕固定时间槽——不再按标称点数抽稀，
+                      *   因此实际采样率偏低/波动时时间尺度依然正确。 */
 } wave_point_t;
 
 #define PM_TIER0_CAP 4000u   /**< 4000Hz × 1s */
@@ -84,16 +87,16 @@ typedef struct {
 #define PM_TIER2_DECIM 40u   /**< tier1→tier2：40 点均值（400/40=10Hz） */
 
 typedef struct {
-    uint8_t tier;
-    uint32_t points;
+    uint8_t tier;    /**< 该窗口取哪一级缓冲 */
+    uint32_t win_ms; /**< 该窗口的时长（毫秒）——水平时间尺度的唯一依据 */
 } window_map_t;
 static const window_map_t s_window_map[PM_WAVE_WINDOW_MAX] = {
-    [PM_WAVE_1S]    = { 0, PM_TIER0_CAP },
-    [PM_WAVE_10S]   = { 1, 4000u },
-    [PM_WAVE_30S]   = { 1, 12000u },
-    [PM_WAVE_60S]   = { 1, PM_TIER1_CAP },
-    [PM_WAVE_120S]  = { 2, 1200u },
-    [PM_WAVE_10MIN] = { 2, PM_TIER2_CAP },
+    [PM_WAVE_1S]    = { 0, 1000u },
+    [PM_WAVE_10S]   = { 1, 10000u },
+    [PM_WAVE_30S]   = { 1, 30000u },
+    [PM_WAVE_60S]   = { 1, 60000u },
+    [PM_WAVE_120S]  = { 2, 120000u },
+    [PM_WAVE_10MIN] = { 2, 600000u },
 };
 
 /* ---- NVS 持久化 ---- */
@@ -168,44 +171,139 @@ static void ring_push(ring_t *r, const wave_point_t *p)
 }
 
 /**
- * @brief 从环中读取最旧的 n 个点、按 stride 抽稀映射到 a/b 序列
+ * @brief 时间槽位填充：把「以 now 为右端、跨 window_ms」的 slots 个槽填满
+ *
+ * 槽 j（0..slots-1）对应用户看到的第 j 列，覆盖时段
+ *   age ∈ [(slots-1-j)*step, (slots-1-j+1)*step)，step = window_ms / slots
+ *
+ * 【2026-10 波形重构 Step1】桶聚合取代"最近样本+容差"：
+ *   旧算法取「距 target 最近且 ≤半个槽」的单样本，当采样间隔（tier1 在
+ *   500Hz 下为 40ms）与槽宽（10s/240≈41.7ms）不同步时约一半槽超出容差
+ *   → 留 NaN → 曲线断成竖条碎片（视频实证）。
+ *   新算法把时段内**所有样本**聚合取均值：每桶必有样本（只要采样间隔
+ *   ≤ 槽宽），天然连续；顺带对桶内多样本求均值，抑制噪声（示波器
+ *   均值采集模式同理）。
+ *   真空缺（ADC 停帧超过槽宽）仍断线：空桶前向填充限 2 桶，超限留 NaN，
+ *   既不画假波形，也不因亚槽级抖动产生碎片。
+ *
+ * ⚠ 这是本模块给 UI 的时间契约：**每槽固定时长**，与采样率无关。
+ *
  * @note 调用方持有 s_ring_lock
  */
-static int ring_copy_locked(const ring_t *r, uint32_t n, int stride,
-                            int field_a, int field_b, bool has_b,
-                            float *a, float *b, int max_points)
-{
-    if (n == 0 || r->buf == NULL) {
-        return 0;
-    }
-    if (n > r->count) {
-        n = r->count;
-    }
-    int out_n = (int)((n + (uint32_t)stride - 1u) / (uint32_t)stride);
-    if (out_n > max_points) {
-        out_n = max_points;
-    }
-    uint32_t start = (r->head + r->cap - n) % r->cap;
+#define PM_WAVE_SLOT_MAX 480 /* 与 screen_wave 的 CHART_MAX_POINTS 对齐 */
 
-    for (int k = 0; k < out_n; k++) {
-        uint32_t idx = (start + (uint32_t)k * (uint32_t)stride) % r->cap;
-        const wave_point_t *p = &r->buf[idx];
+/* 桶聚合暂存（仅 ring_fill_slots_locked 内使用，受 s_ring_lock 串行保护） */
+static float s_bsum_a[PM_WAVE_SLOT_MAX];
+static float s_bsum_b[PM_WAVE_SLOT_MAX];
+static uint16_t s_bcnt[PM_WAVE_SLOT_MAX];
+
+static void ring_fill_slots_locked(const ring_t *r, uint32_t now_ms, uint32_t window_ms,
+                                   int slots, int field_a, int field_b, bool has_b,
+                                   float *a, float *b)
+{
+    if (slots > PM_WAVE_SLOT_MAX) {
+        slots = PM_WAVE_SLOT_MAX;
+    }
+    for (int j = 0; j < slots; j++) {
+        a[j] = NAN;
+        if (b != NULL) {
+            b[j] = NAN;
+        }
+        s_bsum_a[j] = 0.0f;
+        s_bsum_b[j] = 0.0f;
+        s_bcnt[j] = 0;
+    }
+    if (r->buf == NULL || r->count == 0 || slots <= 0 || window_ms == 0) {
+        return;
+    }
+
+    /* ① 桶聚合：按样本年龄归桶求均值（一趟 O(count)） */
+    const uint32_t start = (r->head + r->cap - r->count) % r->cap;
+    for (uint32_t k = 0; k < r->count; k++) {
+        const wave_point_t *p = &r->buf[(start + k) % r->cap];
+        const uint32_t age = now_ms - p->t_ms; /* 无符号回绕安全 */
+        if (age > window_ms) {
+            continue; /* 窗口之外 */
+        }
+        /* 年龄 0 → 最右槽（现在）；年龄越大越靠左 */
+        int j = slots - 1 - (int)((double)age * (double)slots / (double)window_ms);
+        if (j < 0) {
+            j = 0;
+        } else if (j >= slots) {
+            j = slots - 1;
+        }
+        float va, vb = NAN;
         switch (field_a) {
-        case 0: a[k] = p->v; break;
-        case 1: a[k] = p->i; break;
-        case 2: a[k] = p->p; break;
-        default: a[k] = p->e; break;
+        case 0: va = p->v; break;
+        case 1: va = p->i; break;
+        case 2: va = p->p; break;
+        default: va = p->e; break;
         }
         if (has_b && b != NULL) {
             switch (field_b) {
-            case 0: b[k] = p->v; break;
-            case 1: b[k] = p->i; break;
-            case 2: b[k] = p->p; break;
-            default: b[k] = p->e; break;
+            case 0: vb = p->v; break;
+            case 1: vb = p->i; break;
+            case 2: vb = p->p; break;
+            default: vb = p->e; break;
+            }
+        }
+        s_bsum_a[j] += va;
+        s_bcnt[j]++;
+        if (has_b && b != NULL) {
+            s_bsum_b[j] += vb;
+        }
+    }
+
+    /* ② 桶均值 → 输出 */
+    for (int j = 0; j < slots; j++) {
+        if (s_bcnt[j] > 0) {
+            a[j] = s_bsum_a[j] / (float)s_bcnt[j];
+            if (has_b && b != NULL) {
+                b[j] = s_bsum_b[j] / (float)s_bcnt[j];
             }
         }
     }
-    return out_n;
+
+    /* ③ 全桶线性插值（Step4·min/max 包络前提）：
+     *   480 槽 > 屏宽 280 像素，LVGL 对 LINE 系列自动画 min/max 竖线包络
+     *   （示波器 peak-detect 同款，防混叠丢峰）。但包络只覆盖**连续**段，
+     *   NaN 断点会把包络也切成碎片——所以这里把空桶全插值补齐，
+     *   让包络覆盖整个窗口。末端空桶（历史不足）回退单桶填补限 2 个，
+     *   更靠左的仍留 NaN（画假曲线没意义）。 */
+    for (int j = 1; j < slots; j++) {
+        if (isfinite(a[j])) {
+            continue;
+        }
+        int prev = j - 1;
+        while (prev >= 0 && !isfinite(a[prev])) {
+            prev--;
+        }
+        if (prev < 0) {
+            continue;
+        }
+        /* 找右锚点：向右扫描下一个有效桶 */
+        int next = j;
+        while (next < slots && !isfinite(a[next])) {
+            next++;
+        }
+        if (next < slots) {
+            /* 两端均有锚点：线性插值中间所有空桶 */
+            const int span = next - prev;
+            for (int k = prev + 1; k < next; k++) {
+                const float t = (float)(k - prev) / (float)span;
+                a[k] = a[prev] + (a[next] - a[prev]) * t;
+                if (has_b && b != NULL) {
+                    b[k] = b[prev] + (b[next] - b[prev]) * t;
+                }
+            }
+        } else if ((j - prev) <= 2) {
+            /* 右端（最近）无数据：仅末端 2 桶前向保持，避免假曲线 */
+            a[j] = a[prev];
+            if (has_b && b != NULL) {
+                b[j] = b[prev];
+            }
+        }
+    }
 }
 
 /** 4 点滑动平均的历史值（仅采样线程访问） */
@@ -228,9 +326,12 @@ static void wave_push_sample(float v, float i)
     float fv = sv / (float)PM_WAVE_MAVG_N;
     float fi = si / (float)PM_WAVE_MAVG_N;
 
+    /* 本样本时间戳（ms）：三级缓冲共用同一时刻，供 UI 按真实时间对齐槽位 */
+    const uint32_t now_ms = (uint32_t)(esp_timer_get_time() / 1000);
+
     portENTER_CRITICAL(&s_ring_lock);
 
-    wave_point_t pt = { .v = fv, .i = fi, .p = fv * fi, .e = s_persist.energy_wh };
+    wave_point_t pt = { .v = fv, .i = fi, .p = fv * fi, .e = s_persist.energy_wh, .t_ms = now_ms };
     ring_push(&s_tier[0], &pt);
 
     s_tier1_acc.v += fv;
@@ -243,6 +344,7 @@ static void wave_push_sample(float v, float i)
             .i = s_tier1_acc.i / (float)s_tier1_acc_n,
             .p = s_tier1_acc.p / (float)s_tier1_acc_n,
             .e = s_persist.energy_wh,
+            .t_ms = now_ms,
         };
         ring_push(&s_tier[1], &d);
         s_tier1_acc = (wave_point_t){ 0 };
@@ -258,6 +360,7 @@ static void wave_push_sample(float v, float i)
                 .i = s_tier2_acc.i / (float)s_tier2_acc_n,
                 .p = s_tier2_acc.p / (float)s_tier2_acc_n,
                 .e = s_persist.energy_wh,
+                .t_ms = now_ms,
             };
             ring_push(&s_tier[2], &d2);
             s_tier2_acc = (wave_point_t){ 0 };
@@ -368,6 +471,7 @@ static void task_sample(void *arg)
     /* 快速显示子窗口累加（仅用于 40Hz 即时显示帧） */
     double qsum_v = 0.0, qsum_i = 0.0, qsum_p = 0.0;
     uint32_t qcnt = 0;
+    float qmin_v = 0, qmax_v = 0, qmin_i = 0, qmax_i = 0; /**< 掐头去尾：窗口内极值 */
     int64_t sub_start_us = esp_timer_get_time();
     /* 块内电能逐步积分（让 40Hz 帧的电能读数也能连续走动；块末以权威值覆写） */
     float block_energy_wh = 0.0f;
@@ -439,10 +543,30 @@ static void task_sample(void *arg)
         qsum_i += i;
         qsum_p += (double)p;
         qcnt++;
+        /* 掐头去尾：窗口内最大最小值各去一个再取均值，抵御 ADC 坏帧尖峰
+         * （实测：稳定 10V 下电压码值偶发近零尖峰，单帧即可拉偏显示值 12%，
+         * 导致"几秒跳一次"的观感）。只对显示快照生效，统计/电能不受影响。 */
+        if (qcnt == 1) {
+            qmin_v = qmax_v = v;
+            qmin_i = qmax_i = i;
+        } else {
+            if (v < qmin_v) qmin_v = v;
+            if (v > qmax_v) qmax_v = v;
+            if (i < qmin_i) qmin_i = i;
+            if (i > qmax_i) qmax_i = i;
+        }
         const int64_t sub_now_us = esp_timer_get_time();
         if (qcnt > 0 && (uint64_t)(sub_now_us - sub_start_us) >= PM_DISPLAY_SUBWINDOW_US) {
-            float qv = (float)(qsum_v / qcnt);
-            float qi = (float)(qsum_i / qcnt);
+            /* 掐头去尾均值：样本数 ≥3 时去最大最小各一个，抵御单个坏帧尖峰；
+             * 样本不足 3 时退化为普通均值。 */
+            float qv, qi;
+            if (qcnt >= 3) {
+                qv = (float)((qsum_v - qmax_v - qmin_v) / (double)(qcnt - 2));
+                qi = (float)((qsum_i - qmax_i - qmin_i) / (double)(qcnt - 2));
+            } else {
+                qv = (float)(qsum_v / qcnt);
+                qi = (float)(qsum_i / qcnt);
+            }
             float qp = (float)(qsum_p / qcnt);
             /* 子窗口真实时长（墙钟）：帧率非标称值时按样本数折算会错 */
             const float sub_dt_s = (float)(sub_now_us - sub_start_us) / 1e6f;
@@ -466,6 +590,7 @@ static void task_sample(void *arg)
 
             qsum_v = qsum_i = qsum_p = 0.0;
             qcnt = 0;
+            qmin_v = qmax_v = qmin_i = qmax_i = 0.0f;
         }
 
         /* 原始码值统计（诊断用） */
@@ -743,28 +868,42 @@ int pm_wave_copy(pm_wave_window_t win, pm_wave_mode_t mode, float *a, float *b, 
     bool has_b;
     mode_fields(mode, &fa, &fb, &has_b);
 
-    uint32_t n = m->points;
-    int stride = 1;
-    if ((int)n > max_points) {
-        stride = (int)((n + (uint32_t)max_points - 1u) / (uint32_t)max_points);
-    }
-
-    int got;
+    /* 填满 max_points 个固定时间槽：索引 j 即屏幕第 j 列，
+     * 右端（j=max_points-1）是"现在"，无数据的槽为 NaN。
+     * UI 因此可以「一比一」映射，不再需要右对齐/填充点数计算。 */
+    const uint32_t now_ms = (uint32_t)(esp_timer_get_time() / 1000);
     portENTER_CRITICAL(&s_ring_lock);
-    got = ring_copy_locked(&s_tier[m->tier], n, stride, fa, fb, has_b, a, b, max_points);
+    ring_fill_slots_locked(&s_tier[m->tier], now_ms, m->win_ms, max_points, fa, fb, has_b, a, b);
     portEXIT_CRITICAL(&s_ring_lock);
-    return got;
+
+    int valid = 0;
+    for (int i = 0; i < max_points; i++) {
+        if (isfinite(a[i])) {
+            valid++;
+        }
+    }
+    return valid;
 }
 
+/** 有效样本（跳过 NaN 空槽）的最小/最大值；全空返回 false */
 static bool span_of(const float *v, int n, float *mn, float *mx)
 {
-    if (n <= 0) {
-        return false;
+    bool any = false;
+    float lo = 0.0f, hi = 0.0f;
+    for (int k = 0; k < n; k++) {
+        if (!isfinite(v[k])) {
+            continue;
+        }
+        if (!any) {
+            lo = hi = v[k];
+            any = true;
+        } else {
+            if (v[k] < lo) lo = v[k];
+            if (v[k] > hi) hi = v[k];
+        }
     }
-    float lo = v[0], hi = v[0];
-    for (int k = 1; k < n; k++) {
-        if (v[k] < lo) lo = v[k];
-        if (v[k] > hi) hi = v[k];
+    if (!any) {
+        return false;
     }
     *mn = lo;
     *mx = hi;
@@ -789,20 +928,23 @@ static void pad_range(float mn, float mx, float *out_min, float *out_max)
 bool pm_wave_get_range(pm_wave_window_t win, pm_wave_mode_t mode, float *a_min, float *a_max,
                        float *b_min, float *b_max)
 {
-    static float ba[300], bb[300];
-    int n = pm_wave_copy(win, mode, ba, bb, 300);
+    /* 300 个时间槽覆盖整个窗口；span_of 会跳过无数据的 NaN 槽，
+     * 因此量程取自「有数据的时段」而非整个窗口。 */
+    enum { RANGE_SLOTS = 300 };
+    static float ba[RANGE_SLOTS], bb[RANGE_SLOTS];
+    (void)pm_wave_copy(win, mode, ba, bb, RANGE_SLOTS);
     int fa, fb;
     bool has_b;
     mode_fields(mode, &fa, &fb, &has_b);
 
     float mn, mx;
-    if (span_of(ba, n, &mn, &mx)) {
+    if (span_of(ba, RANGE_SLOTS, &mn, &mx)) {
         pad_range(mn, mx, a_min, a_max);
     } else {
         *a_min = 0.0f;
         *a_max = 1.0f;
     }
-    if (has_b && span_of(bb, n, &mn, &mx)) {
+    if (has_b && span_of(bb, RANGE_SLOTS, &mn, &mx)) {
         pad_range(mn, mx, b_min, b_max);
     } else if (has_b) {
         *b_min = 0.0f;
