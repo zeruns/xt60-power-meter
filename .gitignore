@@ -29,3 +29,16 @@ bin-release/
 # 数据手册中厂商例程压缩包的临时解压目录（保留原压缩包，解压目录不入库）
 example_extracted/
 example_stm32_extracted/
+
+# MinerU 文档解析的临时产物/诊断目录（保留原始数据手册，解析输出不入库）
+03-Datasheet/_mineru_chunks/
+03-Datasheet/_mineru_diag/
+03-Datasheet/_mineru_out/
+03-Datasheet/_mineru_tools/
+
+# Trae 本地 HTML 分享包（工具生成的本地副本，正式文档在 docs/ 下）
+.trae-html-share-packages/
+
+# LVGL PC 模拟器的构建产物（源码与脚本入库，build/ 不入库）
+02-Software/XT60-Power-Meter-Firmware/tools/ui_sim/build/
+02-Software/XT60-Power-Meter-Firmware/tools/ui_sim/out/
