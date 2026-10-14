@@ -28,6 +28,7 @@
 #include "imu_sc7a20h.h"
 #include "lcd_nv3030b.h"
 #include "lvgl_port.h"
+#include "orientation.h"
 #include "power_measure.h"
 #include "settings.h"
 #include "status_led.h"
@@ -128,6 +129,10 @@ static const init_step_t s_boot_steps[] = {
     /* LVGL 适配层：注册显示/输入设备并启动心跳。失败则 UI 无法工作，
      * 故与 LCD 共用 SYSTEM_FAULT_LCD 故障位，UI 启动门控据此判断。 */
     { "lvgl_port", lvgl_port_app_init, SYSTEM_FAULT_LCD },
+
+    /* 重力自动旋转：IMU/LVGL 就绪后启动方向监测，并按 NVS 恢复方向模式。
+     * 非关键——失败只影响自动转屏，手动角度仍可用。 */
+    { "orientation", orientation_boot_restore, 0 },
 };
 
 /** 初始化步骤个数 */

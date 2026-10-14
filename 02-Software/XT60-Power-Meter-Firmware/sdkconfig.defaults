@@ -161,7 +161,10 @@ CONFIG_LV_COLOR_FORMAT_RGB565_SWAPPED=y
 #   tiny_ttf 运行时只使用内存接口 lv_tiny_ttf_create_data，不需要文件支持。
 CONFIG_LV_USE_TINY_TTF=y
 # CONFIG_LV_TINY_TTF_FILE_SUPPORT is not set
-CONFIG_LV_TINY_TTF_CACHE_GLYPH_CNT=64
+# ⚠ 字形缓存条数（每字体的槽位结构 + 位图）：64 → 32。
+#   14 个字体实例时缓存结构本身就要几十 KB；32 条配合 LRU 驱逐足够覆盖
+#   单页可见字形（每页常用字形约 20 个），代价仅为少量重光栅化。
+CONFIG_LV_TINY_TTF_CACHE_GLYPH_CNT=32
 CONFIG_LV_TINY_TTF_CACHE_KERNING_CNT=16
 # LVGL 内存池大小（lv_malloc 的堆）。
 # ⚠ 符号名注意：LVGL 9.6 已废弃 LV_MEM_SIZE_KILOBYTES（KB），改为
@@ -169,6 +172,15 @@ CONFIG_LV_TINY_TTF_CACHE_KERNING_CNT=16
 # 正式界面（tileview + chart + 三级对象）与此前 demo 实测同档，保持 128KB。
 # 该内存池是静态数组，占用内部 RAM（S3 有 512KB，可承受）。
 CONFIG_LV_MEM_SIZE=131072
+# 内存分配器：改用系统堆（malloc/free）而非内建池。
+# 实机 coredump 定位：内建池被"字形缓存 + 二级页对象"逐步耗尽，
+# 渲染新字形时 stb_truetype 临时缓冲分配失败（stbtt__new_active 断言）→ panic 复位。
+# 系统堆下：小块分配仍优先内部 RAM（< CONFIG_SPIRAM_MALLOC_ALWAYSINTERNAL），
+# 大块自动走 PSRAM（8MB），彻底解除 128KB 上限；渲染结果与内建池完全一致。
+# ⚠ Kconfig 是 choice：必须同时翻"成员行"，只改序号会被 Kconfig 按成员覆盖回
+#   BUILTIN（本工程踩过：序号改了、成员没改 → 配置静默回退）。
+CONFIG_LV_USE_CLIB_MALLOC=y
+CONFIG_LV_USE_STDLIB_MALLOC=1
 
 # ============================================================
 # 任务与网络资源（为 WiFi + 网页控制台预留）

@@ -73,6 +73,7 @@
 
 #include <stdbool.h>
 #include <stdint.h>
+#include <stdatomic.h>
 
 #include "board_pins.h"
 
@@ -208,6 +209,8 @@ static spi_device_handle_t s_spi = NULL;
 static SemaphoreHandle_t s_drdy_sem = NULL;
 /** SPI 事务互斥锁：测量核与诊断可能并发调用 ads131m02_read() */
 static SemaphoreHandle_t s_bus_mutex = NULL;
+/** DRDY# 边沿累计（诊断：区分 DRDY 真实速率与任务处理速率） */
+static atomic_uint s_drdy_count;
 
 /**
  * @brief 16bit 命令/寄存器值 -> 线上 24bit 字（MSB 对齐）
@@ -234,6 +237,7 @@ static inline int32_t ads_sign_extend24(uint32_t word24)
 static void IRAM_ATTR ads_drdy_isr(void *arg)
 {
     (void)arg;
+    atomic_fetch_add_explicit(&s_drdy_count, 1, memory_order_relaxed);
     BaseType_t hp_task_woken = pdFALSE;
     xSemaphoreGiveFromISR(s_drdy_sem, &hp_task_woken);
     portYIELD_FROM_ISR(hp_task_woken);
@@ -782,4 +786,9 @@ esp_err_t ads131m02_read(ads131m02_sample_t *out)
 uint32_t ads131m02_get_sample_rate_hz(void)
 {
     return s_initialized ? ADS_ODR_HZ : 0;
+}
+
+uint32_t ads131m02_drdy_count(void)
+{
+    return atomic_load_explicit(&s_drdy_count, memory_order_relaxed);
 }

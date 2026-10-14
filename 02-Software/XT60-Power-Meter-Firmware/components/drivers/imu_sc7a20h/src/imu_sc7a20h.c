@@ -83,8 +83,8 @@ static bool s_initialized = false;
 /* I2C 器件句柄（挂在 bsp 共享传感器总线上） */
 static i2c_master_dev_handle_t s_dev = NULL;
 
-/* 上次朝向（平放时保持） */
-static imu_sc7a20h_orientation_t s_last_orient = IMU_SC7A20H_ORIENT_PORTRAIT;
+/* 上次朝向（已不再用于平放保持——平放显式返回 FLAT；保留仅供诊断） */
+static imu_sc7a20h_orientation_t s_last_orient = IMU_SC7A20H_ORIENT_LANDSCAPE;
 
 /**
  * @brief 写单个寄存器
@@ -126,7 +126,11 @@ static esp_err_t imu_read_xyz(int16_t *x, int16_t *y, int16_t *z)
  * @brief 由重力主导轴与符号判定朝向（重力主导轴法）
  *
  * 取绝对值最大的轴为主导轴：
- *   · |Z| 最大 -> 设备近乎平放，无法区分横竖，保持上次朝向；
+ *   · |Z| 最大 -> 设备近乎平放，无法区分横竖 -> 显式返回 FLAT，
+ *     由调用方决定"保持现状"（2026-10 修复：此前平放返回的是驱动初始
+ *     默认值 PORTRAIT，导致"平放开机 + 自动旋转开启"时被误判为竖屏，
+ *     开机约 1.2s 后自动旋转 90° 并触发全 UI 重建——实机 UI 冻结的
+ *     触发路径之一）；
  *   · 否则按主导轴与符号映射到四种朝向。
  *
  * 符号到朝向的映射与屏幕/芯片安装方向强相关，若反向请按实际装配调整
@@ -138,8 +142,8 @@ static void classify_orientation(int16_t x, int16_t y, int16_t z,
     int16_t ax = abs(x), ay = abs(y), az = abs(z);
 
     if (az >= ax && az >= ay) {
-        /* 平放：保持上次朝向 */
-        *out = s_last_orient;
+        /* 平放：显式告知调用方"姿态不确定"，不替它做任何默认假设 */
+        *out = IMU_SC7A20H_ORIENT_FLAT;
         return;
     }
 

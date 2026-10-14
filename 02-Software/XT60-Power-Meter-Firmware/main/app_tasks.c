@@ -4,13 +4,17 @@
  */
 #include "app_tasks.h"
 
+#include "ads131m02.h"
 #include "data_store.h"
+#include "lvgl_port.h"
 #include "power_measure.h"
 #include "system_state.h"
 #include "ui.h"
 
+#include "esp_heap_caps.h"
 #include "esp_log.h"
 #include "esp_system.h"
+#include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 
@@ -60,6 +64,12 @@ static void task_sys_monitor(void *arg)
                  system_state_name(system_state_get()), fault_text, xPortGetCoreID(),
                  (unsigned)esp_get_free_heap_size(), (unsigned)esp_get_minimum_free_heap_size());
 
+        /* --- 内部 RAM 水位（LVGL 改用系统堆后：小块分配仍优先内部 RAM，
+         *     此值可反映"内部 RAM 是否吃紧"；历史最低持续下降同样提示泄漏） --- */
+        ESP_LOGI(TAG, "内部 RAM 空闲 %u 字节（历史最低 %u）",
+                 (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
+                 (unsigned)heap_caps_get_minimum_free_size(MALLOC_CAP_INTERNAL));
+
         /* --- 栈水位 ---
          * ⚠ 三个容易踩的坑（都是 ESP-IDF 与上游 FreeRTOS 的差异）：
          *   1. uxTaskGetStackHighWaterMark() 返回单位是「字节」，
@@ -74,6 +84,63 @@ static void task_sys_monitor(void *arg)
         UBaseType_t stack_free_bytes = uxTaskGetStackHighWaterMark(s_monitor_task);
         ESP_LOGI(TAG, "巡检任务栈：剩余 %u 字节 / 共 %d 字节", (unsigned)stack_free_bytes,
                  CONFIG_APP_SYS_MONITOR_STACK);
+
+        /* --- LVGL 任务栈水位（关键观测项）---
+         * 2026-10 实机曾因 tiny_ttf 首次光栅化新字号/新字形（设置页）导致
+         * taskLVGL 栈溢出复位（详见 lvgl_port.c 的 LVGL_PORT_TASK_STACK 注释）。
+         * 该任务由官方 esp_lvgl_port 创建（句柄不对外），因此按任务名查找
+         * 并常驻打印其剩余栈——今后新增字号/大批新汉字后，复查本值即可
+         * 提前发现栈吃紧（余量建议不低于 25%，当前栈 12288 → 不低于约 3KB）。
+         *
+         * 同时打印"冻结三角"诊断（2026-10 实机 UI 冻结排查）：
+         *   flush 增量 = 渲染管线是否在出帧（LV_EVENT_FLUSH_FINISH 计数差）；
+         *   data  增量 = 测量核是否在产出快照（data_store 更新计数差）；
+         *   LVGL 状态 = taskLVGL 的调度状态（0运行/1就绪/2阻塞/3挂起）；
+         *   锁探测   = 1ms 试探取 LVGL 锁（taskLVGL 是否长期持锁不放）。
+         * 屏幕冻结时的判读：
+         *   flush=0 且 LVGL=0 → taskLVGL 在持锁忙等（QSPI 传输完成丢失）；
+         *   flush=0 且 LVGL=2 且锁可得 → 任务睡死/时间冻结（tick/timer 异常）；
+         *   flush>0 且 data=0 → 渲染活着，是测量核停了（"数据冻结"非 UI 冻结）。 */
+        {
+            static TaskHandle_t s_lvgl_task = NULL;
+            static uint32_t s_prev_flush = 0;
+            static uint32_t s_prev_data = 0;
+            static uint32_t s_prev_drdy = 0;
+            if (s_lvgl_task == NULL) {
+                /* 首个巡检周期时 LVGL 任务可能尚未创建，之后周期会自动补上 */
+                s_lvgl_task = xTaskGetHandle("taskLVGL");
+            }
+            if (s_lvgl_task != NULL) {
+                const uint32_t flush_now = lvgl_port_flush_count();
+                const uint32_t data_now = data_store_update_count();
+                const uint32_t drdy_now = ads131m02_drdy_count();
+                /* eTaskGetState：eRunning=0 / eReady=1 / eBlocked=2 / eSuspended=3 */
+                int state = (int)eTaskGetState(s_lvgl_task);
+                bool lock_ok = lvgl_port_lock(1);
+                if (lock_ok) {
+                    lvgl_port_unlock();
+                }
+                /* UI 任务心跳间隔（越大说明 UI 任务越久没跑完一轮） */
+                const uint32_t ui_age_ms =
+                    (uint32_t)((esp_timer_get_time() - ui_get_last_loop_us()) / 1000);
+                ESP_LOGI(TAG,
+                         "冻结诊断: flush+%u data+%u drdy+%u(%.0fHz) LVGL态=%d 锁=%s UI心跳龄=%ums | LVGL栈剩 %u/%d",
+                         (unsigned)(flush_now - s_prev_flush),
+                         (unsigned)(data_now - s_prev_data),
+                         (unsigned)(drdy_now - s_prev_drdy),
+                         (drdy_now - s_prev_drdy) / 5.0,
+                         state, lock_ok ? "可得" : "被占", (unsigned)ui_age_ms,
+                         (unsigned)uxTaskGetStackHighWaterMark(s_lvgl_task), 16384);
+                /* 渲染停滞告警：flush 在 5s 内零增长 = taskLVGL 出不了帧 */
+                if (flush_now == s_prev_flush) {
+                    ESP_LOGE(TAG, "!! 渲染停滞：5s 内 flush 零增长（LVGL态=%d 锁=%s UI心跳龄=%ums）",
+                             state, lock_ok ? "可得" : "被占", (unsigned)ui_age_ms);
+                }
+                s_prev_flush = flush_now;
+                s_prev_data = data_now;
+                s_prev_drdy = drdy_now;
+            }
+        }
 
         /* --- 测量数据链路 ---
          * data_store 尚无数据时返回 ESP_ERR_INVALID_STATE，

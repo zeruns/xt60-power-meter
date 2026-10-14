@@ -83,6 +83,18 @@ esp_err_t power_measure_set_calibration(const power_measure_calib_t *calib);
 void power_measure_get_calibration(power_measure_calib_t *out);
 
 /**
+ * @brief 清零电能与运行时间统计（"本次统计"从此重新开始）
+ *
+ * 由 UI 核调用；真正的清零动作交给测量任务在下一个 200ms 块边界执行，
+ * 以保持"电能值只有一个写者（测量核）"的约定，避免跨核读写撕裂。
+ * 清零完成后立即写入 NVS（掉电不回到旧值）。
+ *
+ * @return ESP_OK 已受理（下一个块边界生效）
+ *         ESP_ERR_INVALID_STATE 测量服务尚未初始化
+ */
+esp_err_t power_measure_reset_energy(void);
+
+/**
  * @brief 查询采样率（Hz，当前固定 4000，与 ADS131M02 配置一致）
  */
 uint32_t power_measure_sample_rate_hz(void);

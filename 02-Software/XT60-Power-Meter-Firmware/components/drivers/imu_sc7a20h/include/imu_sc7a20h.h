@@ -19,6 +19,7 @@ typedef enum {
     IMU_SC7A20H_ORIENT_LANDSCAPE,     /**< 横屏 */
     IMU_SC7A20H_ORIENT_PORTRAIT_INV,  /**< 竖屏（倒置） */
     IMU_SC7A20H_ORIENT_LANDSCAPE_INV, /**< 横屏（倒置） */
+    IMU_SC7A20H_ORIENT_FLAT,          /**< 平放/姿态不确定（调用方应保持现状不动） */
 } imu_sc7a20h_orientation_t;
 
 /**

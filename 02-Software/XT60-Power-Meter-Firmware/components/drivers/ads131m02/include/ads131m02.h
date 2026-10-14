@@ -37,6 +37,11 @@ esp_err_t ads131m02_init(void);
 esp_err_t ads131m02_read(ads131m02_sample_t *out);
 
 /**
+ * @brief DRDY# 中断累计边沿数（诊断用：区分「DRDY 真的慢」还是「任务处理慢」）
+ */
+uint32_t ads131m02_drdy_count(void);
+
+/**
  * @brief 查询配置的输出数据率（ODR）
  *
  * init() 会把 CLOCK 寄存器显式配置为 HR 模式 + OSR=1024：

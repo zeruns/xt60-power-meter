@@ -37,9 +37,12 @@
 
 #include "esp_heap_caps.h"
 #include "esp_log.h"
+#include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/semphr.h"
 #include "freertos/task.h"
+#include <stdatomic.h>
+
 #include "nvs.h"
 #include "nvs_flash.h"
 
@@ -49,8 +52,8 @@ static const char *TAG = "power_measure";
  * 采样与计算参数
  * ============================================================ */
 #define PM_SAMPLE_RATE_HZ  4000u                 /**< ADC 输出数据率（与驱动配置一致） */
-#define PM_BLOCK_SAMPLES   800u                  /**< 每 800 样本一块：200ms */
-#define PM_BLOCK_PERIOD_MS (1000u * PM_BLOCK_SAMPLES / PM_SAMPLE_RATE_HZ)
+#define PM_BLOCK_SAMPLES   800u                  /**< 标称 4kHz 下 200ms 的样本数（仅作历史参考） */
+#define PM_BLOCK_PERIOD_MS (1000u * PM_BLOCK_SAMPLES / PM_SAMPLE_RATE_HZ) /**< 块周期：墙钟 200ms */
 #define PM_BLOCK_PER_SEC   (PM_SAMPLE_RATE_HZ / PM_BLOCK_SAMPLES) /**< 每秒块数 = 5 */
 
 /** 显示平滑系数（对块均值做一阶低通）：约 0.8s 时间常数，兼顾响应与稳定 */
@@ -117,6 +120,9 @@ static power_measure_calib_t s_calib;
 static SemaphoreHandle_t s_calib_mutex = NULL;
 
 static pm_persist_t s_persist;
+
+/** 电能清零请求（UI 核 → 测量核）：由采样任务在块边界消费，保持电能值单写者 */
+static atomic_bool s_reset_energy_req = false;
 
 static struct {
     SemaphoreHandle_t mutex;
@@ -328,6 +334,14 @@ static void save_persist(void)
 #define PM_ADC_FAULT_AFTER_FAILS 2000u
 #define PM_DIAG_PERIOD_BLOCKS 25u /* 每 25 块（5s）打印一次诊断 */
 
+/* 快速显示子窗口周期（微秒）：**墙钟时间驱动**，与实际 ODR 解耦。
+ * 2026-10 实测：本板 ADC 的 MCLK 异常，DRDY 实际只有 ~320Hz（标称 4kHz，
+ * drdy 计数 317~326Hz 且 ±3% 抖动，晶振时基不应有此抖动——硬件时钟问题）。
+ * 原方案"每 100 个有效样本开一窗"在 320Hz 下被拖到 ~2.6Hz（即用户所见
+ * "首页刷新率低/数据不动"的根源）。改为每 25ms 强制输出一帧即时均值：
+ * 4kHz 时约 100 样本/帧、320Hz 时约 8 样本/帧，UI 恒定 40Hz 有数据。 */
+#define PM_DISPLAY_SUBWINDOW_US 25000ull
+
 static void task_sample(void *arg)
 {
     (void)arg;
@@ -351,8 +365,22 @@ static void task_sample(void *arg)
     float disp_v = 0.0f, disp_i = 0.0f, disp_p = 0.0f;
     bool disp_init = false;
 
-    ESP_LOGI(TAG, "采样任务启动（Core1，%u SPS，块长 %u 样本 = %u ms，V gain=%.6e I gain=%.6e）",
-             PM_SAMPLE_RATE_HZ, PM_BLOCK_SAMPLES, PM_BLOCK_PERIOD_MS,
+    /* 快速显示子窗口累加（仅用于 40Hz 即时显示帧） */
+    double qsum_v = 0.0, qsum_i = 0.0, qsum_p = 0.0;
+    uint32_t qcnt = 0;
+    int64_t sub_start_us = esp_timer_get_time();
+    /* 块内电能逐步积分（让 40Hz 帧的电能读数也能连续走动；块末以权威值覆写） */
+    float block_energy_wh = 0.0f;
+    /* 块起点墙钟：dt 用真实时间而非「样本数/标称率」——
+     * 2026-10 实测：ADC 实际帧率 ~310Hz（标称 4000Hz），按样本数折算 dt 会把
+     * 电能/运行时间算错约 13 倍。真实墙钟对任何实际帧率都正确。 */
+    int64_t block_start_us = esp_timer_get_time();
+    /* 诊断：上一条诊断打印的墙钟与 DRDY 计数 */
+    int64_t diag_last_us = block_start_us;
+    uint32_t diag_last_drdy = ads131m02_drdy_count();
+
+    ESP_LOGI(TAG, "采样任务启动（Core1，标称 %u SPS，块周期 %u ms（墙钟），V gain=%.6e I gain=%.6e）",
+             PM_SAMPLE_RATE_HZ, PM_BLOCK_PERIOD_MS,
              (double)PM_DEFAULT_V_GAIN, (double)PM_DEFAULT_I_GAIN);
 
     for (;;) {
@@ -406,6 +434,40 @@ static void task_sample(void *arg)
         sum_i += i;
         sum_p += (double)p;
 
+        /* ---- 40Hz 快速显示快照（墙钟驱动，不触碰块级统计）---- */
+        qsum_v += v;
+        qsum_i += i;
+        qsum_p += (double)p;
+        qcnt++;
+        const int64_t sub_now_us = esp_timer_get_time();
+        if (qcnt > 0 && (uint64_t)(sub_now_us - sub_start_us) >= PM_DISPLAY_SUBWINDOW_US) {
+            float qv = (float)(qsum_v / qcnt);
+            float qi = (float)(qsum_i / qcnt);
+            float qp = (float)(qsum_p / qcnt);
+            /* 子窗口真实时长（墙钟）：帧率非标称值时按样本数折算会错 */
+            const float sub_dt_s = (float)(sub_now_us - sub_start_us) / 1e6f;
+            sub_start_us = sub_now_us;
+            /* 本子窗口对块内电能的贡献（Wh）；块末权威积分以墙钟为准 */
+            block_energy_wh = power_calc_energy_wh(block_energy_wh, qp, sub_dt_s);
+
+            data_store_snapshot_t qsnap = {
+                .voltage_v = qv,
+                .current_a = qi,
+                .power_w = qp,
+                .energy_wh = s_persist.energy_wh + block_energy_wh,
+            };
+            xSemaphoreTake(s_aux_data.mutex, portMAX_DELAY);
+            qsnap.temperature_c = s_aux_data.temp_c;
+            qsnap.humidity_pct = s_aux_data.humidity_pct;
+            qsnap.battery_mv = s_aux_data.battery_mv;
+            xSemaphoreGive(s_aux_data.mutex);
+            qsnap.runtime_s = s_persist.runtime_s;
+            data_store_update(&qsnap);
+
+            qsum_v = qsum_i = qsum_p = 0.0;
+            qcnt = 0;
+        }
+
         /* 原始码值统计（诊断用） */
         if (raw_n == 0) {
             raw_v_min = raw_v_max = raw.voltage_raw;
@@ -420,7 +482,17 @@ static void task_sample(void *arg)
         raw_i_sum += raw.current_raw;
         raw_n++;
 
-        if (++block_cnt >= PM_BLOCK_SAMPLES) {
+        block_cnt++;
+        /* 块边界：**墙钟 200ms**（与实际 ODR 解耦——ODR 偏低时按样本数会把
+         * 块长拖到秒级，电能/运行时间/诊断节拍全部失真）。 */
+        const int64_t block_now_us = esp_timer_get_time();
+        if ((uint64_t)(block_now_us - block_start_us) >= (uint64_t)PM_BLOCK_PERIOD_MS * 1000ull) {
+            if (block_cnt == 0) {
+                /* 本块无有效样本（ADC 全程停帧/全被拒）：只重置计时器，
+                 * 避免恢复后第一块 dt 被拉长；统计与积分全部跳过 */
+                block_start_us = block_now_us;
+                continue;
+            }
             /* 直流量：块内平均值（不是 RMS，理由见文件头） */
             float v_mean = (float)(sum_v / block_cnt);
             float i_mean = (float)(sum_i / block_cnt);
@@ -438,9 +510,21 @@ static void task_sample(void *arg)
                 disp_p += PM_DISPLAY_EMA_ALPHA * (p_mean - disp_p);
             }
 
-            /* 电能矩形积分：dt 用**本块实际接受的样本数**换算
-             * （帧过滤会丢弃部分样本，固定用 200ms 会把电能算少） */
-            float dt_s = (float)block_cnt / (float)PM_SAMPLE_RATE_HZ;
+            /* 清零请求（UI 核发起）：在块边界消费——本任务始终是电能值的唯一写者。
+             * 同时重置秒累加器，避免清零后立刻又进 1 秒 */
+            if (atomic_exchange(&s_reset_energy_req, false)) {
+                s_persist.energy_wh = 0.0f;
+                s_persist.runtime_s = 0;
+                sec_acc_ms = 0;
+                save_persist();
+                ESP_LOGI(TAG, "电能与运行时间已清零（本次统计重新开始）");
+            }
+
+            /* 电能矩形积分：dt 用本块**真实墙钟时长**
+             * （实际帧率 ≠ 标称 4kHz 时，按样本数折算会系统性算错；
+             *   帧过滤丢帧也不影响——墙钟自动覆盖） */
+            const float dt_s = (float)(block_now_us - block_start_us) / 1e6f;
+            block_start_us = block_now_us;
             s_persist.energy_wh = power_calc_energy_wh(s_persist.energy_wh, p_mean, dt_s);
 
             /* 运行时间：按实际采样时间累加（每满 1s 进 1） */
@@ -450,25 +534,26 @@ static void task_sample(void *arg)
                 sec_acc_ms %= 1000u;
             }
 
-            data_store_snapshot_t snap = {
-                .voltage_v = disp_v,
-                .current_a = disp_i,
-                .power_w = disp_p,
-                .energy_wh = s_persist.energy_wh,
-            };
-            xSemaphoreTake(s_aux_data.mutex, portMAX_DELAY);
-            snap.temperature_c = s_aux_data.temp_c;
-            snap.humidity_pct = s_aux_data.humidity_pct;
-            snap.battery_mv = s_aux_data.battery_mv;
-            xSemaphoreGive(s_aux_data.mutex);
-            snap.runtime_s = s_persist.runtime_s;
-            data_store_update(&snap);
+            /* 注意：块末**不再**向 data_store 写 EMA 帧。显示快照唯一来源是
+             * 上方 40Hz 子窗口的即时均值帧（电能在其中已用 block_energy_wh
+             * 连续积分、块末归零处无缝衔接）。若再写一帧 EMA 值，30Hz 档
+             * （窗口=1 帧）每 200ms 会有一次读数向慢响应值回顿，破坏高刷连贯。
+             * EMA 值仍保留用于下方诊断日志。 */
 
-            /* ---- 周期性诊断（每 5s）：给"读数对不对"提供板上证据 ---- */
+            /* ---- 周期性诊断（每 25 块）：给"读数对不对"提供板上证据 ---- */
             if (++diag_blocks >= PM_DIAG_PERIOD_BLOCKS) {
                 diag_blocks = 0;
-                ESP_LOGI(TAG, "诊断: 帧=%u 丢弃=%u(%.1f%%) | 原始码 V[min=%ld max=%ld 均值=%.0f] "
-                              "I[min=%ld max=%ld 均值=%.0f] | 换算 V=%.5fV I=%.5fA P=%.5fW",
+                const int64_t diag_now_us = esp_timer_get_time();
+                const uint32_t drdy_now = ads131m02_drdy_count();
+                const uint32_t diag_wall_ms = (uint32_t)((diag_now_us - diag_last_us) / 1000);
+                const uint32_t drdy_delta = drdy_now - diag_last_drdy;
+                diag_last_us = diag_now_us;
+                diag_last_drdy = drdy_now;
+                ESP_LOGI(TAG, "诊断: wall=%ums drdy+%u(%.0fHz) 帧=%u 丢弃=%u(%.1f%%) | "
+                              "原始码 V[min=%ld max=%ld 均值=%.0f] I[min=%ld max=%ld 均值=%.0f] | "
+                              "换算 V=%.5fV I=%.5fA P=%.5fW",
+                         (unsigned)diag_wall_ms, (unsigned)drdy_delta,
+                         diag_wall_ms ? (1000.0 * (double)drdy_delta / (double)diag_wall_ms) : 0.0,
                          (unsigned)frame_total, (unsigned)frame_reject,
                          frame_total ? (100.0f * (float)frame_reject / (float)frame_total) : 0.0f,
                          (long)raw_v_min, (long)raw_v_max, raw_n ? (raw_v_sum / raw_n) : 0.0,
@@ -482,6 +567,7 @@ static void task_sample(void *arg)
 
             sum_v = sum_i = sum_p = 0;
             block_cnt = 0;
+            block_energy_wh = 0.0f; /* 块末权威电能已写入，子窗口积分归零 */
         }
     }
 }
@@ -617,6 +703,16 @@ void power_measure_get_calibration(power_measure_calib_t *out)
     xSemaphoreTake(s_calib_mutex, portMAX_DELAY);
     *out = s_calib;
     xSemaphoreGive(s_calib_mutex);
+}
+
+esp_err_t power_measure_reset_energy(void)
+{
+    if (!s_inited) {
+        return ESP_ERR_INVALID_STATE;
+    }
+    /* 只置请求标志，不在本核直接改电能值（跨核写会让累加中的 float 撕裂） */
+    atomic_store(&s_reset_energy_req, true);
+    return ESP_OK;
 }
 
 uint32_t power_measure_sample_rate_hz(void)
