@@ -40,7 +40,7 @@
  *   · 整屏黑但背光正常：多为命令帧不被面板接收，先确认 quad_mode 与
  *     use_qspi_interface=1；
  *   · 颜色偏色/列错位：像素字节序问题。面板线上要求高字节在前
- *     （big-endian），LVGL 用 RGB565_SWAPPED；
+ *     （big-endian），LVGL 侧以 RGB565 渲染、flush 时 swap_bytes 交换成大端；
  *   · 横条变竖条：MADCTL 方向位错，确认是 0x68 不是 0x28。
  * ============================================================
  */
@@ -75,11 +75,12 @@ static const char *TAG = "lcd_nv3030b";
  * ============================================================ */
 #define LCD_QSPI_HOST        SPI2_HOST
 /* QSPI 写显存时钟。
- * 实测结论（本模组 + 本板走线）：**30MHz 稳定，40MHz 会花屏**，
- * 说明该面板/走线的时序余量不足以支撑 40MHz（厂商例程取 20MHz 偏保守）。
- * 因此定格在 30MHz。若换批次后仍出现花屏/丢像素，依次降 20/10MHz 定位。
- * 注意：改这个值只影响写显存速率，不影响命令时序。 */
-#define LCD_QSPI_PCLK_HZ     (30 * 1000 * 1000)
+ * 实测结论（本模组 + 本板走线）：40MHz 花屏；30MHz 表面正常但持续刷屏数秒后
+ * 面板失锁（软件全链路 ESP_OK，但 GRAM 不再更新，屏幕冻结）；降到 10MHz 后
+ * 横屏长时间运行稳定。根因是该面板/走线的信号完整性裕量不足。
+ * ⚠ 该值与显示稳定性强相关，不要随意调高；换批次若仍异常可再降档。
+ * 注意：只影响写显存速率，不影响命令时序。 */
+#define LCD_QSPI_PCLK_HZ     (20 * 1000 * 1000)
 #define LCD_QSPI_CMD_BITS    32
 #define LCD_QSPI_PARAM_BITS  8
 #define LCD_QSPI_TRANS_DEPTH 10
@@ -583,15 +584,16 @@ esp_err_t lcd_nv3030b_set_rotation(lcd_nv3030b_rotation_t rot)
         return ESP_ERR_INVALID_STATE;
     }
 
-    const uint8_t madctl = s_rot_madctl[rot];
-    esp_err_t err = esp_lcd_panel_io_tx_param(s_io, LCD_QSPI_CMD(LCD_CMD_MADCTL), &madctl, 1);
-    if (err != ESP_OK) {
-        ESP_LOGE(TAG, "写 MADCTL(0x%02X) 失败: %s", madctl, esp_err_to_name(err));
-        return err;
-    }
-
+    /* 2026-10 架构变更：面板物理方向永久固定为 ROT_90（MADCTL 0x68，已在
+     * 厂商 init 序列里写过一次），运行期绝不再向面板写 MADCTL。
+     * 原因：QSPI 面板的寄存器命令(tx_param)与颜色 DMA(tx_color)共用同一
+     * panel IO，esp_lcd panel IO 非线程安全；运行期在刷屏流中插入 MADCTL
+     * 会使面板控制器状态异常（实测快速刷新若干次后整屏冻结）。屏幕方向改由
+     * LVGL 软件旋转完成（见 lvgl_port.c 的 sw_rotate + lv_display_set_rotation），
+     * 面板始终只按 284x240 物理横屏收数据。这里只记录档位，不产生总线事务。 */
+    (void)s_rot_madctl;
     s_rotation = rot;
-    ESP_LOGI(TAG, "显示旋转切换为 ROT_%d（MADCTL=0x%02X）", rot * 90, madctl);
+    ESP_LOGI(TAG, "显示旋转档位=ROT_%d（面板 MADCTL 保持 0x68，旋转在 LVGL 软件层）", rot * 90);
     return ESP_OK;
 }
 
