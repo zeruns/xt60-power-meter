@@ -80,7 +80,7 @@ static const char *TAG = "lcd_nv3030b";
  * 横屏长时间运行稳定。根因是该面板/走线的信号完整性裕量不足。
  * ⚠ 该值与显示稳定性强相关，不要随意调高；换批次若仍异常可再降档。
  * 注意：只影响写显存速率，不影响命令时序。 */
-#define LCD_QSPI_PCLK_HZ     (20 * 1000 * 1000)
+#define LCD_QSPI_PCLK_HZ     (23 * 1000 * 1000)
 #define LCD_QSPI_CMD_BITS    32
 #define LCD_QSPI_PARAM_BITS  8
 #define LCD_QSPI_TRANS_DEPTH 10

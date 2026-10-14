@@ -52,20 +52,23 @@ static const char *TAG = "lvgl_port";
 
 /** LVGL 心跳周期（毫秒）：交给官方 esp_lvgl_port 的 timer_period_ms */
 #define LVGL_PORT_TICK_MS 5
-/** flush 缓冲行数（PARTIAL 模式按行刷新，40 行兼顾内存占用与刷新效率） */
-#define LVGL_PORT_BUF_ROWS 40
 
-/* 软件旋转小块高度：PARTIAL 模式 LVGL 按 draw buffer 容量切分脏区，
- * 90/270 度旋转前后像素数不变 (w*h==h*w)，故同尺寸旋转缓冲足够。
- * 284*20*2≈11.4KB，主缓冲+旋转缓冲共约 23KB 内部 RAM。
- * 全屏缓冲实测会把 CPU0 跑满触发 TWDT，故必须用小块。 */
-#define LVGL_PORT_SWROT_ROWS 20
+/* 渲染缓冲块高度：PARTIAL 模式按行分块刷新。
+ * 台阶1 优化（20 → 40 行）：减小 flush 次数、提升 DMA 效率与帧率。
+ * 284*40*2 ≈ 22.7KB/缓冲；开启双缓冲（render 与 DMA 并行）后
+ * 主缓冲×2 + 软件旋转缓冲×1 ≈ 68KB 内部 RAM，仍有充足余量。 */
+#define LVGL_PORT_BUF_ROWS 40
+/** 软件旋转输出缓冲行数：与主缓冲等大（90/270° 旋转前后像素总数不变） */
+#define LVGL_PORT_SWROT_ROWS LVGL_PORT_BUF_ROWS
 /** LVGL 任务栈大小（字节）与优先级、绑定核（0=交互核） */
 /* 软件旋转（lv_draw_sw_rotate）+ 波形 chart 的渲染调用链较深，
  * 实测 7168 在竖屏渲染波形/设置页时栈溢出（剩 140B 后 CORRUPTED），
  * 12288 余量不足 200B；16384 留足安全余量（内部 RAM 空闲 130KB+）。 */
 #define LVGL_PORT_TASK_STACK 16384
-#define LVGL_PORT_TASK_PRIO  4
+/* 台阶1 优化：优先级 4 → 10。LVGL 是交互核的主要负载，低优先级下
+ * 频繁被采样/日志等任务抢占，帧率受限；10 让渲染及时获得 CPU。
+ * 仍低于测量核的关键任务，不会饿死其他任务。 */
+#define LVGL_PORT_TASK_PRIO  10
 #define LVGL_PORT_TASK_CORE  0
 
 /* ---- 中文字体路径（SPIFFS） ---- */
@@ -272,8 +275,11 @@ esp_err_t lvgl_port_app_init(void)
     const lvgl_port_display_cfg_t disp_cfg = {
         .io_handle = lcd_nv3030b_get_io_handle(),
         .panel_handle = lcd_nv3030b_get_panel_handle(),
-        .buffer_size = (uint32_t)LCD_NV3030B_H_RES * LVGL_PORT_SWROT_ROWS, /* 20 行小块 */
-        .double_buffer = false,
+        .buffer_size = (uint32_t)LCD_NV3030B_H_RES * LVGL_PORT_BUF_ROWS, /* 40 行块 */
+        /* 台阶1 优化：双缓冲——LVGL 渲染 buf1 时 DMA 正在搬运 buf2，
+         * 渲染与刷屏并行，消除 CPU 等 DMA 的空转（实测帧率提升明显）。
+         * 内存代价：多一个 284×40×2≈22.7KB 内部 RAM 缓冲。 */
+        .double_buffer = true,
         .hres = (uint32_t)LCD_NV3030B_H_RES, /* 物理 284，永不改变 */
         .vres = (uint32_t)LCD_NV3030B_V_RES, /* 物理 240，永不改变 */
         .monochrome = false,

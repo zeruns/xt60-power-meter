@@ -148,9 +148,8 @@ CONFIG_LV_COLOR_DEPTH_16=y
 CONFIG_LV_COLOR_FORMAT_RGB565_SWAPPED=y
 # 正式测量界面已上线，不再编译官方 widgets demo
 # CONFIG_LV_USE_DEMO_WIDGETS is not set
-# 关闭 FPS/CPU 性能监视器与 sysmon（不再需要屏幕角标）
+# 关闭 FPS/CPU 性能监视器（台阶1 验收已完成，恢复无角标的干净界面）
 # CONFIG_LV_USE_SYSMON is not set
-# CONFIG_LV_USE_PERF_MONITOR is not set
 # 中文字体方案：tiny_ttf，字体文件放 SPIFFS（storage 分区，挂载于 /spiffs）
 #   字体由 tools/fonts/make_fonts.py 生成（Noto Sans SC Regular/Bold，
 #   GB2312 一级字库子集，OFL 授权），构建时打入 SPIFFS 镜像随固件烧入，
