@@ -22,13 +22,18 @@
 #include "freertos/task.h"
 
 #include "esp_log.h"
+#include "esp_timer.h"
 
 #include "button.h"
 #include "data_store.h"
 #include "lcd_nv3030b.h"
 #include "lvgl.h"
+#include "settings.h"
 
 #include "lvgl_port.h"
+#include "screens/screen_measure.h"
+#include "screens/screen_settings.h"
+#include "screens/screen_wave.h"
 #include "screens/splash.h"
 #include "ui.h"
 #include "ui_nav.h"
@@ -44,13 +49,68 @@ static const char *TAG = "ui";
 
 #define UI_BUILD_LOCK_TIMEOUT_MS 5000 /**< 构建界面时获取 LVGL 锁的超时 */
 #define UI_HANDLER_WAIT_MAX_MS 200    /**< 单次等待 LVGL 锁的上限 */
-#define UI_LOOP_PERIOD_MS 20          /**< 主循环固定节拍（50Hz） */
+#define UI_LOOP_PERIOD_MS 5           /**< 主循环节拍（200Hz 检查点；30Hz 刷新档
+                                       *   需要 ≤33ms 判定粒度，故收紧到 5ms） */
 #define UI_SPLASH_HOLD_MS 1800        /**< 启动画面停留时长 */
-#define UI_REFRESH_PERIOD_MS 200      /**< 数据刷新周期（5Hz） */
-#define UI_BACKLIGHT_PERCENT 100      /**< 首帧上屏后设置的背光亮度 */
+#define UI_REFRESH_DEFAULT_HZ 5       /**< 测量页默认刷新率 */
+#define UI_SAMPLE_PERIOD_US 25000     /**< 快照环采样周期（25ms=40Hz，与测量核
+                                       *   PM_DISPLAY_SUBWINDOW 的快拍频率一致） */
+#define UI_RING_SIZE 40               /**< 1 秒快照环（40 帧 @40Hz） */
+#define UI_WAVE_PERIOD_US 40000       /**< 波形页固定 25Hz（图面流畅，独立于测量页） */
+#define UI_STATUSBAR_PERIOD_US 200000 /**< 状态栏/设置页 5Hz */
+#define UI_BACKLIGHT_PERCENT 100      /**< 背光兜底默认值（用户已保存亮度时以 NVS 值为准） */
 #define UI_INPUT_QUEUE_LEN 16
 
 static bool s_ui_inited = false;
+
+/* ============================================================
+ * 临时诊断开关（复现"首页数据快速刷新后 UI 卡死"）。定位后请改回 0/删除。
+ *
+ * 开启后 UI 任务会每隔约 1s 自动执行一步操作序列，等价于"无人值守地
+ * 反复开/关快速菜单、翻页、旋转屏幕"，从而在 PC 侧串口日志里稳定复现
+ * 卡死，并借助 app_task 的"冻结诊断"行判定卡在渲染管线还是 UI 任务。
+ * ============================================================ */
+#define UI_SELFTEST 0
+
+/** UI 任务心跳（主循环每轮更新）：供 app_task 判断 UI 任务是否也停摆 */
+static volatile int64_t s_ui_loop_us = 0;
+static volatile uint32_t s_ui_loop_count = 0;
+
+int64_t ui_get_last_loop_us(void)
+{
+    return s_ui_loop_us;
+}
+
+/* ---- 显示刷新配置（测量页快速菜单可改；持久化在 settings） ---- */
+static volatile uint8_t s_rate_hz = UI_REFRESH_DEFAULT_HZ;
+
+/* 快照历史环：40Hz 采样（测量核的快速显示帧），供测量页各档位做窗口平均。
+ * 单写者是测量核；这里只读，seqlock 保证帧自洽。 */
+#define SNAP_HIST UI_RING_SIZE
+static data_store_snapshot_t s_hist[SNAP_HIST];
+static int s_hist_pos = 0;   /**< 下一个写入位置 */
+static int s_hist_count = 0; /**< 已填充帧数（≤ SNAP_HIST） */
+static int64_t s_last_sample_us = 0;
+static int64_t s_last_measure_us = 0;
+static int64_t s_last_wave_us = 0;
+static int64_t s_last_bar_us = 0;
+static int64_t s_last_set_us = 0;
+
+uint8_t ui_get_display_rate_hz(void)
+{
+    return s_rate_hz;
+}
+
+void ui_set_display_rate_hz(uint8_t hz)
+{
+    /* 合法性由 settings 兜底校验（1/5/10/20/30）；此处只同步运行时值。
+     * 本函数由菜单回调（LVGL 任务）调用，s_rate_hz 为 volatile 供 UI 任务读取。 */
+    if (settings_set_display_rate_hz(hz) != ESP_OK) {
+        return;
+    }
+    s_rate_hz = hz;
+    ESP_LOGI(TAG, "首页数据刷新率 → %u Hz", (unsigned)hz);
+}
 
 /** 按键输入消息（esp_timer 回调 → 队列 → UI 任务） */
 typedef struct {
@@ -85,6 +145,22 @@ static void drain_key_queue(void)
 }
 
 /**
+ * @brief 打开背光：优先应用用户已保存的亮度（设置页可调），无效时用出厂默认
+ *
+ * 亮度值来自 NVS（settings 服务），因此"用户上次调好的亮度"在每次开机都生效。
+ */
+static void apply_backlight(void)
+{
+    uint8_t bright = UI_BACKLIGHT_PERCENT;
+    settings_t cfg;
+    if (settings_get(&cfg) == ESP_OK && cfg.lcd_brightness >= 10) {
+        bright = cfg.lcd_brightness;
+    }
+    (void)lcd_nv3030b_set_backlight(bright);
+    ESP_LOGI(TAG, "背光已打开（%u%%）", bright);
+}
+
+/**
  * @brief UI 任务：启动画面 → 主界面 → 循环驱动 LVGL
  *
  * 界面构建放在本任务（而非 ui_init()）的原因：app_main 任务栈仅 3.5KB，
@@ -101,6 +177,13 @@ static void task_ui(void *arg)
     (void)arg;
 
     s_key_queue = xQueueCreate(UI_INPUT_QUEUE_LEN, sizeof(ui_key_msg_t));
+
+    /* 载入用户设置的刷新率（失败则保持默认 5Hz） */
+    settings_t cfg0;
+    if (settings_get(&cfg0) == ESP_OK && cfg0.display_rate_hz > 0) {
+        s_rate_hz = cfg0.display_rate_hz;
+    }
+    ESP_LOGI(TAG, "首页数据刷新率：%u Hz", (unsigned)s_rate_hz);
 
     /* ---- ① 启动画面：边跑 handler 边计时（停留期间必须持续渲染） ---- */
     bool backlight_on = false;
@@ -120,16 +203,15 @@ static void task_ui(void *arg)
         }
         /* 首帧真正上屏后才打开背光：避免开机先看到黑屏/局部条带（见 lcd 驱动注释） */
         if (!backlight_on && lvgl_port_flush_count() > 0) {
-            (void)lcd_nv3030b_set_backlight(UI_BACKLIGHT_PERCENT);
+            apply_backlight();
             backlight_on = true;
-            ESP_LOGI(TAG, "首帧已上屏，打开背光（%d%%）", UI_BACKLIGHT_PERCENT);
         }
         vTaskDelayUntil(&last, pdMS_TO_TICKS(UI_LOOP_PERIOD_MS));
         elapsed_ms += UI_LOOP_PERIOD_MS;
     }
     /* 兜底：若因异常一直没有 flush 完成，启动画面结束后也点亮背光，避免全黑 */
     if (!backlight_on) {
-        (void)lcd_nv3030b_set_backlight(UI_BACKLIGHT_PERCENT);
+        apply_backlight();
         backlight_on = true;
         ESP_LOGW(TAG, "启动画面期间未检测到上屏完成，强制打开背光");
     }
@@ -155,22 +237,149 @@ static void task_ui(void *arg)
         ESP_LOGW(TAG, "K2 回调注册失败: %s", esp_err_to_name(err));
     }
 
-    /* ---- ③ 主循环：固定节拍（20ms），每 10 拍刷一次数据（5Hz） ---- */
+    /* ---- ③ 主循环：三个页面的刷新节奏**相互独立** ----
+     *   · 快照环：25ms（40Hz）从 data_store 采一帧（测量核已按 40Hz 推快拍）；
+     *   · 状态栏：5Hz（时间/电量/页码点），任何页面都刷；
+     *   · 测量页：按用户设定刷新率（1/5/10/20/30Hz），对历史环取窗口平均；
+     *   · 波形页：固定 25Hz（图面流畅，不受测量页刷新率影响）；
+     *   · 设置页：5Hz（校准向导读数/电能统计等少量实时值）。
+     * 数据源恒定 40Hz 快拍 + 200ms 权威块（电能/真 RMS 不受显示设置影响）。 */
     last = xTaskGetTickCount();
-    uint32_t tick_cnt = 0;
-    const uint32_t refresh_ticks = UI_REFRESH_PERIOD_MS / UI_LOOP_PERIOD_MS;
 
     for (;;) {
+        /* UI 任务心跳：每轮更新，供 app_task 判断 UI 任务是否也停摆 */
+        s_ui_loop_us = esp_timer_get_time();
+        s_ui_loop_count++;
+
         if (lvgl_port_lock(UI_HANDLER_WAIT_MAX_MS)) {
             drain_key_queue();
 
-            if (++tick_cnt >= refresh_ticks) {
-                tick_cnt = 0;
-                data_store_snapshot_t snap;
-                if (data_store_get(&snap) == ESP_OK) {
-                    ui_nav_refresh(&snap);
+            const int64_t now_us = esp_timer_get_time();
+
+            /* ① 40Hz 快照环 */
+            if (now_us - s_last_sample_us >= UI_SAMPLE_PERIOD_US) {
+                s_last_sample_us = now_us;
+                data_store_snapshot_t s0;
+                if (data_store_get(&s0) == ESP_OK) {
+                    s_hist[s_hist_pos] = s0;
+                    s_hist_pos = (s_hist_pos + 1) % SNAP_HIST;
+                    if (s_hist_count < SNAP_HIST) {
+                        s_hist_count++;
+                    }
                 }
             }
+
+            /* ② 状态栏 5Hz（先取最新帧，下面各页复用） */
+            const bool have_data = (s_hist_count > 0);
+            data_store_snapshot_t latest;
+            if (have_data) {
+                latest = s_hist[(s_hist_pos - 1 + SNAP_HIST) % SNAP_HIST];
+            }
+            if (have_data && now_us - s_last_bar_us >= UI_STATUSBAR_PERIOD_US) {
+                s_last_bar_us = now_us;
+                ui_nav_refresh_statusbar(&latest);
+            }
+
+            const ui_page_t page = ui_nav_current_page();
+
+            /* ③ 测量页：设定刷新率 + 窗口平均（1s/200ms/100ms/50ms/即时） */
+            if (have_data && page == UI_PAGE_MEASURE) {
+                const uint8_t hz = s_rate_hz ? s_rate_hz : 5;
+                if (now_us - s_last_measure_us >= 1000000 / (int64_t)hz) {
+                    s_last_measure_us = now_us;
+                    /* 窗口帧数：40Hz 源下 1Hz→40、5Hz→8、10Hz→4、20Hz→2、30Hz→1 */
+                    int win = 40 / (hz >= 1 ? hz : 1);
+                    if (win < 1) {
+                        win = 1;
+                    }
+                    if (win > s_hist_count) {
+                        win = s_hist_count;
+                    }
+                    data_store_snapshot_t out =
+                        s_hist[(s_hist_pos - 1 + SNAP_HIST) % SNAP_HIST];
+                    if (win >= 2) {
+                        double sv = 0, si = 0, sp = 0;
+                        for (int k = 0; k < win; k++) {
+                            const data_store_snapshot_t *f =
+                                &s_hist[(s_hist_pos - 1 - k + SNAP_HIST) % SNAP_HIST];
+                            sv += f->voltage_v;
+                            si += f->current_a;
+                            sp += f->power_w;
+                        }
+                        out.voltage_v = (float)(sv / win);
+                        out.current_a = (float)(si / win);
+                        out.power_w = (float)(sp / win);
+                    }
+                    screen_measure_refresh(&out);
+                }
+            } else if (have_data && page == UI_PAGE_WAVE) {
+                /* ④ 波形页：固定 25Hz（与测量页刷新率互不影响） */
+                if (now_us - s_last_wave_us >= UI_WAVE_PERIOD_US) {
+                    s_last_wave_us = now_us;
+                    screen_wave_refresh();
+                }
+            } else if (have_data && page == UI_PAGE_SETTINGS) {
+                /* ⑤ 设置页：5Hz 实时值（校准向导/电能统计的动态标签） */
+                if (now_us - s_last_set_us >= UI_STATUSBAR_PERIOD_US) {
+                    s_last_set_us = now_us;
+                    screen_settings_refresh(&latest);
+                }
+            }
+
+#if UI_SELFTEST
+            /* ---- 临时诊断：UI 压力自测（每约 1s 一步，循环往复）----
+             * 每步打印当前页/菜单状态，便于从日志还原"卡死前最后一步"。 */
+            {
+                static int64_t s_st_us = 0;
+                static int s_step = 0;
+                if (now_us - s_st_us >= 1000000) {
+                    s_st_us = now_us;
+                    ESP_LOGW(TAG, "[自测] step=%d 页=%d 菜单=%d", s_step, (int)ui_nav_current_page(),
+                             (int)screen_measure_menu_is_open());
+                    switch (s_step % 12) {
+                    case 0: /* 开测量快速菜单 */
+                        ui_nav_handle_key(BUTTON_ID_USER, BUTTON_EVENT_LONG_PRESS_START);
+                        break;
+                    case 1: /* 焦点下移 */
+                        ui_nav_handle_key(BUTTON_ID_USER, BUTTON_EVENT_SINGLE_CLICK);
+                        break;
+                    case 2: /* 激活（切刷新率档） */
+                        ui_nav_handle_key(BUTTON_ID_USER, BUTTON_EVENT_DOUBLE_CLICK);
+                        break;
+                    case 3: /* 关菜单 */
+                        ui_nav_handle_key(BUTTON_ID_BOOT, BUTTON_EVENT_LONG_PRESS_START);
+                        break;
+                    case 4: /* → 波形页 */
+                        ui_nav_handle_key(BUTTON_ID_USER, BUTTON_EVENT_SINGLE_CLICK);
+                        break;
+                    case 5: /* → 设置页 */
+                        ui_nav_handle_key(BUTTON_ID_USER, BUTTON_EVENT_SINGLE_CLICK);
+                        break;
+                    case 6: /* 旋转 90°（竖屏，触发整树重建） */
+                        lvgl_port_set_rotation_angle(90);
+                        break;
+                    case 7: /* 旋转回 0° */
+                        lvgl_port_set_rotation_angle(0);
+                        break;
+                    case 8: /* ← 波形页 */
+                        ui_nav_handle_key(BUTTON_ID_BOOT, BUTTON_EVENT_SINGLE_CLICK);
+                        break;
+                    case 9: /* ← 测量页 */
+                        ui_nav_handle_key(BUTTON_ID_BOOT, BUTTON_EVENT_SINGLE_CLICK);
+                        break;
+                    case 10: /* 再次开菜单 */
+                        screen_measure_open_menu();
+                        break;
+                    case 11: /* 旋转 90°（菜单开着时旋转） */
+                        lvgl_port_set_rotation_angle(90);
+                        break;
+                    default:
+                        break;
+                    }
+                    s_step++;
+                }
+            }
+#endif
 
             lvgl_port_unlock();
         }

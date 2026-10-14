@@ -56,7 +56,11 @@
  * 已存数据、也不需要做版本迁移。
  */
 typedef struct {
-    uint8_t buzzer_volume; /**< 蜂鸣器响度 1~100（出厂默认取 CONFIG_BUZZER_VOLUME_PERCENT） */
+    uint8_t buzzer_volume;  /**< 蜂鸣器响度 1~100（出厂默认取 CONFIG_BUZZER_VOLUME_PERCENT） */
+    uint8_t lcd_brightness; /**< 屏幕背光亮度 10~100（出厂默认 80；下限 10 防止全黑无法操作） */
+    uint8_t display_rate_hz; /**< 首页数据刷新率（1/5/10/20/30 Hz，出厂默认 5） */
+    uint8_t orientation_auto; /**< 屏幕是否随重力自动旋转（1=自动，0=手动，出厂默认 0） */
+    uint16_t orientation_angle; /**< 手动方向角度（0/90/180/270，默认 0=横屏） */
 } settings_t;
 
 /**
@@ -90,6 +94,39 @@ esp_err_t settings_get(settings_t *out);
  *         ESP_ERR_INVALID_STATE 尚未初始化
  */
 esp_err_t settings_set_buzzer_volume(uint8_t percent);
+
+/**
+ * @brief 更新屏幕背光亮度：写入内存缓存并安排延迟落盘
+ *
+ * 与响度相同采用防抖策略：设置页滑块拖动期间可放心高频调用，
+ * 由调用方负责同步调用 lcd_nv3030b_set_backlight() 让亮度立即生效。
+ *
+ * @param percent 亮度 10~100（下限 10 防止把屏幕调到全黑后无法操作）
+ * @return ESP_OK 成功
+ *         ESP_ERR_INVALID_ARG 超出范围
+ *         ESP_ERR_INVALID_STATE 尚未初始化
+ */
+esp_err_t settings_set_lcd_brightness(uint8_t percent);
+
+/**
+ * @brief 更新首页数据刷新率（测量页快速菜单中可调）
+ *
+ * 合法档位：1 / 5 / 10 / 20 / 30 Hz。测量核固定 40Hz 推送即时快照，
+ * 低档位由 UI 层对快照历史做窗口平均（更稳），高档位提高界面响应速度；
+ * 只影响测量页（波形页固定 25Hz）。
+ *
+ * @param hz 刷新率（仅接受 1/5/10/20/30）
+ * @return ESP_OK 成功；ESP_ERR_INVALID_ARG 非合法档位；ESP_ERR_INVALID_STATE 尚未初始化
+ */
+esp_err_t settings_set_display_rate_hz(uint8_t hz);
+
+/**
+ * @brief 更新屏幕方向设置（显示设置页调用；立即防抖落盘）
+ *
+ * @param auto_on 是否启用重力自动旋转（1/0）
+ * @param angle   手动方向角度（auto_on=0 时生效；仅接受 0/90/180/270）
+ */
+esp_err_t settings_set_orientation(uint8_t auto_on, uint16_t angle);
 
 /**
  * @brief 立即把内存缓存写入 NVS（忽略防抖）

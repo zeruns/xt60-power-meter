@@ -18,14 +18,15 @@
  * ────────────────────────────────────────────────────────────
  * 关于硬旋转与 sw_rotate（重要，改动前必读）
  * ────────────────────────────────────────────────────────────
- * 本面板的方向由 MADCTL=0x68（MX|MV|BGR）在面板侧硬旋转为 284x240 横屏，
- * LVGL 逻辑分辨率随之设为 284x240。官方的 lvgl_port_add_disp() 在
- * sw_rotate=false 时会根据 disp_cfg.rotation 调用 esp_lcd_panel_swap_xy()/
- * mirror() 去“设置面板方向”。但本面板（spd2010 组件）**不支持 swap_xy**
- * （调用会报错），且该调用会改写 MADCTL，破坏我们已标定好的硬旋转。
- * 因此这里置 disp_cfg.flags.sw_rotate = 1：官方会跳过其 HW 旋转分支，
- * 只做“软件旋转”（而我们始终让 LVGL 旋转档位保持 ROTATION_0，软件旋转
- * 分支不产生任何变换），从而完全保留面板侧的 MADCTL 硬旋转与触摸映射。
+ * 本面板物理方向由初始化序列 MADCTL=0x68（MX|MV|BGR）固定为 284x240 横屏，
+ * 运行期绝不再向面板写任何方向命令（命令与颜色 DMA 并发会冻结，见
+ * lcd_nv3030b.c）。用户角度 0/90/180/270° 全部由 LVGL 软件旋转实现：
+ * disp_cfg.flags.sw_rotate = 1 使官方跳过 HW 旋转分支，flush 时用
+ * lv_draw_rotate() 把逻辑缓冲旋进物理缓冲（90/270° 换行、180° 倒序）。
+ * ⚠ 该旋转函数只支持 LV_COLOR_FORMAT_RGB565，不支持 RGB565_SWAPPED
+ * （否则旋转输出是垃圾内存=整屏花屏），因此渲染格式用 RGB565、由
+ * flags.swap_bytes=1 在旋转完成后统一交换字节序给面板。
+ * 90/270° 时 touch 映射按 s_touch_map 表把物理坐标换成逻辑坐标。
  *
  * ────────────────────────────────────────────────────────────
  * 中文字体（tiny_ttf + SPIFFS 文件）
@@ -53,8 +54,17 @@ static const char *TAG = "lvgl_port";
 #define LVGL_PORT_TICK_MS 5
 /** flush 缓冲行数（PARTIAL 模式按行刷新，40 行兼顾内存占用与刷新效率） */
 #define LVGL_PORT_BUF_ROWS 40
+
+/* 软件旋转小块高度：PARTIAL 模式 LVGL 按 draw buffer 容量切分脏区，
+ * 90/270 度旋转前后像素数不变 (w*h==h*w)，故同尺寸旋转缓冲足够。
+ * 284*20*2≈11.4KB，主缓冲+旋转缓冲共约 23KB 内部 RAM。
+ * 全屏缓冲实测会把 CPU0 跑满触发 TWDT，故必须用小块。 */
+#define LVGL_PORT_SWROT_ROWS 20
 /** LVGL 任务栈大小（字节）与优先级、绑定核（0=交互核） */
-#define LVGL_PORT_TASK_STACK 7168
+/* 软件旋转（lv_draw_sw_rotate）+ 波形 chart 的渲染调用链较深，
+ * 实测 7168 在竖屏渲染波形/设置页时栈溢出（剩 140B 后 CORRUPTED），
+ * 12288 余量不足 200B；16384 留足安全余量（内部 RAM 空闲 130KB+）。 */
+#define LVGL_PORT_TASK_STACK 16384
 #define LVGL_PORT_TASK_PRIO  4
 #define LVGL_PORT_TASK_CORE  0
 
@@ -74,7 +84,7 @@ static volatile uint32_t s_flush_count = 0;
 static lcd_nv3030b_rotation_t s_rotation = LCD_NV3030B_ROT_90;
 
 /** 各字号对应的像素高度（与枚举 lvgl_port_font_size_t 一一对应） */
-static const int s_font_px[LVGL_PORT_FONT_MAX] = { 12, 14, 16, 20, 24, 32, 40 };
+static const int s_font_px[LVGL_PORT_FONT_MAX] = { 12, 14, 16, 20, 24, 32, 36, 40 };
 /** 字重下标 */
 enum {
     FONT_WEIGHT_REG = 0,
@@ -192,33 +202,25 @@ uint32_t lvgl_port_flush_count(void)
 }
 
 /**
- * @brief 触摸坐标映射参数（按旋转档位）
+ * @brief 触摸坐标映射（旋转交给 LVGL 内置逻辑，本层只做固定玻璃校准）
  *
- * 触摸 IC（CST816D）输出的是**物理玻璃坐标** (px∈0..239, py∈0..283)，
- * 它不随显示方向变化；而显示方向由面板 MADCTL 决定。因此每个旋转档位都需要
- * 一组「交换/翻转」参数，把物理坐标换算成当前逻辑坐标：
+ * 触摸 IC（CST816D）输出的是**触摸玻璃坐标** (px∈0..239, py∈0..283)，
+ * 它不随显示方向变化。本层只做一次与旋转无关的固定校准（0° 实测锚点），
+ * 把玻璃坐标换到**面板物理坐标系**（284×240）：
  *
- *   x0 = swap_xy ? py : px
- *   y0 = swap_xy ? px : py
- *   lx = flip_x  ? (逻辑宽-1 - x0) : x0
- *   ly = flip_y  ? (逻辑高-1 - y0) : y0
+ *   (Px, Py) = (283 - py, 239 - px)
  *
- * ⚠ ROT_90（当前默认）的三项参数是**上板实测**校正过的，换档位方向不对时
- *   只改这张表，不要动面板 MADCTL。
+ * 各角度的物理→逻辑旋转**交给 LVGL 内置**：LVGL 9.6 的
+ * indev_pointer_proc() 会对 read_cb 返回的点自动调用
+ * lv_display_rotate_point()（默认 cw，恰好是 flush 软件旋转
+ * lv_draw_rotate 的逆变换，三个角度均已逐一验证）。
+ *
+ * ⚠ read_cb 只能返回**物理坐标**。若在此按角度自行映射成逻辑坐标，
+ *   会被 LVGL 二次旋转：0° 时 rotate_point 是恒等所以不暴露，
+ *   180° 时两次旋转相互抵消（触摸表现为 0°，与显示差 180°），
+ *   90°/270° 叠加出反向/错乱——2026-10 实机现象正是此根因，
+ *   已废弃原 s_touch_map 逐档位映射表。
  */
-typedef struct {
-    bool swap_xy; /**< 是否交换 px/py（横屏为 true） */
-    bool flip_x;  /**< 逻辑 X 是否反向 */
-    bool flip_y;  /**< 逻辑 Y 是否反向 */
-} touch_map_t;
-
-static const touch_map_t s_touch_map[4] = {
-    [LCD_NV3030B_ROT_0] = { false, false, false },  /* 竖屏 240x284 */
-    [LCD_NV3030B_ROT_90] = { true, true, true },    /* 横屏 284x240（已上板校正） */
-    [LCD_NV3030B_ROT_180] = { false, true, true },  /* 竖屏倒置 */
-    [LCD_NV3030B_ROT_270] = { true, false, false }, /* 横屏倒置 */
-};
-
 static void indev_read_cb(lv_indev_t *indev, lv_indev_data_t *data)
 {
     (void)indev;
@@ -230,31 +232,10 @@ static void indev_read_cb(lv_indev_t *indev, lv_indev_data_t *data)
         return;
     }
 
-    /* 按当前旋转档位把物理坐标换算成逻辑坐标 */
-    const touch_map_t *m = &s_touch_map[s_rotation];
-    int lw = 0;
-    int lh = 0;
-    lcd_nv3030b_get_resolution(s_rotation, &lw, &lh);
-
-    const int x0 = m->swap_xy ? (int)tp.y : (int)tp.x;
-    const int y0 = m->swap_xy ? (int)tp.x : (int)tp.y;
-    int lx = m->flip_x ? (lw - 1 - x0) : x0;
-    int ly = m->flip_y ? (lh - 1 - y0) : y0;
-
-    /* 裁剪到当前逻辑分辨率 */
-    if (lx < 0) {
-        lx = 0;
-    } else if (lx > lw - 1) {
-        lx = lw - 1;
-    }
-    if (ly < 0) {
-        ly = 0;
-    } else if (ly > lh - 1) {
-        ly = lh - 1;
-    }
-
-    data->point.x = (lv_coord_t)lx;
-    data->point.y = (lv_coord_t)ly;
+    /* 玻璃坐标 → 面板物理坐标（0° 实测锚点，与旋转无关）。
+     * 283 = LCD_NV3030B_PHYS_H-1，239 = LCD_NV3030B_PHYS_W-1。 */
+    data->point.x = (lv_coord_t)(LCD_NV3030B_PHYS_H - 1 - (int)tp.y);
+    data->point.y = (lv_coord_t)(LCD_NV3030B_PHYS_W - 1 - (int)tp.x);
     data->state = LV_INDEV_STATE_PRESSED;
 }
 
@@ -280,31 +261,38 @@ esp_err_t lvgl_port_app_init(void)
     /* ---- ② 中文字体（须在 lv_init 之后创建） ---- */
     load_fonts();
 
-    /* ---- ③ 注册显示：由官方分配缓冲并接管刷屏与传输完成回调 ----
-     * 关键：sw_rotate=1 —— 面板方向由 MADCTL 硬旋转决定，必须让官方跳过其
-     * HW 旋转分支（否则会调 swap_xy（本面板不支持）并改写 MADCTL）。详见文件头。 */
-    int lw = 0;
-    int lh = 0;
-    lcd_nv3030b_get_resolution(s_rotation, &lw, &lh);
-
+    /* ---- ③ 注册显示（软件旋转架构）----
+     * 面板物理方向永久固定 284x240 横屏（MADCTL 0x68，init 写一次后不再动）。
+     * sw_rotate=1：方向切换时 esp_lvgl_port 在 flush 里用 lv_draw_rotate 把
+     * 逻辑缓冲旋进物理缓冲，运行期零面板命令，杜绝命令/颜色 DMA 并发冻结。
+     * PARTIAL 模式脏区被 draw buffer 容量切成 ≤20 行小块，284*20*2≈11.4KB
+     * 的旋转输出缓冲就够（与主缓冲同尺寸），放内部 RAM，DMA 快。
+     * ⚠ 旋转缓冲必须与主缓冲等大：90°/270° 时旋转输出按目标行主序写，
+     *   行数=源宽、行跨度=源高对应的字节数，像素总数不变。 */
     const lvgl_port_display_cfg_t disp_cfg = {
         .io_handle = lcd_nv3030b_get_io_handle(),
         .panel_handle = lcd_nv3030b_get_panel_handle(),
-        .buffer_size = (uint32_t)LCD_NV3030B_PHYS_H * LVGL_PORT_BUF_ROWS, /* 单位：像素 */
+        .buffer_size = (uint32_t)LCD_NV3030B_H_RES * LVGL_PORT_SWROT_ROWS, /* 20 行小块 */
         .double_buffer = false,
-        .hres = (uint32_t)lw,
-        .vres = (uint32_t)lh,
+        .hres = (uint32_t)LCD_NV3030B_H_RES, /* 物理 284，永不改变 */
+        .vres = (uint32_t)LCD_NV3030B_V_RES, /* 物理 240，永不改变 */
         .monochrome = false,
         .rotation = { .swap_xy = false, .mirror_x = false, .mirror_y = false },
         .flags = {
-            .buff_dma = 1,   /* 渲染缓冲放内部 RAM（QSPI DMA 要求） */
+            .buff_dma = 1,   /* 主缓冲+旋转缓冲在内部 RAM（小块，渲染/DMA 快） */
             .buff_spiram = 0,
-            .sw_rotate = 1,  /* 见上：保护 MADCTL 硬旋转 */
-            .swap_bytes = 0, /* 颜色格式已用 RGB565_SWAPPED，无需再交换 */
+            .sw_rotate = 1,
+            /* 必须在 flush 时交换字节序：LVGL 的 lv_draw_rotate()（9.6 中即
+             * lv_draw_sw_rotate）只支持普通 RGB565，不支持 RGB565_SWAPPED
+             * （落到 default 分支什么都不写，旋转输出是垃圾内存→90/180/270°
+             * 整屏花屏）。因此渲染格式用 RGB565，旋转完成后由官方 flush 路径
+             * 的 swap_bytes 把旋转输出逐像素交换成面板所需的大端字节序，
+             * 0°（无旋转）路径同样正确。 */
+            .swap_bytes = 1,
             .full_refresh = 0,
             .direct_mode = 0,
         },
-        .color_format = LV_COLOR_FORMAT_RGB565_SWAPPED, /* 面板线上要求高字节在前 */
+        .color_format = LV_COLOR_FORMAT_RGB565,
     };
 
     s_display = lvgl_port_add_disp(&disp_cfg);
@@ -338,10 +326,17 @@ esp_err_t lvgl_port_app_init(void)
     lv_indev_set_read_cb(s_indev, indev_read_cb);
 
     s_inited = true;
-    ESP_LOGI(TAG, "LVGL 适配层就绪（官方 esp_lvgl_port；显示 %dx%d ROT_%d，RGB565 big-endian）",
-             lw, lh, s_rotation * 90);
+    ESP_LOGI(TAG, "LVGL 适配层就绪（软件旋转；物理面板固定 284x240）");
     return ESP_OK;
 }
+
+/* 用户角度（0/90/180/270）→ LVGL 软件旋转枚举。面板物理恒为 0° 横屏。 */
+static const lv_display_rotation_t s_angle_to_lvrot[4] = {
+    [LCD_NV3030B_ROT_90]  = LV_DISPLAY_ROTATION_0,
+    [LCD_NV3030B_ROT_180] = LV_DISPLAY_ROTATION_90,
+    [LCD_NV3030B_ROT_270] = LV_DISPLAY_ROTATION_180,
+    [LCD_NV3030B_ROT_0]   = LV_DISPLAY_ROTATION_270,
+};
 
 esp_err_t lvgl_port_set_rotation(lcd_nv3030b_rotation_t rot)
 {
@@ -352,34 +347,64 @@ esp_err_t lvgl_port_set_rotation(lcd_nv3030b_rotation_t rot)
         return ESP_ERR_INVALID_ARG;
     }
 
-    int lw = 0;
-    int lh = 0;
-    lcd_nv3030b_get_resolution(rot, &lw, &lh);
-
-    /* ① 先改面板方向（写 MADCTL） */
-    esp_err_t err = lcd_nv3030b_set_rotation(rot);
-    if (err != ESP_OK) {
-        return err;
+    /* 纯 LVGL 软件旋转：不写面板、不手动改分辨率。
+     * lv_display_set_rotation 内部更新逻辑分辨率并广播 RESOLUTION_CHANGED
+     * （三页据此重建）；esp_lvgl_port flush 时逐块 lv_draw_sw_rotate。 */
+    if (!lvgl_port_lock(1000)) {
+        ESP_LOGW(TAG, "旋转：获取 LVGL 锁超时，本次切换放弃");
+        return ESP_ERR_TIMEOUT;
     }
-
-    /* ② 记录档位：触摸映射立即按新档位生效 */
     s_rotation = rot;
+    lv_display_set_rotation(s_display, s_angle_to_lvrot[rot]);
+    lvgl_port_unlock();
 
-    /* ③ 同步 LVGL 显示分辨率（LVGL 9 会广播 RESOLUTION_CHANGED，界面自动重排） */
-    if (lvgl_port_lock(1000)) {
-        lv_display_set_resolution(s_display, lw, lh);
-        lvgl_port_unlock();
-    } else {
-        ESP_LOGW(TAG, "旋转后获取 LVGL 锁超时，显示分辨率未同步");
-    }
+    (void)lcd_nv3030b_set_rotation(rot); /* 仅记录档位，驱动内部无面板事务 */
 
-    ESP_LOGI(TAG, "显示旋转已切换为 ROT_%d（%dx%d）", rot * 90, lw, lh);
+    int lw = 0, lh = 0;
+    lcd_nv3030b_get_resolution(rot, &lw, &lh);
+    ESP_LOGI(TAG, "显示旋转（LVGL 软件层）ROT_%d（逻辑 %dx%d，物理面板固定 284x240）",
+             rot * 90, lw, lh);
     return ESP_OK;
 }
 
 lcd_nv3030b_rotation_t lvgl_port_get_rotation(void)
 {
     return s_rotation;
+}
+
+static lcd_nv3030b_rotation_t angle_to_rot(uint16_t deg)
+{
+    switch (deg) {
+    case 90:  return LCD_NV3030B_ROT_180;
+    case 180: return LCD_NV3030B_ROT_270;
+    case 270: return LCD_NV3030B_ROT_0;
+    case 0:
+    default:  return LCD_NV3030B_ROT_90;
+    }
+}
+
+static uint16_t rot_to_angle(lcd_nv3030b_rotation_t rot)
+{
+    switch (rot) {
+    case LCD_NV3030B_ROT_180: return 90;
+    case LCD_NV3030B_ROT_270: return 180;
+    case LCD_NV3030B_ROT_0:   return 270;
+    case LCD_NV3030B_ROT_90:
+    default:                 return 0;
+    }
+}
+
+esp_err_t lvgl_port_set_rotation_angle(uint16_t deg)
+{
+    if (deg != 0 && deg != 90 && deg != 180 && deg != 270) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    return lvgl_port_set_rotation(angle_to_rot(deg));
+}
+
+uint16_t lvgl_port_get_rotation_angle(void)
+{
+    return rot_to_angle(s_rotation);
 }
 
 /**

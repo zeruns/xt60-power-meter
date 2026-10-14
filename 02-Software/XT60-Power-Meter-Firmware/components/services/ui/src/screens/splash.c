@@ -2,14 +2,19 @@
  * @file splash.c
  * @brief 启动画面实现（参考 RD/UM34 类桌面功率计的简洁风格）
  *
- * 版式（284×240 横屏，白底）：
+ * 版式（白底，横屏 284×240 / 竖屏 240×284 自适应）：
  *   ┌──────────────────────────────┐  ← 顶部品牌色通栏（4px）
  *   │                              │
- *   │        XT60 功率计           │  Bold 34px，近黑
- *   │      作者博客：blog.zeruns    │  14px 中灰
- *   │        固件版本 v0.1.0        │  12px 浅灰
- *   │       ▓▓▓▓▓▓▓░░░░░            │  底部加载条（品牌色）
+ *   │        XT60 功率计           │  Bold 40px，近黑
+ *   │      作者博客：blog.zeruns    │  16px 中灰
+ *   │        固件版本 v0.1.0        │  14px 浅灰
+ *   │       ▓▓▓▓▓▓▓░░░░░            │  加载条（品牌色，屏宽 55%）
  *   └──────────────────────────────┘
+ *
+ * 布局策略：文字块 + 加载条全部放进同一 flex 列、整体居中。
+ * 加载条是列内最后一个子项，天然水平居中且恒在版本行下方——
+ * 横竖屏都自适应（旧版加载条用绝对坐标按 284 宽写死，竖屏时
+ * 既不居中又压住版本行）。
  */
 #include "splash.h"
 
@@ -23,6 +28,10 @@
 #define COLOR_SUB     lv_color_hex(0x666666)
 #define COLOR_VER     lv_color_hex(0x999999)
 #define COLOR_BAR_BG  lv_color_hex(0xE3E7EC)
+
+/** 加载条宽度占比（相对屏宽）、高度 */
+#define BAR_WIDTH_PCT 55
+#define BAR_H 6
 
 static lv_obj_t *s_bar = NULL;
 
@@ -42,6 +51,10 @@ void splash_build(lv_obj_t *scr)
     lv_obj_set_style_bg_opa(scr, LV_OPA_COVER, 0);
     lv_obj_set_scrollable(scr, false);
 
+    /* 当前逻辑分辨率（旋转后重建时横竖屏各不同） */
+    lv_display_t *d = lv_display_get_default();
+    const int32_t w = (d != NULL) ? lv_display_get_horizontal_resolution(d) : 284;
+
     /* ① 顶部品牌色通栏 */
     lv_obj_t *topbar = lv_obj_create(scr);
     lv_obj_remove_style_all(topbar);
@@ -51,11 +64,12 @@ void splash_build(lv_obj_t *scr)
     lv_obj_set_style_bg_opa(topbar, LV_OPA_COVER, 0);
     lv_obj_set_scrollable(topbar, false);
 
-    /* ② 中部纵向布局：小标识 + 标题 + 副标题 + 版本 */
+    /* ② 纵向布局：小标识 + 标题 + 副标题 + 版本 + 加载条（整体居中）。
+     * 容器铺满整屏、flex 三轴居中：内容高度变化时（横竖屏不同）自动保持
+     * 垂直居中，无需在加完子项后重算坐标。 */
     lv_obj_t *cont = lv_obj_create(scr);
     lv_obj_remove_style_all(cont);
-    lv_obj_set_size(cont, LV_PCT(100), 200);
-    lv_obj_center(cont);
+    lv_obj_set_size(cont, LV_PCT(100), LV_PCT(100));
     lv_obj_set_flex_flow(cont, LV_FLEX_FLOW_COLUMN);
     lv_obj_set_flex_align(cont, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
     lv_obj_set_style_pad_row(cont, 8, 0);
@@ -67,7 +81,7 @@ void splash_build(lv_obj_t *scr)
     lv_obj_set_style_text_letter_space(brand, 1, 0);
     lv_obj_set_style_pad_bottom(brand, 6, 0);
 
-    /* 主标题：Bold 34px（字体文件不含时自动回退常规字重，不会方框） */
+    /* 主标题：Bold 40px（字体文件不含时自动回退常规字重，不会方框） */
     make_label(cont, "XT60 功率计", lvgl_port_get_font_bold(LVGL_PORT_FONT_40), COLOR_TITLE);
 
     make_label(cont, "作者博客：blog.zeruns.com", lvgl_port_get_font(LVGL_PORT_FONT_16),
@@ -77,10 +91,9 @@ void splash_build(lv_obj_t *scr)
     lv_snprintf(ver_text, sizeof(ver_text), "固件版本 v%s", esp_app_get_description()->version);
     make_label(cont, ver_text, lvgl_port_get_font(LVGL_PORT_FONT_14), COLOR_VER);
 
-    /* ③ 底部加载条（宽 55%，高 6px，圆角胶囊） */
-    s_bar = lv_bar_create(scr);
-    lv_obj_set_size(s_bar, 158, 6);
-    lv_obj_set_pos(s_bar, (284 - 158) / 2, 204);
+    /* ③ 加载条：列内最后一项（宽 = 屏宽 55%，高 6px，圆角胶囊） */
+    s_bar = lv_bar_create(cont);
+    lv_obj_set_size(s_bar, w * BAR_WIDTH_PCT / 100, BAR_H);
     lv_bar_set_range(s_bar, 0, 100);
     lv_bar_set_value(s_bar, 0, LV_ANIM_OFF);
     lv_obj_set_style_bg_color(s_bar, COLOR_BAR_BG, 0);

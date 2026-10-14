@@ -55,6 +55,7 @@ typedef enum {
     LVGL_PORT_FONT_20,
     LVGL_PORT_FONT_24,
     LVGL_PORT_FONT_32,
+    LVGL_PORT_FONT_36, /* 首页大数字用（36px：4 行 44px 行高内的可读性/宽度平衡点） */
     LVGL_PORT_FONT_40,
     LVGL_PORT_FONT_MAX,
 } lvgl_port_font_size_t;
@@ -119,3 +120,14 @@ esp_err_t lvgl_port_set_rotation(lcd_nv3030b_rotation_t rot);
  * @return 当前档位
  */
 lcd_nv3030b_rotation_t lvgl_port_get_rotation(void);
+
+/**
+ * @brief 屏幕角度（用户语义）：以默认横屏为 0°，顺时针 90/180/270°
+ *
+ * 与面板枚举的对应（MIPI/TFT_eSPI 旋转约定，与校准过的 0° 触摸映射自洽）：
+ *   0° → ROT_90（出厂默认横屏）/ 90° → ROT_180（竖屏）/
+ *   180° → ROT_270（横屏倒）/ 270° → ROT_0（竖屏倒）。
+ * 非 0/90/180/270 的入参返回 ESP_ERR_INVALID_ARG。
+ */
+esp_err_t lvgl_port_set_rotation_angle(uint16_t deg);
+uint16_t lvgl_port_get_rotation_angle(void);

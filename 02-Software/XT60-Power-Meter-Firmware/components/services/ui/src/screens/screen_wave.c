@@ -43,9 +43,60 @@
 
 #define CHART_MAX_POINTS 240
 #define CHART_VALUE_SCALE 100.0f
-#define PANEL_H 168
+/* 滑板高度：title 20 + row 88 + 提示两行 32 + 行距 3×4 + 内边距 20 ≈ 188。
+ * 旧值 168 配单行提示恰好；提示改两行后必须加高，否则底部第二行被裁。 */
+#define PANEL_H 188
 #define SAFE_X 12
 #define AXIS_LABEL_W 62
+
+/**
+ * @brief 波形页布局几何（横/竖屏各一套；旋转重建时重新取值）
+ *
+ * 横屏 284×240 为历史调优值（逐像素保持）；竖屏 240×284 时图表加高
+ * 吃满多出的垂直空间，时间轴/数据行随之下移，设置滑板的两列 roller
+ * 收窄以适配 240 屏宽。
+ */
+typedef struct {
+    int32_t w;          /**< 逻辑宽 */
+    int32_t h;          /**< 逻辑高 */
+    int32_t chart_y;    /**< 图表顶部 y */
+    int32_t chart_h;    /**< 图表高 */
+    int32_t time_y;     /**< 时间轴 y */
+    int32_t rt_y;       /**< 实时行 y */
+    int32_t av_y;       /**< 平均行 y */
+    int32_t col_win_w;  /**< 滑板"时间窗"列宽 */
+    int32_t col_mode_w; /**< 滑板"波形模式"列宽 */
+} wave_geom_t;
+
+static wave_geom_t wave_geom(void)
+{
+    lv_display_t *d = lv_display_get_default();
+    int32_t w = (d != NULL) ? lv_display_get_horizontal_resolution(d) : 284;
+    int32_t h = (d != NULL) ? lv_display_get_vertical_resolution(d) : 240;
+    wave_geom_t g;
+    g.w = w;
+    g.h = h;
+    if (w >= h) {
+        /* 横屏 284×240 */
+        g.chart_y = 44;
+        g.chart_h = 138;
+        g.time_y = 184;
+        g.rt_y = 196;
+        g.av_y = 209;
+        g.col_win_w = 116;
+        g.col_mode_w = 146;
+    } else {
+        /* 竖屏 240×284：图表加高，时间轴/数据行整体下移 */
+        g.chart_y = 44;
+        g.chart_h = 170;
+        g.time_y = 220;
+        g.rt_y = 232;
+        g.av_y = 245;
+        g.col_win_w = 96;
+        g.col_mode_w = 104;
+    }
+    return g;
+}
 
 static lv_obj_t *s_chart = NULL;
 static lv_chart_series_t *s_ser_a = NULL;
@@ -201,6 +252,7 @@ void screen_wave_open_menu(void)
     if (s_panel == NULL || s_menu_open || s_panel_animating) {
         return;
     }
+    wave_geom_t g = wave_geom();
     lv_obj_set_hidden(s_panel, false);
     s_panel_animating = true;
     update_focus_style();
@@ -208,7 +260,7 @@ void screen_wave_open_menu(void)
     lv_anim_t anim;
     lv_anim_init(&anim);
     lv_anim_set_var(&anim, s_panel);
-    lv_anim_set_values(&anim, 240, 240 - PANEL_H);
+    lv_anim_set_values(&anim, g.h, g.h - PANEL_H); /* 自底部升起（横240/竖284） */
     lv_anim_set_duration(&anim, 220);
     lv_anim_set_path_cb(&anim, lv_anim_path_ease_out);
     lv_anim_set_exec_cb(&anim, anim_panel_y);
@@ -233,10 +285,11 @@ void screen_wave_close_menu(bool apply)
     s_menu_open = false;
     s_panel_animating = true;
 
+    wave_geom_t g = wave_geom();
     lv_anim_t anim;
     lv_anim_init(&anim);
     lv_anim_set_var(&anim, s_panel);
-    lv_anim_set_values(&anim, 240 - PANEL_H, 240);
+    lv_anim_set_values(&anim, g.h - PANEL_H, g.h); /* 沉回屏外（横240/竖284） */
     lv_anim_set_duration(&anim, 180);
     lv_anim_set_path_cb(&anim, lv_anim_path_ease_in);
     lv_anim_set_exec_cb(&anim, anim_panel_y);
@@ -450,11 +503,11 @@ static void chart_size_event_cb(lv_event_t *e)
     }
 }
 
-static void create_panel(lv_obj_t *scr)
+static void create_panel(lv_obj_t *scr, const wave_geom_t *g)
 {
     s_panel = lv_obj_create(scr);
     lv_obj_set_size(s_panel, LV_PCT(100), PANEL_H);
-    lv_obj_set_pos(s_panel, 0, 240);
+    lv_obj_set_pos(s_panel, 0, g->h); /* 初始沉在屏外（横 240 / 竖 284） */
     lv_obj_set_style_bg_color(s_panel, COL_PANEL_BG, 0);
     lv_obj_set_style_bg_opa(s_panel, LV_OPA_COVER, 0);
     lv_obj_set_style_radius(s_panel, 12, 0);
@@ -484,7 +537,7 @@ static void create_panel(lv_obj_t *scr)
 
     lv_obj_t *col_w = lv_obj_create(row);
     lv_obj_remove_style_all(col_w);
-    lv_obj_set_size(col_w, 116, 88);
+    lv_obj_set_size(col_w, g->col_win_w, 88);
     lv_obj_set_scrollable(col_w, false);
     lv_obj_set_flex_flow(col_w, LV_FLEX_FLOW_COLUMN);
     lv_obj_set_flex_align(col_w, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
@@ -498,11 +551,11 @@ static void create_panel(lv_obj_t *scr)
                           LV_ROLLER_MODE_NORMAL);
     lv_roller_set_visible_row_count(s_roller_win, 3);
     lv_roller_set_selected(s_roller_win, (uint16_t)s_window, LV_ANIM_OFF);
-    lv_obj_set_size(s_roller_win, 108, 68);
+    lv_obj_set_size(s_roller_win, g->col_win_w - 8, 68);
 
     lv_obj_t *col_m = lv_obj_create(row);
     lv_obj_remove_style_all(col_m);
-    lv_obj_set_size(col_m, 146, 88);
+    lv_obj_set_size(col_m, g->col_mode_w, 88);
     lv_obj_set_scrollable(col_m, false);
     lv_obj_set_flex_flow(col_m, LV_FLEX_FLOW_COLUMN);
     lv_obj_set_flex_align(col_m, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
@@ -516,16 +569,50 @@ static void create_panel(lv_obj_t *scr)
                           "功率\n电流+功率\n电压+功率\n电压+电流\n电能", LV_ROLLER_MODE_NORMAL);
     lv_roller_set_visible_row_count(s_roller_mode, 3);
     lv_roller_set_selected(s_roller_mode, (uint16_t)s_mode, LV_ANIM_OFF);
-    lv_obj_set_size(s_roller_mode, 138, 68);
+    lv_obj_set_size(s_roller_mode, g->col_mode_w - 8, 68);
 
-    lv_obj_t *hint = lv_label_create(s_panel);
-    lv_label_set_text(hint, "K1/K2 上下 · K2 双击切项 · K2 长按确定 · K1 长按退出");
-    lv_obj_set_style_text_font(hint, lvgl_port_get_font(LVGL_PORT_FONT_12), 0);
-    lv_obj_set_style_text_color(hint, COL_GRAY, 0);
+    /* 提示分两行：单行 26 字符在 252px 内宽里放不下（12px 字约 280px），
+     * 会被左右裁切，竖屏 240 宽更严重 */
+    lv_obj_t *hint1 = lv_label_create(s_panel);
+    lv_label_set_text(hint1, "K1/K2 上下 · K2 双击切项");
+    lv_obj_set_style_text_font(hint1, lvgl_port_get_font(LVGL_PORT_FONT_12), 0);
+    lv_obj_set_style_text_color(hint1, COL_GRAY, 0);
+
+    lv_obj_t *hint2 = lv_label_create(s_panel);
+    lv_label_set_text(hint2, "K2 长按确定 · K1 长按退出");
+    lv_obj_set_style_text_font(hint2, lvgl_port_get_font(LVGL_PORT_FONT_12), 0);
+    lv_obj_set_style_text_color(hint2, COL_GRAY, 0);
 }
 
 void screen_wave_create(lv_obj_t *tile)
 {
+    wave_geom_t g = wave_geom();
+
+    /* ---- 旋转重建清理：底部滑板挂在 screen 层（不随 tile 删除），
+     * 必须先停掉位移动画再删对象，否则动画回调会访问已释放的 panel ---- */
+    if (s_panel != NULL) {
+        lv_anim_del(s_panel, anim_panel_y);
+        lv_obj_delete(s_panel);
+        s_panel = NULL;
+    }
+    s_menu_open = false;
+    s_panel_animating = false;
+    s_chart = NULL;
+    s_ser_a = NULL;
+    s_ser_b = NULL;
+    s_lbl_title = NULL;
+    s_lbl_time_l = NULL;
+    s_lbl_time_r = NULL;
+    s_lbl_realtime = NULL;
+    s_lbl_average = NULL;
+    s_roller_win = NULL;
+    s_roller_mode = NULL;
+    for (int k = 0; k < 3; k++) {
+        s_axis_a[k] = NULL;
+        s_axis_b[k] = NULL;
+    }
+    /* s_window / s_mode / 量程滞回状态保留：用户的波形选择不被旋转打断 */
+
     lv_obj_set_style_bg_color(tile, lv_color_white(), 0);
     lv_obj_set_style_bg_opa(tile, LV_OPA_COVER, 0);
     lv_obj_set_scrollable(tile, false);
@@ -538,13 +625,13 @@ void screen_wave_create(lv_obj_t *tile)
     lv_obj_set_style_text_font(s_lbl_title, lvgl_port_get_font(LVGL_PORT_FONT_14), 0);
     lv_obj_set_style_text_color(s_lbl_title, COL_DARK, 0);
     lv_obj_set_pos(s_lbl_title, 0, 26);
-    lv_obj_set_width(s_lbl_title, 284);
+    lv_obj_set_width(s_lbl_title, g.w);
     lv_obj_set_style_text_align(s_lbl_title, LV_TEXT_ALIGN_CENTER, 0);
 
     /* 图表 */
     s_chart = lv_chart_create(tile);
-    lv_obj_set_size(s_chart, 284 - 2 * SAFE_X, 138);
-    lv_obj_set_pos(s_chart, SAFE_X, 44);
+    lv_obj_set_size(s_chart, g.w - 2 * SAFE_X, g.chart_h);
+    lv_obj_set_pos(s_chart, SAFE_X, g.chart_y);
     lv_chart_set_type(s_chart, LV_CHART_TYPE_LINE);
     lv_chart_set_point_count(s_chart, CHART_MAX_POINTS);
     lv_chart_set_update_mode(s_chart, LV_CHART_UPDATE_MODE_SHIFT);
@@ -592,29 +679,29 @@ void screen_wave_create(lv_obj_t *tile)
     lv_label_set_text(s_lbl_time_l, "");
     lv_obj_set_style_text_font(s_lbl_time_l, f12, 0);
     lv_obj_set_style_text_color(s_lbl_time_l, COL_GRAY, 0);
-    lv_obj_set_pos(s_lbl_time_l, SAFE_X + AXIS_LABEL_W + 4, 184);
+    lv_obj_set_pos(s_lbl_time_l, SAFE_X + AXIS_LABEL_W + 4, g.time_y);
 
     s_lbl_time_r = lv_label_create(tile);
     lv_label_set_text(s_lbl_time_r, "0");
     lv_obj_set_style_text_font(s_lbl_time_r, f12, 0);
     lv_obj_set_style_text_color(s_lbl_time_r, COL_GRAY, 0);
-    lv_obj_set_pos(s_lbl_time_r, 284 - SAFE_X - AXIS_LABEL_W - 4, 184);
+    lv_obj_set_pos(s_lbl_time_r, g.w - SAFE_X - AXIS_LABEL_W - 4, g.time_y);
 
     /* 实时 / 平均 */
     s_lbl_realtime = lv_label_create(tile);
     lv_label_set_text(s_lbl_realtime, "实 --");
     lv_obj_set_style_text_font(s_lbl_realtime, f12, 0);
     lv_obj_set_style_text_color(s_lbl_realtime, COL_DARK, 0);
-    lv_obj_set_pos(s_lbl_realtime, SAFE_X, 196);
+    lv_obj_set_pos(s_lbl_realtime, SAFE_X, g.rt_y);
 
     s_lbl_average = lv_label_create(tile);
     lv_label_set_text(s_lbl_average, "均 --");
     lv_obj_set_style_text_font(s_lbl_average, f12, 0);
     lv_obj_set_style_text_color(s_lbl_average, COL_GRAY, 0);
-    lv_obj_set_pos(s_lbl_average, SAFE_X, 209);
+    lv_obj_set_pos(s_lbl_average, SAFE_X, g.av_y);
 
     update_header();
-    create_panel(lv_screen_active());
+    create_panel(lv_screen_active(), &g);
 }
 
 pm_wave_window_t screen_wave_get_window(void)

@@ -47,6 +47,8 @@
 static lv_obj_t *s_tileview = NULL;
 static lv_obj_t *s_tiles[UI_PAGE_MAX];
 static lv_obj_t *s_dots[UI_PAGE_MAX];
+/** 共享状态栏（screen 级浮层，不随三页重建；重建后需重新置顶） */
+static lv_obj_t *s_topbar = NULL;
 static lv_obj_t *s_lbl_runtime;
 static lv_obj_t *s_lbl_bat;
 static ui_page_t s_current = UI_PAGE_MEASURE;
@@ -113,6 +115,7 @@ static void create_dots(lv_obj_t *parent)
 static void create_topbar(lv_obj_t *scr)
 {
     lv_obj_t *bar = lv_obj_create(scr);
+    s_topbar = bar;
     lv_obj_remove_style_all(bar);
     lv_obj_set_size(bar, LV_PCT(100), 22);
     lv_obj_set_pos(bar, 0, 0);
@@ -232,13 +235,20 @@ static void goto_page(ui_page_t page)
     lv_obj_scroll_to_view(s_tiles[page], LV_ANIM_ON);
 }
 
-void ui_nav_build(void)
+/**
+ * @brief 构建 tileview + 三页内容（首次构建与旋转重建共用）
+ *
+ * 三页里大量元素使用按当前分辨率计算的固定像素坐标（测量页四行数据条、
+ * 波形页图表等），LVGL 改分辨率只会缩放 pct 对象，固定坐标不会自动重排，
+ * 因此旋转（RESOLUTION_CHANGED）后直接按新分辨率**重建整组页面**最可靠。
+ * 各 screen 的 create() 都会读取当前显示分辨率决定几何，横屏构建结果与
+ * 历史布局逐像素一致。
+ *
+ * @param keep 重建后要停留的页面（旋转前的当前页）
+ */
+static void build_pages(ui_page_t keep)
 {
     lv_obj_t *scr = lv_screen_active();
-    lv_obj_clean(scr);
-    lv_obj_set_style_bg_color(scr, lv_color_white(), 0);
-    lv_obj_set_style_bg_opa(scr, LV_OPA_COVER, 0);
-    lv_obj_set_scrollable(scr, false);
 
     s_tileview = lv_tileview_create(scr);
     lv_obj_set_size(s_tileview, LV_PCT(100), LV_PCT(100));
@@ -250,24 +260,97 @@ void ui_nav_build(void)
 
     s_tiles[UI_PAGE_MEASURE] =
         lv_tileview_add_tile(s_tileview, UI_PAGE_MEASURE, 0, LV_DIR_HOR);
-    s_tiles[UI_PAGE_WAVE] = lv_tileview_add_tile(s_tileview, UI_PAGE_WAVE, 0, LV_DIR_HOR);
+    s_tiles[UI_PAGE_WAVE] =
+        lv_tileview_add_tile(s_tileview, UI_PAGE_WAVE, 0, LV_DIR_HOR);
     s_tiles[UI_PAGE_SETTINGS] =
         lv_tileview_add_tile(s_tileview, UI_PAGE_SETTINGS, 0, LV_DIR_HOR);
 
+    /* create 顺序即 z 序；各 create 会重置自身的浮层/菜单状态，
+     * screen_wave 的底部滑板挂在 screen 层，create 内部负责清理旧实例。 */
     screen_measure_create(s_tiles[UI_PAGE_MEASURE]);
     screen_wave_create(s_tiles[UI_PAGE_WAVE]);
     screen_settings_create(s_tiles[UI_PAGE_SETTINGS]);
 
+    s_current = keep;
+    update_dots();
+    /* 无动画滚到目标页：旋转后直接呈现该页，不让用户看到甩动过程 */
+    lv_obj_update_layout(s_tileview);
+    lv_obj_scroll_to_view(s_tiles[keep], LV_ANIM_OFF);
+
+    /* 新建的 tileview z 序在状态栏之上会把白底状态栏整个盖掉，
+     * 必须把屏幕级浮层重新置顶（首次构建时 s_topbar 尚未创建）。 */
+    if (s_topbar != NULL) {
+        lv_obj_move_foreground(s_topbar);
+    }
+}
+
+/** @brief 旋转重建的下一帧回调（避免在事件派发途中删除对象树） */
+static void rebuild_pages_async_cb(void *arg)
+{
+    (void)arg;
+    if (s_tileview == NULL) {
+        return;
+    }
+    ui_page_t keep = s_current;
+    lv_obj_delete(s_tileview); /* 三页内容随删；状态栏/圆点是 screen 的独立子对象，保留 */
+    s_tileview = NULL;
+    for (int i = 0; i < UI_PAGE_MAX; i++) {
+        s_tiles[i] = NULL;
+    }
+    build_pages(keep);
+}
+
+/**
+ * @brief 显示分辨率变化（旋转）后按新分辨率重建三页
+ *
+ * 背景：tileview 自身是 pct 尺寸会跟着分辨率缩放，但页内按 284×240
+ * 定位的数据条/图表不会重排（竖屏时右侧被裁、下方留大片空白）。
+ * 延迟到下一帧重建：事件回调正处于 LVGL 派发栈中，当场删建对象树不安全。
+ */
+static void disp_resolution_changed_cb(lv_event_t *e)
+{
+    (void)e;
+    lv_async_call(rebuild_pages_async_cb, NULL);
+}
+
+void ui_nav_build(void)
+{
+    lv_obj_t *scr = lv_screen_active();
+    lv_obj_clean(scr);
+    lv_obj_set_style_bg_color(scr, lv_color_white(), 0);
+    lv_obj_set_style_bg_opa(scr, LV_OPA_COVER, 0);
+    lv_obj_set_scrollable(scr, false);
+
+    build_pages(UI_PAGE_MEASURE);
+
+    /* 状态栏是 screen 级独立浮层（不随三页重建），pct 宽，旋转后自适应 */
     create_topbar(scr);
     update_dots();
 
-    s_current = (ui_page_t)0;
+    /* 旋转（分辨率变化）后按新分辨率重建三页：display 生命周期与三页无关，
+     * 此回调只注册一次（重建的是 tileview，不是 display）。 */
+    lv_display_t *disp = lv_display_get_default();
+    if (disp != NULL) {
+        lv_display_add_event_cb(disp, disp_resolution_changed_cb, LV_EVENT_RESOLUTION_CHANGED,
+                                NULL);
+    }
+}
+
+void ui_nav_refresh_statusbar(const data_store_snapshot_t *snap)
+{
+    /* 状态栏（时间/电量）三页都要 */
+    refresh_status(snap);
+    update_dots();
+}
+
+ui_page_t ui_nav_current_page(void)
+{
+    return s_current;
 }
 
 void ui_nav_refresh(const data_store_snapshot_t *snap)
 {
-    /* 状态栏（时间/电量）三页都要，必须每帧刷 */
-    refresh_status(snap);
+    ui_nav_refresh_statusbar(snap);
 
     /* 页面内容只刷当前可见页（见文件头"性能约定"） */
     switch (s_current) {
@@ -278,6 +361,8 @@ void ui_nav_refresh(const data_store_snapshot_t *snap)
         screen_wave_refresh();
         break;
     case UI_PAGE_SETTINGS:
+        screen_settings_refresh(snap);
+        break;
     default:
         break;
     }
@@ -288,21 +373,26 @@ void ui_nav_handle_key(button_id_t id, button_event_t ev)
     /* 被接受的按键都给一声短鸣（操作反馈） */
     bool handled = false;
 
-    if (screen_wave_menu_is_open() && screen_wave_menu_key(id, ev)) {
+    if (screen_measure_menu_is_open() && screen_measure_menu_key(id, ev)) {
+        handled = true;
+    } else if (screen_wave_menu_is_open() && screen_wave_menu_key(id, ev)) {
         handled = true;
     } else if (ev == BUTTON_EVENT_SINGLE_CLICK) {
-        if (id == BUTTON_ID_BOOT) {
-            if (s_current > UI_PAGE_MEASURE) {
-                goto_page((ui_page_t)(s_current - 1));
+            if (id == BUTTON_ID_BOOT) {
+                if (s_current > UI_PAGE_MEASURE) {
+                    goto_page((ui_page_t)(s_current - 1));
+                }
+            } else {
+                if (s_current < UI_PAGE_SETTINGS) {
+                    goto_page((ui_page_t)(s_current + 1));
+                }
             }
-        } else {
-            if (s_current < UI_PAGE_SETTINGS) {
-                goto_page((ui_page_t)(s_current + 1));
-            }
-        }
-        handled = true;
-    } else if (ev == BUTTON_EVENT_LONG_PRESS_START) {
-        if (s_current == UI_PAGE_WAVE && id == BUTTON_ID_USER) {
+            handled = true;
+        } else if (ev == BUTTON_EVENT_LONG_PRESS_START) {
+        if (s_current == UI_PAGE_MEASURE && id == BUTTON_ID_USER) {
+            screen_measure_open_menu();
+            handled = true;
+        } else if (s_current == UI_PAGE_WAVE && id == BUTTON_ID_USER) {
             screen_wave_open_menu();
             handled = true;
         } else if (s_current == UI_PAGE_SETTINGS && id == BUTTON_ID_BOOT) {

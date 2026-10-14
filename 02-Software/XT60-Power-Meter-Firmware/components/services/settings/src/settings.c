@@ -26,6 +26,10 @@ static const char *TAG = "settings";
 
 /** 各配置项的键名（NVS 键名同样限制 15 字符） */
 #define SETTINGS_KEY_BUZZER_VOLUME "buzzer_vol"
+#define SETTINGS_KEY_LCD_BRIGHTNESS "lcd_bright"
+#define SETTINGS_KEY_DISPLAY_RATE "rate_hz"
+#define SETTINGS_KEY_ORIENT_AUTO "orient_a"
+#define SETTINGS_KEY_ORIENT_ANG "orient_d"
 
 /** 防抖时长（毫秒）：最后一次修改后静默这么久才真正写 Flash */
 #define SETTINGS_SAVE_DELAY_MS     1500
@@ -33,6 +37,16 @@ static const char *TAG = "settings";
 /** 响度合法范围，与 buzzer 驱动保持一致 */
 #define SETTINGS_VOLUME_MIN        1
 #define SETTINGS_VOLUME_MAX        100
+
+/** 亮度合法范围（下限 10：避免用户把屏幕调到全黑后无法操作） */
+#define SETTINGS_BRIGHT_MIN        10
+#define SETTINGS_BRIGHT_MAX        100
+
+/** 刷新率合法档位（与测量页快速菜单一致） */
+static bool settings_rate_valid(uint8_t hz)
+{
+    return hz == 1 || hz == 5 || hz == 10 || hz == 20 || hz == 30;
+}
 
 /** 内存缓存：保存当前生效的配置 */
 static settings_t s_cache;
@@ -63,6 +77,10 @@ static portMUX_TYPE s_lock = portMUX_INITIALIZER_UNLOCKED;
 static void load_defaults(settings_t *cfg)
 {
     cfg->buzzer_volume = CONFIG_BUZZER_VOLUME_PERCENT;
+    cfg->lcd_brightness = 80; /* 80%：室内外通用的出厂观感 */
+    cfg->display_rate_hz = 5; /* 5Hz：40Hz 快拍源上取 8 帧窗口平均，稳与快的折中 */
+    cfg->orientation_auto = 0;   /* 出厂手动方向（横屏 0°），避免开机乱转 */
+    cfg->orientation_angle = 0;  /* 默认横屏 */
 }
 
 /**
@@ -115,6 +133,41 @@ static void load_from_nvs(void)
         ESP_LOGW(TAG, "蜂鸣器响度读取异常（%s，值 %u），使用默认值", esp_err_to_name(err), volume);
     }
 
+    /* ---- 屏幕亮度 ---- */
+    uint8_t bright = 0;
+    err = nvs_get_u8(handle, SETTINGS_KEY_LCD_BRIGHTNESS, &bright);
+    if (err == ESP_OK && bright >= SETTINGS_BRIGHT_MIN && bright <= SETTINGS_BRIGHT_MAX) {
+        s_cache.lcd_brightness = bright;
+        ESP_LOGI(TAG, "已载入屏幕亮度: %u%%", bright);
+    } else if (err != ESP_ERR_NVS_NOT_FOUND) {
+        ESP_LOGW(TAG, "屏幕亮度读取异常（%s，值 %u），使用默认值", esp_err_to_name(err), bright);
+    }
+
+    /* ---- 首页数据刷新率 ---- */
+    uint8_t rate = 0;
+    err = nvs_get_u8(handle, SETTINGS_KEY_DISPLAY_RATE, &rate);
+    if (err == ESP_OK && settings_rate_valid(rate)) {
+        s_cache.display_rate_hz = rate;
+        ESP_LOGI(TAG, "已载入数据刷新率: %u Hz", rate);
+    } else if (err != ESP_ERR_NVS_NOT_FOUND) {
+        ESP_LOGW(TAG, "数据刷新率读取异常（%s，值 %u），使用默认值", esp_err_to_name(err), rate);
+    }
+
+    /* ---- 屏幕方向（自动开关 + 手动角度）----
+     * 角度含 270，超出 uint8_t 范围，必须用 u16 存储（早期版本误用 u8，
+     * 270 会被截断成 14，读到类型不匹配的旧键时按 ESP_NVS_NOT_FOUND 处理）。 */
+    uint8_t oauto = 0;
+    if (nvs_get_u8(handle, SETTINGS_KEY_ORIENT_AUTO, &oauto) == ESP_OK) {
+        s_cache.orientation_auto = oauto ? 1u : 0u;
+    }
+    uint16_t oang = 0;
+    if (nvs_get_u16(handle, SETTINGS_KEY_ORIENT_ANG, &oang) == ESP_OK &&
+        (oang == 0 || oang == 90 || oang == 180 || oang == 270)) {
+        s_cache.orientation_angle = oang;
+    }
+    ESP_LOGI(TAG, "已载入屏幕方向：自动=%u，角度=%u°", (unsigned)s_cache.orientation_auto,
+             (unsigned)s_cache.orientation_angle);
+
     nvs_close(handle);
 }
 
@@ -131,6 +184,18 @@ static esp_err_t persist_cache(void)
     }
 
     err = nvs_set_u8(handle, SETTINGS_KEY_BUZZER_VOLUME, s_cache.buzzer_volume);
+    if (err == ESP_OK) {
+        err = nvs_set_u8(handle, SETTINGS_KEY_LCD_BRIGHTNESS, s_cache.lcd_brightness);
+    }
+    if (err == ESP_OK) {
+        err = nvs_set_u8(handle, SETTINGS_KEY_DISPLAY_RATE, s_cache.display_rate_hz);
+    }
+    if (err == ESP_OK) {
+        err = nvs_set_u8(handle, SETTINGS_KEY_ORIENT_AUTO, s_cache.orientation_auto);
+    }
+    if (err == ESP_OK) {
+        err = nvs_set_u16(handle, SETTINGS_KEY_ORIENT_ANG, s_cache.orientation_angle);
+    }
     if (err == ESP_OK) {
         /* nvs_set_xxx 只是写入 RAM 中的 NVS 页缓存，
          * 必须 commit 才会真正落到 Flash */
@@ -222,7 +287,8 @@ esp_err_t settings_init(void)
 
     load_from_nvs();
 
-    ESP_LOGI(TAG, "初始化完成（当前蜂鸣器响度 %u%%）", s_cache.buzzer_volume);
+    ESP_LOGI(TAG, "初始化完成（响度 %u%%，亮度 %u%%）", s_cache.buzzer_volume,
+             s_cache.lcd_brightness);
     return ESP_OK;
 }
 
@@ -263,10 +329,76 @@ esp_err_t settings_set_buzzer_volume(uint8_t percent)
     return ESP_OK;
 }
 
+esp_err_t settings_set_lcd_brightness(uint8_t percent)
+{
+    if (!s_ready) {
+        return ESP_ERR_INVALID_STATE;
+    }
+    if (percent < SETTINGS_BRIGHT_MIN || percent > SETTINGS_BRIGHT_MAX) {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    portENTER_CRITICAL(&s_lock);
+    s_cache.lcd_brightness = percent;
+    portEXIT_CRITICAL(&s_lock);
+
+    mark_dirty_and_schedule();
+
+    return ESP_OK;
+}
+
+esp_err_t settings_set_display_rate_hz(uint8_t hz)
+{
+    if (!s_ready) {
+        return ESP_ERR_INVALID_STATE;
+    }
+    if (!settings_rate_valid(hz)) {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    portENTER_CRITICAL(&s_lock);
+    s_cache.display_rate_hz = hz;
+    portEXIT_CRITICAL(&s_lock);
+
+    mark_dirty_and_schedule();
+
+    return ESP_OK;
+}
+
+esp_err_t settings_set_orientation(uint8_t auto_on, uint16_t angle)
+{
+    if (!s_ready) {
+        return ESP_ERR_INVALID_STATE;
+    }
+    if (angle != 0 && angle != 90 && angle != 180 && angle != 270) {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    portENTER_CRITICAL(&s_lock);
+    s_cache.orientation_auto = auto_on ? 1u : 0u;
+    s_cache.orientation_angle = angle;
+    portEXIT_CRITICAL(&s_lock);
+
+    mark_dirty_and_schedule();
+
+    return ESP_OK;
+}
+
 esp_err_t settings_save_now(void)
 {
     if (!s_ready) {
         return ESP_ERR_INVALID_STATE;
+    }
+
+    /* 没有待落盘的改动就直接成功返回，不碰 Flash。
+     * 开机时 device_ctrl 会用“从 NVS 恢复出来的值”调一次本函数，那些值本就
+     * 已在 NVS 中，无需再写；只有运行期用户真的改过（s_dirty=true）才需要落盘，
+     * 从而避免每次开机都做一次无谓的 NVS commit（减少 Flash 磨损）。 */
+    portENTER_CRITICAL(&s_lock);
+    bool need_save = s_dirty;
+    portEXIT_CRITICAL(&s_lock);
+    if (!need_save) {
+        return ESP_OK;
     }
 
     /* 取消待执行的防抖任务，改为当前立即落盘 */
