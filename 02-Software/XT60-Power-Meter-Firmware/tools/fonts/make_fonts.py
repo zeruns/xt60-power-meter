@@ -15,7 +15,9 @@ make_fonts.py — 生成 SPIFFS 用中文字体子集（Regular + Bold）
 依赖：
     pip install fonttools requests
 """
+import glob
 import os
+import re
 import sys
 import urllib.request
 
@@ -61,8 +63,33 @@ def collect_unicodes():
         "←→↑↓↔▲△▼▽●○■□◆◇◀▶▷◁"
         "①②③④⑤⑥⑦⑧⑨⑩"
         "✓✔✗★☆♪"
+        "“”‘’—…°"
     )
     codes.update(ord(c) for c in extras)
+    # UI 源码里出现的所有字符（结构性保障：文案用到的字一定会被包含，
+    # 不再依赖"手工补字"；配套 tools/fonts/audit_glyphs.py 做缺字校验）
+    codes.update(_scan_ui_source_chars())
+    return codes
+
+
+UI_SRC = os.path.abspath(os.path.join(HERE, "..", "..", "components", "services", "ui", "src"))
+_STR_PAT = re.compile(r'"((?:[^"\\]|\\.)*)"')
+
+
+def _scan_ui_source_chars():
+    """扫描 UI 源码的字符串字面量，返回其中出现的字符码点集合。"""
+    codes = set()
+    for ext in ("*.c", "*.h"):
+        for path in glob.glob(os.path.join(UI_SRC, "**", ext), recursive=True):
+            try:
+                with open(path, encoding="utf-8") as f:
+                    src = f.read()
+            except OSError:
+                continue
+            for m in _STR_PAT.finditer(src):
+                for ch in m.group(1):
+                    if ch != "\\":
+                        codes.add(ord(ch))
     return codes
 
 
