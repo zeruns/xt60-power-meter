@@ -27,25 +27,33 @@
 
 #include <math.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
 #include "lvgl.h"
 #include "lvgl_port.h"
+#include "settings.h"
 
-#define COL_V lv_color_hex(0x1E9E4F)
-#define COL_I lv_color_hex(0x1B6FD6)
-#define COL_P lv_color_hex(0xD0392B)
-#define COL_E lv_color_hex(0x7D3CB5)
+/* 波形区黑底配色（示波器惯例：黑底 + 亮线，对比度高、聚焦曲线）。
+ * 2026-10 波形重构：白底上灰格线+多色曲线视觉杂乱（视频实证"一片乱"），
+ * 改黑底亮线后曲线成为绝对主体——Tektronix/Keysight/DSO Nano 均为此风格。 */
+#define COL_WAVE_BG   lv_color_hex(0x0A0E14) /* 波形区深黑底 */
+#define COL_WAVE_GRID lv_color_hex(0x2B333B) /* 格线暗灰（不抢眼） */
+#define COL_V lv_color_hex(0x3FB950) /* CH1 电压：亮绿 */
+#define COL_I lv_color_hex(0x58A6FF) /* CH2 电流：亮蓝 */
+#define COL_P lv_color_hex(0xF0883E) /* CH3 功率：亮橙 */
+#define COL_E lv_color_hex(0xA371F7) /* CH4 电能：亮紫 */
 #define COL_DARK lv_color_hex(0x1A1A1A)
 #define COL_GRAY lv_color_hex(0x6B7280)
-#define COL_CARD_BD lv_color_hex(0xE3E7EC)
-#define COL_PANEL_BG lv_color_hex(0xF7F9FC)
+#define COL_CARD_BD lv_color_hex(0xB4BEC9) /* 边框：与白底拉开可辨差异 */
+#define COL_PANEL_BG lv_color_hex(0xF1F4F8)
+#define COL_PRIMARY lv_color_hex(0x0066CC) /* 品牌蓝（与设置页一致，用于开关开启态） */
 
-#define CHART_MAX_POINTS 240
+#define CHART_MAX_POINTS 480
 #define CHART_VALUE_SCALE 100.0f
-/* 滑板高度：title 20 + row 88 + 提示两行 32 + 行距 3×4 + 内边距 20 ≈ 188。
- * 旧值 168 配单行提示恰好；提示改两行后必须加高，否则底部第二行被裁。 */
-#define PANEL_H 188
+/* 滑板高度：title 20 + row 88 + 平滑行 28+4 + 提示两行 32 + 行距 4×4 +
+ * 内边距 20 ≈ 224。旧值 188 是加"曲线平滑"开关行之前的布局。 */
+#define PANEL_H 224
 #define SAFE_X 12
 #define AXIS_LABEL_W 62
 
@@ -115,6 +123,12 @@ static pm_wave_mode_t s_mode = PM_WAVE_MODE_VI;
 /* 纵轴量程滞回状态（避免每帧改量程导致曲线乱跳） */
 static bool s_range_valid = false;
 static float s_range_a_min, s_range_a_max, s_range_b_min, s_range_b_max;
+/** 量程收缩防抖：连续满足收缩条件的帧数（阈值见 RANGE_SHRINK_FRAMES） */
+static int s_shrink_cnt_a = 0;
+static int s_shrink_cnt_b = 0;
+/** 极值点防跳动锚点（NAN 表示尚未锚定） */
+static float s_hold_min_val = NAN;
+static float s_hold_max_val = NAN;
 
 static lv_obj_t *s_panel = NULL;
 static lv_obj_t *s_roller_win = NULL;
@@ -122,9 +136,28 @@ static lv_obj_t *s_roller_mode = NULL;
 static int8_t s_focus_idx = 0;
 static bool s_menu_open = false;
 static bool s_panel_animating = false;
+/** roller 触控两阶段状态：-1=无（不可滑动）/0=时间窗选中/1=波形模式选中。
+ *  点击选中后该 roller 才允许手指滑动；点另一个或关菜单即取消。
+ *  （上一版直接 set_clickable(false) 完全禁触控过头了——用户要的是
+ *   「点击选中后才能滑动」，既防下滑菜单时误改，又保留触控能力。） */
+static int8_t s_roller_edit = -1;
 
 static float s_buf_a[CHART_MAX_POINTS];
 static float s_buf_b[CHART_MAX_POINTS];
+static float s_buf_a_raw[CHART_MAX_POINTS]; /**< 平滑前原值（平滑开时暂存） */
+static float s_buf_b_raw[CHART_MAX_POINTS]; /**< 副轴平滑前原值（Step2 降噪用） */
+
+/* ---- 趋势图装饰（P0）：均值参考线 + min/max 极值点 ----
+ * 【波形重构 Step1·做减法】视频实证波形"一片乱"的主因之一是装饰元素过多。
+ * 调研结论（Tektronix/DSO Nano/仪表惯例）：小屏波形应只保留曲线+格线+少量
+ * 刻度，均值线/min-max 圆点全删。默认关闭，若需要趋势标注可改回 1。
+ * 用 lv_obj 而非 chart series：样式独立（1px 细线 / 小圆点），
+ * 不污染曲线本身的线宽/点样式。挂 chart 下，坐标相对 content area。 */
+#define WAVE_DECOR_ENABLE 0
+static lv_obj_t *s_avg_line = NULL;
+static lv_obj_t *s_dot_min = NULL;
+static lv_obj_t *s_dot_max = NULL;
+static lv_obj_t *s_lbl_time_m = NULL; /**< 时间轴中点刻度 */
 
 typedef struct {
     int8_t ch_a;
@@ -179,6 +212,38 @@ static void update_focus_style(void)
     }
 }
 
+/** roller 触控两阶段：点击选中后才允许滑动（防下滑关菜单时误改） */
+static void roller_clicked_cb(lv_event_t *e)
+{
+    lv_obj_t *obj = lv_event_get_target(e);
+    int8_t idx = (obj == s_roller_win) ? 0 : 1;
+    if (s_roller_edit == idx) {
+        /* 已在编辑态：本次点击视为"确认当前选择"，退出编辑态 */
+        s_roller_edit = -1;
+        lv_obj_set_scrollable(s_roller_win, false);
+        lv_obj_set_scrollable(s_roller_mode, false);
+    } else {
+        /* 进入编辑态：只允许选中的 roller 滑动 */
+        s_roller_edit = idx;
+        lv_obj_set_scrollable(s_roller_win, idx == 0);
+        lv_obj_set_scrollable(s_roller_mode, idx == 1);
+        s_focus_idx = idx;
+        update_focus_style();
+    }
+}
+
+/** 关闭 roller 编辑态（关菜单/长按确认等调用） */
+static void roller_edit_cancel(void)
+{
+    s_roller_edit = -1;
+    if (s_roller_win != NULL) {
+        lv_obj_set_scrollable(s_roller_win, false);
+    }
+    if (s_roller_mode != NULL) {
+        lv_obj_set_scrollable(s_roller_mode, false);
+    }
+}
+
 static void apply_roller_selection(void)
 {
     int w = lv_roller_get_selected(s_roller_win);
@@ -194,6 +259,10 @@ static void apply_roller_selection(void)
     }
     if (changed) {
         s_range_valid = false; /* 换了窗/模式，量程重新自适应 */
+        s_shrink_cnt_a = 0;
+        s_shrink_cnt_b = 0;
+        s_hold_min_val = NAN; /* 极值锚点失效，重新锚定 */
+        s_hold_max_val = NAN;
     }
 }
 
@@ -203,11 +272,19 @@ static void update_header(void)
     snprintf(t, sizeof(t), "%s · %s", pm_wave_mode_name(s_mode), pm_wave_window_name(s_window));
     lv_label_set_text(s_lbl_title, t);
 
-    /* 时间轴：左端 -窗长，右端 0（现在） */
+    /* 时间轴：左 -窗长、中 -半窗、右 0（贴图面左右缘） */
     char tl[16];
     snprintf(tl, sizeof(tl), "-%s", pm_wave_window_name(s_window));
     lv_label_set_text(s_lbl_time_l, tl);
     lv_label_set_text(s_lbl_time_r, "0");
+    if (s_lbl_time_m != NULL) {
+        static const char *const half_name[PM_WAVE_WINDOW_MAX] = {
+            "0.5s", "5s", "15s", "30s", "60s", "5min",
+        };
+        char tm[16];
+        snprintf(tm, sizeof(tm), "-%s", half_name[s_window % PM_WAVE_WINDOW_MAX]);
+        lv_label_set_text(s_lbl_time_m, tm);
+    }
 
     const mode_desc_t *d = &s_mode_desc[s_mode];
     lv_chart_set_series_color(s_chart, s_ser_a, channel_color(d->ch_a));
@@ -282,6 +359,7 @@ void screen_wave_close_menu(bool apply)
         apply_roller_selection();
         update_header();
     }
+    roller_edit_cancel(); /* 关菜单时退出编辑态 */
     s_menu_open = false;
     s_panel_animating = true;
 
@@ -335,9 +413,9 @@ bool screen_wave_menu_key(button_id_t id, button_event_t ev)
     }
 }
 
-static void gesture_event_cb(lv_event_t *e)
+/** 波形页滑动：上滑出设置滑板 / 下滑关闭（由 ui_nav indev 级滑动识别调用） */
+void screen_wave_swipe_cb(lv_dir_t dir)
 {
-    lv_dir_t dir = lv_indev_get_gesture_dir(lv_indev_active());
     if (dir == LV_DIR_TOP) {
         screen_wave_open_menu();
     } else if (dir == LV_DIR_BOTTOM) {
@@ -346,17 +424,108 @@ static void gesture_event_cb(lv_event_t *e)
 }
 
 /**
- * @brief 纵轴量程计算（带滞回，避免曲线每帧乱跳）
+ * @brief 稳健量程：取窗口内 2%~98% 分位，剔除 ADC 异常尖峰
  *
- * 规则：数据超出当前量程 → 按新数据扩量程；
- *       数据跨度不足当前量程的 40% → 收缩（滞后系数防止反复）；
+ * 2026-10 实拍（VID_160937 f03）：ADC 坏帧尖峰把电流量程拉到
+ * -13~+18A，而真实信号仅 ±0.1A——趋势被压成中间一条细线。
+ * 分位截断后再做滞回，趋势才可读。
+ *
+ * 性能：只需求第 i0/i1 个顺序统计量，不必全排序。原实现每帧 qsort
+ * 240 个 float（O(n log n) 且写快排常数），改为两次快速选择 O(n)。
+ */
+/** 快速选择：把第 k 小的元素放到 a[k]，左侧 ≤、右侧 ≥（原地，不保证整体有序） */
+static void select_kth(float *a, int n, int k)
+{
+    int lo = 0, hi = n - 1;
+    while (lo < hi) {
+        float pivot = a[lo + (hi - lo) / 2];
+        int i = lo, j = hi;
+        while (i <= j) {
+            while (a[i] < pivot) {
+                i++;
+            }
+            while (a[j] > pivot) {
+                j--;
+            }
+            if (i <= j) {
+                float t = a[i];
+                a[i] = a[j];
+                a[j] = t;
+                i++;
+                j--;
+            }
+        }
+        if (k <= j) {
+            hi = j;
+        } else if (k >= i) {
+            lo = i;
+        } else {
+            return; /* pivot 就位 */
+        }
+    }
+}
+
+static bool robust_range(const float *buf, int n, float *lo, float *hi)
+{
+    if (buf == NULL || n <= 0) {
+        return false;
+    }
+    float tmp[CHART_MAX_POINTS];
+    int m = 0;
+    for (int i = 0; i < n && m < CHART_MAX_POINTS; i++) {
+        if (isfinite(buf[i])) {
+            tmp[m++] = buf[i];
+        }
+    }
+    if (m == 0) {
+        return false;
+    }
+    int i0 = (int)((float)(m - 1) * 0.02f);
+    int i1 = (int)((float)(m - 1) * 0.98f);
+    if (i1 <= i0) {
+        i0 = 0;
+        i1 = m - 1;
+    }
+    /* 两次快速选择必须**分区间**做，否则后者会挪动前者的结果：
+     *   ① 先在整个 [0,m) 取第 i1 小 → tmp[i1] 就位，前缀 [0,i1) ≤ 它；
+     *   ② 再只在 [0,i1) 取第 i0 小 → tmp[i0] 就位，且不触碰 tmp[i1]。
+     * 第 i0 小必在前缀内（i0 < i1，排序位置 i0 落在第 0..i1-1 名），故②正确。 */
+    select_kth(tmp, m, i1);
+    if (i0 < i1) {
+        select_kth(tmp, i1, i0);
+    }
+    *lo = tmp[i0];
+    *hi = tmp[i1];
+    if (*hi - *lo < 1e-6f) {
+        /* 信号几乎恒定：给一点最小跨度，避免除零/全平线 */
+        float mid = *lo;
+        float pad = fabsf(mid) * 0.01f + 1e-4f;
+        *lo = mid - pad;
+        *hi = mid + pad;
+    }
+    return true;
+}
+
+/**
+ * @brief 纵轴量程计算（稳健分位 + 滞回 + 收缩防抖，避免每帧改量程导致曲线乱跳）
+ *
+ * 规则：先取窗口 2%~98% 分位（剔尖峰）；数据超出当前量程 → 扩量程（立即）；
+ *       数据跨度不足当前量程的 40% → 收缩，但需**连续 N 帧**满足才执行
+ *       （防抖：单帧的收缩误判会让量程在两个值间反复横跳）；
  *       其余情况保持不变。
  */
-static void update_axis_range(void)
+
+/** 收缩防抖：连续满足收缩条件的帧数阈值（实测 3~5 帧较稳） */
+#define RANGE_SHRINK_FRAMES 4
+
+static void update_axis_range(int n)
 {
     const mode_desc_t *d = &s_mode_desc[s_mode];
     float a_min, a_max, b_min, b_max;
-    bool has_b = pm_wave_get_range(s_window, s_mode, &a_min, &a_max, &b_min, &b_max);
+    if (!robust_range(s_buf_a_raw, n, &a_min, &a_max)) {
+        return;
+    }
+    bool has_b = d->has_b && robust_range(s_buf_b, n, &b_min, &b_max);
 
     if (!s_range_valid) {
         s_range_a_min = a_min;
@@ -364,38 +533,74 @@ static void update_axis_range(void)
         s_range_b_min = b_min;
         s_range_b_max = b_max;
         s_range_valid = true;
+        s_shrink_cnt_a = 0;
+        s_shrink_cnt_b = 0;
     } else {
-        bool outside = (a_min < s_range_a_min) || (a_max > s_range_a_max);
+        /* a 通道：扩程加滞回余量（数据超出当前量程 3% 才扩，防单点噪声
+         * 触发扩程跳动）；缩程需连续帧确认（防抖） */
+        bool outside = (a_min < s_range_a_min - (s_range_a_max - s_range_a_min) * 0.03f) ||
+                       (a_max > s_range_a_max + (s_range_a_max - s_range_a_min) * 0.03f);
         float cur_span = s_range_a_max - s_range_a_min;
-        if (outside || (cur_span > 1e-9f && (a_max - a_min) < cur_span * 0.4f)) {
+        bool want_shrink = (cur_span > 1e-9f && (a_max - a_min) < cur_span * 0.4f);
+        if (outside) {
             s_range_a_min = a_min;
             s_range_a_max = a_max;
+            s_shrink_cnt_a = 0;
+        } else if (want_shrink) {
+            s_shrink_cnt_a++;
+            if (s_shrink_cnt_a >= RANGE_SHRINK_FRAMES) {
+                s_range_a_min = a_min;
+                s_range_a_max = a_max;
+                s_shrink_cnt_a = 0;
+            }
+        } else {
+            s_shrink_cnt_a = 0;
         }
         if (has_b) {
-            bool outside_b = (b_min < s_range_b_min) || (b_max > s_range_b_max);
+            bool outside_b = (b_min < s_range_b_min - (s_range_b_max - s_range_b_min) * 0.03f) ||
+                             (b_max > s_range_b_max + (s_range_b_max - s_range_b_min) * 0.03f);
             float cur_span_b = s_range_b_max - s_range_b_min;
-            if (outside_b || (cur_span_b > 1e-9f && (b_max - b_min) < cur_span_b * 0.4f)) {
+            bool want_shrink_b = (cur_span_b > 1e-9f && (b_max - b_min) < cur_span_b * 0.4f);
+            if (outside_b) {
                 s_range_b_min = b_min;
                 s_range_b_max = b_max;
+                s_shrink_cnt_b = 0;
+            } else if (want_shrink_b) {
+                s_shrink_cnt_b++;
+                if (s_shrink_cnt_b >= RANGE_SHRINK_FRAMES) {
+                    s_range_b_min = b_min;
+                    s_range_b_max = b_max;
+                    s_shrink_cnt_b = 0;
+                }
+            } else {
+                s_shrink_cnt_b = 0;
             }
         }
     }
 
+    /* 轴量程与刻度统一加 5% 上下留白：
+     * ⚠ 之前 chart range 用分位原值 [min,max]，但刻度显示 [min-pad,max+pad]，
+     * 导致曲线峰谷顶到 chart 框边、而刻度却说上方还有空间——视觉不一致。
+     * 修复：chart range 与刻度都用留白后的范围，峰谷落在 95% 处不顶边。 */
+    const float pad_a = (s_range_a_max - s_range_a_min) * 0.05f;
+    const float pad_b = (s_range_b_max - s_range_b_min) * 0.05f;
     lv_chart_set_axis_range(s_chart, LV_CHART_AXIS_PRIMARY_Y,
-                            (int32_t)(s_range_a_min * CHART_VALUE_SCALE),
-                            (int32_t)(s_range_a_max * CHART_VALUE_SCALE));
+                            (int32_t)((s_range_a_min - pad_a) * CHART_VALUE_SCALE),
+                            (int32_t)((s_range_a_max + pad_a) * CHART_VALUE_SCALE));
     if (d->has_b) {
         lv_chart_set_axis_range(s_chart, LV_CHART_AXIS_SECONDARY_Y,
-                                (int32_t)(s_range_b_min * CHART_VALUE_SCALE),
-                                (int32_t)(s_range_b_max * CHART_VALUE_SCALE));
+                                (int32_t)((s_range_b_min - pad_b) * CHART_VALUE_SCALE),
+                                (int32_t)((s_range_b_max + pad_b) * CHART_VALUE_SCALE));
     }
 
-    /* 轴刻度（上/中/下） */
+    /* 轴刻度（上/中/下）：与 chart range 一致的留白范围 */
     char txt[16];
-    const float avals[3] = { s_range_a_max, (s_range_a_min + s_range_a_max) * 0.5f,
-                             s_range_a_min };
-    const float bvals[3] = { s_range_b_max, (s_range_b_min + s_range_b_max) * 0.5f,
-                             s_range_b_min };
+    const float avals[3] = { s_range_a_max + pad_a,
+                             (s_range_a_min + s_range_a_max) * 0.5f,
+                             s_range_a_min - pad_a };
+    const float bvals[3] = { s_range_b_max + pad_b,
+                             (s_range_b_min + s_range_b_max) * 0.5f,
+                             s_range_b_min - pad_b };
     for (int k = 0; k < 3; k++) {
         format_axis(txt, sizeof(txt), d->ch_a, avals[k]);
         lv_label_set_text(s_axis_a[k], txt);
@@ -406,57 +611,226 @@ static void update_axis_range(void)
     }
 }
 
+/**
+ * @brief 趋势装饰更新：均值参考线 + 主轴 min/max 极值点（P0）
+ *
+ * 只反映**窗口内趋势总结**（极值与偏离程度），不做读值交互。
+ * 坐标用 lv_chart_get_point_pos_by_id()（像素精度，自动含 padding 偏移）。
+ *
+ * 极值点防跳动：圆点钉住「窗口内同一个极值事件」，随窗口滚动平移；
+ * 只有当该事件滑出窗口、或出现显著更极端的新值时才切换锚点。
+ * 否则窗口内小幅波动会让 min/max 在多个相近点间反复横跳、圆点来回抖。
+ */
+static void trend_update(int n, const mode_desc_t *d)
+{
+    if (n <= 0 || s_chart == NULL) {
+        return;
+    }
+
+    /* 主轴（曲线 a）窗口内 min/max 与均值：用**原值**（s_buf_a_raw），
+     * 趋势总结不应被平滑抹掉峰谷。跳过无数据的 NaN 空槽。
+     * 同一趟遍历顺便找「最接近已锚定极值的点」，供防跳动判定。 */
+    float vmin = 0.0f, vmax = 0.0f, vsum = 0.0f;
+    int imin = 0, imax = 0;
+    int iclose_min = -1, iclose_max = -1;
+    float dclose_min = 1e30f, dclose_max = 1e30f;
+    bool has_any = false;
+    int cnt = 0;
+    const float ext_thresh = (s_range_a_max - s_range_a_min) * 0.02f + 1e-6f;
+    for (int i = 0; i < n; i++) {
+        const float v = s_buf_a_raw[i];
+        if (!isfinite(v)) {
+            continue;
+        }
+        if (!has_any) {
+            vmin = vmax = v;
+            imin = imax = i;
+            has_any = true;
+        }
+        vsum += v;
+        cnt++;
+        if (v < vmin) {
+            vmin = v;
+            imin = i;
+        }
+        if (v > vmax) {
+            vmax = v;
+            imax = i;
+        }
+        if (isfinite(s_hold_min_val)) {
+            float dd = fabsf(v - s_hold_min_val);
+            if (dd < dclose_min) {
+                dclose_min = dd;
+                iclose_min = i;
+            }
+        }
+        if (isfinite(s_hold_max_val)) {
+            float dd = fabsf(v - s_hold_max_val);
+            if (dd < dclose_max) {
+                dclose_max = dd;
+                iclose_max = i;
+            }
+        }
+    }
+    if (!has_any) {
+        /* 窗口内全空：隐藏趋势装饰，避免残留上一帧的位置 */
+        if (s_avg_line != NULL) {
+            lv_obj_set_hidden(s_avg_line, true);
+        }
+        if (s_dot_min != NULL) {
+            lv_obj_set_hidden(s_dot_min, true);
+        }
+        if (s_dot_max != NULL) {
+            lv_obj_set_hidden(s_dot_max, true);
+        }
+        return;
+    }
+    float vavg = vsum / (float)cnt;
+
+    /* 防跳动锚点选择：
+     *   ① 已锚定且锚点事件仍在窗口 → 继续钉住它（随滚动平移，不横跳）；
+     *   ② 出现显著更极端的新值（超出阈值）→ 换锚到新极值；
+     *   ③ 锚点事件已滑出窗口 → 回退到窗口内当前 min/max。 */
+    int i_min_dot, i_max_dot;
+    if (!isfinite(s_hold_min_val)) {
+        s_hold_min_val = vmin;
+        i_min_dot = imin;
+    } else if (iclose_min >= 0 && dclose_min < ext_thresh) {
+        i_min_dot = iclose_min;
+    } else {
+        s_hold_min_val = vmin;
+        i_min_dot = imin;
+    }
+    if (!isfinite(s_hold_max_val)) {
+        s_hold_max_val = vmax;
+        i_max_dot = imax;
+    } else if (iclose_max >= 0 && dclose_max < ext_thresh) {
+        i_max_dot = iclose_max;
+    } else {
+        s_hold_max_val = vmax;
+        i_max_dot = imax;
+    }
+
+    /* 均值参考线（水平 1px 浅色，跨图面宽）：按主轴量程（含 5% 留白）换算 y。
+     * ⚠ 必须与 update_axis_range 中 chart_set_axis_range 的留白范围一致，
+     * 否则均值线位置与曲线实际位置不匹配。 */
+    int32_t y_avg;
+    {
+        const float pad = (s_range_a_max - s_range_a_min) * 0.05f;
+        float lo = s_range_a_min - pad, hi = s_range_a_max + pad;
+        float t = (hi > lo) ? (vavg - lo) / (hi - lo) : 0.5f;
+        if (t < 0.0f) {
+            t = 0.0f;
+        } else if (t > 1.0f) {
+            t = 1.0f;
+        }
+        lv_coord_t ch = (lv_coord_t)lv_obj_get_content_height(s_chart);
+        y_avg = (lv_coord_t)((1.0f - t) * (float)(ch - 1));
+    }
+    if (s_avg_line != NULL) {
+        lv_obj_set_hidden(s_avg_line, false);
+        lv_obj_set_width(s_avg_line, lv_obj_get_content_width(s_chart));
+        lv_obj_set_pos(s_avg_line, 0, y_avg);
+    }
+
+    /* min/max 极值点：深色小圆点钉在对应数据点。
+     * 不用曲线同色（绿点压绿线几乎不可见）；深色在任何通道色上都清晰。 */
+    if (s_dot_min != NULL && s_ser_a != NULL) {
+        lv_point_t pm;
+        lv_chart_get_point_pos_by_id(s_chart, s_ser_a, (uint32_t)i_min_dot, &pm);
+        lv_obj_set_pos(s_dot_min, pm.x - 2, pm.y - 2);
+        lv_obj_set_hidden(s_dot_min, false);
+    }
+    if (s_dot_max != NULL && s_ser_a != NULL) {
+        lv_point_t px;
+        lv_chart_get_point_pos_by_id(s_chart, s_ser_a, (uint32_t)i_max_dot, &px);
+        lv_obj_set_pos(s_dot_max, px.x - 2, px.y - 2);
+        lv_obj_set_hidden(s_dot_max, false);
+    }
+    (void)d;
+}
+
 void screen_wave_refresh(void)
 {
     if (s_chart == NULL) {
         return;
     }
 
-    int n = pm_wave_copy(s_window, s_mode, s_buf_a, s_buf_b, CHART_MAX_POINTS);
     const mode_desc_t *d = &s_mode_desc[s_mode];
 
-    update_axis_range();
+    /* 时间槽契约（2026-10 重设计）：pm_wave_copy 填满 CHART_MAX_POINTS 个
+     * 「固定时长」槽，索引 j 即屏幕第 j 列（右端 = 现在），无数据槽为 NaN。
+     * 每槽时长恒为 窗长/点数，故波形走动速度与缓冲区填充程度、实际采样率
+     * 都无关——修复"未占满时慢、占满后飞快"的观感问题。UI 一比一映射即可，
+     * 不再需要右对齐与填充点数计算。 */
+    (void)pm_wave_copy(s_window, s_mode, s_buf_a_raw, s_buf_b, CHART_MAX_POINTS);
 
-    /* 右对齐滚动：把 n 个点画在序列末尾，前面填 NONE。
-     * 这样最新样本永远贴右边缘，时间推进时整体向左走（见文件头说明）。 */
-    int base = CHART_MAX_POINTS - n;
-    if (base < 0) {
-        base = 0;
+    /* 平滑（可选）：对主轴/副轴相邻三个**都有效**的槽做 3 点移动平均；
+     * 空槽（NaN）与端点保持原值，避免把断线抹成假波形。
+     * 【Step2 降噪】副轴（常为电流，空载噪声大）同样平滑——原先只平滑主轴。 */
+    settings_t scfg;
+    bool smooth = (settings_get(&scfg) == ESP_OK && scfg.wave_smooth);
+    for (int i = 0; i < CHART_MAX_POINTS; i++) {
+        s_buf_a[i] = s_buf_a_raw[i];
+        s_buf_b_raw[i] = s_buf_b[i];
     }
-    for (int k = 0; k < CHART_MAX_POINTS; k++) {
-        int src = k - base;
-        if (src >= 0 && src < n) {
-            lv_chart_set_series_value_by_id(s_chart, s_ser_a, (uint32_t)k,
-                                           (int32_t)(s_buf_a[src] * CHART_VALUE_SCALE));
-            if (d->has_b) {
-                lv_chart_set_series_value_by_id(s_chart, s_ser_b, (uint32_t)k,
-                                               (int32_t)(s_buf_b[src] * CHART_VALUE_SCALE));
+    if (smooth) {
+        for (int i = 1; i < CHART_MAX_POINTS - 1; i++) {
+            if (isfinite(s_buf_a_raw[i - 1]) && isfinite(s_buf_a_raw[i]) &&
+                isfinite(s_buf_a_raw[i + 1])) {
+                s_buf_a[i] = (s_buf_a_raw[i - 1] + s_buf_a_raw[i] + s_buf_a_raw[i + 1]) / 3.0f;
             }
+            if (d->has_b && isfinite(s_buf_b_raw[i - 1]) && isfinite(s_buf_b_raw[i]) &&
+                isfinite(s_buf_b_raw[i + 1])) {
+                s_buf_b[i] = (s_buf_b_raw[i - 1] + s_buf_b_raw[i] + s_buf_b_raw[i + 1]) / 3.0f;
+            }
+        }
+    }
+
+    update_axis_range(CHART_MAX_POINTS);
+
+    /* 一比一映射到 chart 槽位：j → 第 j 列；NaN → LV_CHART_POINT_NONE（断线） */
+    for (int k = 0; k < CHART_MAX_POINTS; k++) {
+        if (isfinite(s_buf_a[k])) {
+            lv_chart_set_series_value_by_id(s_chart, s_ser_a, (uint32_t)k,
+                                           (int32_t)(s_buf_a[k] * CHART_VALUE_SCALE));
         } else {
             lv_chart_set_series_value_by_id(s_chart, s_ser_a, (uint32_t)k, LV_CHART_POINT_NONE);
-            if (d->has_b) {
-                lv_chart_set_series_value_by_id(s_chart, s_ser_b, (uint32_t)k,
-                                               LV_CHART_POINT_NONE);
-            }
+        }
+        if (d->has_b && isfinite(s_buf_b[k])) {
+            lv_chart_set_series_value_by_id(s_chart, s_ser_b, (uint32_t)k,
+                                           (int32_t)(s_buf_b[k] * CHART_VALUE_SCALE));
+        } else {
+            lv_chart_set_series_value_by_id(s_chart, s_ser_b, (uint32_t)k, LV_CHART_POINT_NONE);
         }
     }
     lv_chart_refresh(s_chart);
+#if WAVE_DECOR_ENABLE
+    trend_update(CHART_MAX_POINTS, d); /* 均值线 + min/max 极值点 */
+#else
+    (void)d;
+#endif
 
-    /* 底部实时/平均数据行：按当前模式给出两条线对应的量与功率 */
-    if (n <= 0) {
-        return;
-    }
-    float a_last = s_buf_a[n - 1];
-    float b_last = d->has_b ? s_buf_b[n - 1] : 0.0f;
-    float a_sum = 0.0f, b_sum = 0.0f;
-    for (int k = 0; k < n; k++) {
-        a_sum += s_buf_a[k];
-        if (d->has_b) {
-            b_sum += s_buf_b[k];
+    /* 底部实时/平均数据行：跳过无数据的 NaN 空槽 */
+    float a_last = 0.0f, b_last = 0.0f, a_avg = 0.0f, b_avg = 0.0f;
+    int cnt = 0;
+    double sa = 0.0, sb = 0.0;
+    for (int k = 0; k < CHART_MAX_POINTS; k++) {
+        if (isfinite(s_buf_a[k])) {
+            sa += s_buf_a[k];
+            cnt++;
+            a_last = s_buf_a[k]; /* 最后一个有效值即"实时" */
+        }
+        if (d->has_b && isfinite(s_buf_b[k])) {
+            sb += s_buf_b[k];
+            b_last = s_buf_b[k];
         }
     }
-    float a_avg = a_sum / (float)n;
-    float b_avg = d->has_b ? (b_sum / (float)n) : 0.0f;
+    if (cnt == 0) {
+        return;
+    }
+    a_avg = (float)(sa / cnt);
+    b_avg = d->has_b ? (float)(sb / cnt) : 0.0f;
 
     char rt[72], av[72];
     switch (s_mode) {
@@ -488,8 +862,11 @@ void screen_wave_refresh(void)
 }
 
 /**
- * @brief chart 尺寸确定后摆放 6 个轴刻度（左/右 padding 留白区内，上中下）
- * @note 子对象坐标相对 chart 的 content area，故用负坐标放进左侧 padding
+ * @brief chart 尺寸确定后摆放 6 个轴刻度（浮于曲线之上，左右贴边）
+ *
+ * 2026-10 改：波形铺满整宽，刻度不再占 padding 留白（原先两侧各让出
+ * 66px，曲线被挤在中间很不协调）。刻度改贴左右边缘、加半透明白底，
+ * 压在曲线之上仍可读。
  */
 static void chart_size_event_cb(lv_event_t *e)
 {
@@ -498,9 +875,18 @@ static void chart_size_event_cb(lv_event_t *e)
     lv_coord_t h = lv_obj_get_content_height(chart);
     for (int k = 0; k < 3; k++) {
         lv_coord_t y = (k == 0) ? -3 : (k == 1) ? (h - 14) / 2 : (h - 11);
-        lv_obj_set_pos(s_axis_a[k], -(AXIS_LABEL_W + 4), y);
-        lv_obj_set_pos(s_axis_b[k], w + 4, y);
+        lv_obj_set_pos(s_axis_a[k], 0, y);            /* 左刻度贴左缘 */
+        lv_obj_set_pos(s_axis_b[k], w - AXIS_LABEL_W, y); /* 右刻度贴右缘 */
     }
+}
+
+/** 曲线平滑开关：写 settings 并持久化（立即生效，下一次刷新即用新设置） */
+static void smooth_switch_cb(lv_event_t *e)
+{
+    lv_obj_t *sw = lv_event_get_target(e);
+    bool on = lv_obj_has_state(sw, LV_STATE_CHECKED);
+    (void)settings_set_wave_smooth(on ? 1u : 0u);
+    (void)settings_save_now();
 }
 
 static void create_panel(lv_obj_t *scr, const wave_geom_t *g)
@@ -552,6 +938,9 @@ static void create_panel(lv_obj_t *scr, const wave_geom_t *g)
     lv_roller_set_visible_row_count(s_roller_win, 3);
     lv_roller_set_selected(s_roller_win, (uint16_t)s_window, LV_ANIM_OFF);
     lv_obj_set_size(s_roller_win, g->col_win_w - 8, 68);
+    /* 两阶段触控：初始禁滑动（防下滑关闭菜单时误改），点击选中后才可滑 */
+    lv_obj_set_scrollable(s_roller_win, false);
+    lv_obj_add_event_cb(s_roller_win, roller_clicked_cb, LV_EVENT_CLICKED, NULL);
 
     lv_obj_t *col_m = lv_obj_create(row);
     lv_obj_remove_style_all(col_m);
@@ -570,11 +959,47 @@ static void create_panel(lv_obj_t *scr, const wave_geom_t *g)
     lv_roller_set_visible_row_count(s_roller_mode, 3);
     lv_roller_set_selected(s_roller_mode, (uint16_t)s_mode, LV_ANIM_OFF);
     lv_obj_set_size(s_roller_mode, g->col_mode_w - 8, 68);
+    /* 两阶段触控：同时间窗 roller */
+    lv_obj_set_scrollable(s_roller_mode, false);
+    lv_obj_add_event_cb(s_roller_mode, roller_clicked_cb, LV_EVENT_CLICKED, NULL);
+
+    /* 曲线平滑开关（settings.wave_smooth，3 点移动平均） */
+    lv_obj_t *smooth_row = lv_obj_create(s_panel);
+    lv_obj_remove_style_all(smooth_row);
+    lv_obj_set_size(smooth_row, LV_PCT(100), 28);
+    lv_obj_set_scrollable(smooth_row, false);
+    lv_obj_set_flex_flow(smooth_row, LV_FLEX_FLOW_ROW);
+    lv_obj_set_flex_align(smooth_row, LV_FLEX_ALIGN_SPACE_BETWEEN, LV_FLEX_ALIGN_CENTER,
+                          LV_FLEX_ALIGN_CENTER);
+    lv_obj_t *smooth_lbl = lv_label_create(smooth_row);
+    lv_label_set_text(smooth_lbl, "曲线平滑");
+    lv_obj_set_style_text_font(smooth_lbl, lvgl_port_get_font(LVGL_PORT_FONT_14), 0);
+    lv_obj_set_style_text_color(smooth_lbl, COL_DARK, 0);
+    lv_obj_t *sw = lv_switch_create(smooth_row);
+    /* 与设置页自动旋转开关统一样式：关闭轨道灰、开启轨道品牌蓝、
+     * 白色旋钮带 1px 灰边框（避免白底上旋钮"消失"）。 */
+    lv_obj_set_size(sw, 46, 24);
+    lv_obj_set_style_bg_color(sw, COL_CARD_BD, 0);
+    lv_obj_set_style_bg_opa(sw, LV_OPA_COVER, 0);
+    lv_obj_set_style_bg_color(sw, COL_PRIMARY, LV_STATE_CHECKED);
+    lv_obj_set_style_bg_opa(sw, LV_OPA_COVER, LV_STATE_CHECKED);
+    lv_obj_set_style_bg_color(sw, lv_color_white(), LV_PART_KNOB);
+    lv_obj_set_style_bg_opa(sw, LV_OPA_COVER, LV_PART_KNOB);
+    /* 旋钮边框用深灰：与设置页自动旋转开关一致，白底上清晰可辨 */
+    lv_obj_set_style_border_color(sw, COL_GRAY, LV_PART_KNOB);
+    lv_obj_set_style_border_width(sw, 1, LV_PART_KNOB);
+    lv_obj_set_style_pad_all(sw, 3, LV_PART_KNOB);
+    lv_obj_set_style_radius(sw, LV_RADIUS_CIRCLE, LV_PART_KNOB);
+    settings_t scfg;
+    if (settings_get(&scfg) == ESP_OK && scfg.wave_smooth) {
+        lv_obj_add_state(sw, LV_STATE_CHECKED);
+    }
+    lv_obj_add_event_cb(sw, smooth_switch_cb, LV_EVENT_VALUE_CHANGED, NULL);
 
     /* 提示分两行：单行 26 字符在 252px 内宽里放不下（12px 字约 280px），
      * 会被左右裁切，竖屏 240 宽更严重 */
     lv_obj_t *hint1 = lv_label_create(s_panel);
-    lv_label_set_text(hint1, "K1/K2 上下 · K2 双击切项");
+    lv_label_set_text(hint1, "点选项目后可滑动 · K1/K2 上下");
     lv_obj_set_style_text_font(hint1, lvgl_port_get_font(LVGL_PORT_FONT_12), 0);
     lv_obj_set_style_text_color(hint1, COL_GRAY, 0);
 
@@ -617,7 +1042,6 @@ void screen_wave_create(lv_obj_t *tile)
     lv_obj_set_style_bg_opa(tile, LV_OPA_COVER, 0);
     lv_obj_set_scrollable(tile, false);
     lv_obj_set_style_pad_all(tile, 0, 0);
-    lv_obj_add_event_cb(tile, gesture_event_cb, LV_EVENT_GESTURE, NULL);
 
     /* 标题（居中，天然避开圆角） */
     s_lbl_title = lv_label_create(tile);
@@ -634,18 +1058,32 @@ void screen_wave_create(lv_obj_t *tile)
     lv_obj_set_pos(s_chart, SAFE_X, g.chart_y);
     lv_chart_set_type(s_chart, LV_CHART_TYPE_LINE);
     lv_chart_set_point_count(s_chart, CHART_MAX_POINTS);
-    lv_chart_set_update_mode(s_chart, LV_CHART_UPDATE_MODE_SHIFT);
-    lv_chart_set_div_line_count(s_chart, 4, 5);
-    lv_obj_set_style_pad_left(s_chart, AXIS_LABEL_W + 4, 0);  /* 给左轴刻度留位 */
-    lv_obj_set_style_pad_right(s_chart, AXIS_LABEL_W + 4, 0); /* 给右轴刻度留位 */
+    /* 每帧用 set_series_value_by_id 整帧重写全部槽位（时间槽映射，不是
+     * "逐点追加"），update_mode 只影响 set_next_value，这里无需设置。 */
+    /* 格线密度：LVGL 的 div_line_count 是「线数」，格数 = 线数 - 1。
+     * 波形重构 Step1（做减法）：5×10 格 → 4×8 格（线数 5×9），
+     * 暗灰 1px，降低视觉密度——DSO Nano 等小屏示波器的通用密度。 */
+    lv_chart_set_div_line_count(s_chart, 5, 9);
+    lv_obj_set_style_pad_left(s_chart, 4, 0);  /* 曲线铺满宽度，Y 轴刻度浮于其上 */
+    lv_obj_set_style_pad_right(s_chart, 4, 0); /* （原 AXIS_LABEL_W+4 让出两侧，波形被挤压） */
     lv_obj_set_style_pad_top(s_chart, 5, 0);
     lv_obj_set_style_pad_bottom(s_chart, 5, 0);
-    lv_obj_set_style_bg_color(s_chart, lv_color_white(), 0);
-    lv_obj_set_style_border_color(s_chart, COL_CARD_BD, 0);
+    /* 黑底 + 暗灰格线（示波器风格，见 COL_WAVE_BG 注释） */
+    lv_obj_set_style_bg_color(s_chart, COL_WAVE_BG, 0);
+    lv_obj_set_style_bg_opa(s_chart, LV_OPA_COVER, 0);
+    lv_obj_set_style_border_color(s_chart, COL_WAVE_GRID, 0);
     lv_obj_set_style_border_width(s_chart, 1, 0);
     lv_obj_set_style_radius(s_chart, 8, 0);
     lv_obj_set_style_line_width(s_chart, 2, LV_PART_MAIN);
+    lv_obj_set_style_line_color(s_chart, COL_WAVE_GRID, LV_PART_MAIN); /* 格线暗灰 */
     lv_obj_set_style_size(s_chart, 0, 0, LV_PART_INDICATOR);
+    /* 波形图自适应屏宽、禁用自身滚动：左右轴刻度标签挂在 chart 的
+     * padding 留白区（负 x / 越界 x），此前 chart 可滚动时把它们算进
+     * 滚动范围，出现左右滑动空间与滚动条；置 scrollable=false 后
+     * 刻度仍显示在留白区内（未越出 border box），但不再产生滚动，
+     * 横滑交还给 tileview 翻页。 */
+    lv_obj_set_scrollable(s_chart, false);
+    lv_obj_set_scrollbar_mode(s_chart, LV_SCROLLBAR_MODE_OFF);
     lv_obj_add_event_cb(s_chart, chart_size_event_cb, LV_EVENT_SIZE_CHANGED, NULL);
 
     s_ser_a = lv_chart_add_series(s_chart, COL_V, LV_CHART_AXIS_PRIMARY_Y);
@@ -653,7 +1091,7 @@ void screen_wave_create(lv_obj_t *tile)
     lv_chart_set_all_values(s_chart, s_ser_a, LV_CHART_POINT_NONE);
     lv_chart_set_all_values(s_chart, s_ser_b, LV_CHART_POINT_NONE);
 
-    /* 轴刻度（上/中/下 × 左/右），放在 chart 的 padding 留白区内 */
+    /* 轴刻度（上/中/下 × 左/右），浮于曲线之上：深色半透底保证黑底上可读 */
     const lv_font_t *f12 = lvgl_port_get_font(LVGL_PORT_FONT_12);
     for (int k = 0; k < 3; k++) {
         s_axis_a[k] = lv_label_create(s_chart);
@@ -661,6 +1099,8 @@ void screen_wave_create(lv_obj_t *tile)
         lv_obj_set_style_text_font(s_axis_a[k], f12, 0);
         lv_obj_set_style_pad_hor(s_axis_a[k], 2, 0);
         lv_label_set_text(s_axis_a[k], "--");
+        lv_obj_set_style_bg_color(s_axis_a[k], COL_WAVE_BG, 0);
+        lv_obj_set_style_bg_opa(s_axis_a[k], LV_OPA_70, 0);
         lv_obj_set_clickable(s_axis_a[k], false);
         lv_obj_set_scrollable(s_axis_a[k], false);
 
@@ -670,22 +1110,67 @@ void screen_wave_create(lv_obj_t *tile)
         lv_obj_set_style_pad_hor(s_axis_b[k], 2, 0);
         lv_obj_set_style_text_align(s_axis_b[k], LV_TEXT_ALIGN_RIGHT, 0);
         lv_label_set_text(s_axis_b[k], "--");
+        lv_obj_set_style_bg_color(s_axis_b[k], COL_WAVE_BG, 0);
+        lv_obj_set_style_bg_opa(s_axis_b[k], LV_OPA_70, 0);
         lv_obj_set_clickable(s_axis_b[k], false);
         lv_obj_set_scrollable(s_axis_b[k], false);
     }
 
-    /* 时间轴（左：-窗长，右：0） */
+#if WAVE_DECOR_ENABLE
+    /* 趋势装饰对象：均值参考线（1px 浅色横条）+ min/max 极值点（4px 圆），
+     * 挂 chart 下、坐标相对 content area，样式独立不污染曲线 */
+    s_avg_line = lv_obj_create(s_chart);
+    lv_obj_remove_style_all(s_avg_line);
+    lv_obj_set_size(s_avg_line, LV_PCT(100), 1);
+    lv_obj_set_style_bg_color(s_avg_line, COL_DARK, 0);
+    lv_obj_set_style_bg_opa(s_avg_line, LV_OPA_50, 0);
+    lv_obj_set_clickable(s_avg_line, false);
+    lv_obj_set_scrollable(s_avg_line, false);
+    lv_obj_move_to_index(s_avg_line, 0); /* 渲染在曲线之下 */
+
+    s_dot_min = lv_obj_create(s_chart);
+    lv_obj_remove_style_all(s_dot_min);
+    lv_obj_set_size(s_dot_min, 5, 5);
+    lv_obj_set_style_bg_color(s_dot_min, COL_DARK, 0);
+    lv_obj_set_style_bg_opa(s_dot_min, LV_OPA_COVER, 0);
+    lv_obj_set_style_radius(s_dot_min, LV_RADIUS_CIRCLE, 0);
+    lv_obj_set_clickable(s_dot_min, false);
+    lv_obj_set_scrollable(s_dot_min, false);
+    lv_obj_set_hidden(s_dot_min, true);
+
+    s_dot_max = lv_obj_create(s_chart);
+    lv_obj_remove_style_all(s_dot_max);
+    lv_obj_set_size(s_dot_max, 5, 5);
+    lv_obj_set_style_bg_color(s_dot_max, COL_DARK, 0);
+    lv_obj_set_style_bg_opa(s_dot_max, LV_OPA_COVER, 0);
+    lv_obj_set_style_radius(s_dot_max, LV_RADIUS_CIRCLE, 0);
+    lv_obj_set_clickable(s_dot_max, false);
+    lv_obj_set_scrollable(s_dot_max, false);
+    lv_obj_set_hidden(s_dot_max, true);
+#endif
+
+    /* 时间轴（左：-窗长，中：-半窗，右：0）贴 chart 图面左右缘 */
     s_lbl_time_l = lv_label_create(tile);
     lv_label_set_text(s_lbl_time_l, "");
     lv_obj_set_style_text_font(s_lbl_time_l, f12, 0);
     lv_obj_set_style_text_color(s_lbl_time_l, COL_GRAY, 0);
-    lv_obj_set_pos(s_lbl_time_l, SAFE_X + AXIS_LABEL_W + 4, g.time_y);
+    lv_obj_set_pos(s_lbl_time_l, SAFE_X, g.time_y);
+
+    s_lbl_time_m = lv_label_create(tile);
+    lv_label_set_text(s_lbl_time_m, "");
+    lv_obj_set_style_text_font(s_lbl_time_m, f12, 0);
+    lv_obj_set_style_text_color(s_lbl_time_m, COL_GRAY, 0);
+    lv_obj_set_width(s_lbl_time_m, 60);
+    lv_obj_set_style_text_align(s_lbl_time_m, LV_TEXT_ALIGN_CENTER, 0);
+    lv_obj_set_pos(s_lbl_time_m, SAFE_X + (g.w - 2 * SAFE_X - 60) / 2, g.time_y);
 
     s_lbl_time_r = lv_label_create(tile);
     lv_label_set_text(s_lbl_time_r, "0");
     lv_obj_set_style_text_font(s_lbl_time_r, f12, 0);
     lv_obj_set_style_text_color(s_lbl_time_r, COL_GRAY, 0);
-    lv_obj_set_pos(s_lbl_time_r, g.w - SAFE_X - AXIS_LABEL_W - 4, g.time_y);
+    lv_obj_set_width(s_lbl_time_r, 30);
+    lv_obj_set_style_text_align(s_lbl_time_r, LV_TEXT_ALIGN_RIGHT, 0);
+    lv_obj_set_pos(s_lbl_time_r, g.w - SAFE_X - 30, g.time_y);
 
     /* 实时 / 平均 */
     s_lbl_realtime = lv_label_create(tile);

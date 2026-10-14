@@ -21,6 +21,9 @@ void screen_wave_refresh(void);
 /** @brief 打开底部波形设置滑板（K2 长按 / 触摸上滑） */
 void screen_wave_open_menu(void);
 
+/** @brief 波形页滑动处理（ui_nav indev 级滑动识别调用）：上滑开 / 下滑关 */
+void screen_wave_swipe_cb(lv_dir_t dir);
+
 /** @brief 关闭滑板（apply=true 时读取 roller 选择并应用） */
 void screen_wave_close_menu(bool apply);
 
