@@ -183,14 +183,16 @@ typedef struct {
 #define SELFTEST_TEMP_MAX_C   85.0f
 
 /**
- * @brief 自检：测量前端 ADC 能读回一帧数据
+ * @brief 自检：测量前端 ADC 芯片存在、寄存器可信、数据非全 0
  *
  * 这是本设备唯一的测量来源，读不到就等于设备失去核心功能。
+ * 用 ads131m02_selftest()（ID 锚点 + GAIN1 回读 + 连续帧非全 0）
+ * 而非 ads131m02_read()——后者只验 DRDY/SPI 不报错，芯片缺失或
+ * 测量前端未接入（码值恒 0）时照样"通过"，导致自检虚警。
  */
 static esp_err_t selftest_ads131m02(void)
 {
-    ads131m02_sample_t sample;
-    return ads131m02_read(&sample);
+    return ads131m02_selftest();
 }
 
 /**

@@ -177,20 +177,27 @@ static const char *TAG = "ads131m02";
  * CLOCK 寄存器位定义（手册 §8.6.4 Table 8-17，复位值 0x030E）
  *   bit9    CH1_EN / bit8 CH0_EN：两通道均使能；
  *   bit5    TBM：0 = OSR 由 bit[4:2] 决定（1 = Turbo，OSR 固定 64）；
- *   bit[4:2] OSR[2:0]：011 = 1024；
+ *   bit[4:2] OSR[2:0]：011 = 1024（复位档）；
  *   bit[1:0] PWR[1:0]：10 = HR（高分辨率，11 同为 HR，保持复位值 10）。
  *
- * HR 模式 f_MOD = f_CLKIN/2 = 4.096MHz，ODR = f_MOD/OSR = 4000 Hz。
- * 虽然芯片复位默认值就是 0x030E（即 4kSPS），仍显式写入并回读，
- * 防止上游程序/异常状态改过该寄存器，保证采样率确定。
+ * HR 模式 f_MOD = f_CLKIN/2 = 4.096MHz，ODR = f_MOD/OSR = 4000 Hz（复位档）。
+ *
+ * ⚠ 2026-10 实机排查（SBAS839 §8.5.1.5 原文）：
+ *   "The DRDY pulse is blocked when new conversions complete while conversion
+ *    data are read."——主机读取窗口跨越转换完成时刻时 DRDY 被抑制。
+ *   4kHz 档（250µs/帧）下主机"等DRDY+读帧"周期 ~3ms 必然跨越多个转换完成，
+ *   DRDY 塌到 ~310Hz。故 OSR 由 011(1024) 提到 110(8×)：
+ *   · ODR 降为 500Hz（2ms/帧），读取周期有充足余量避开转换完成时刻；
+ *   · 每样本过采样 8×，单样本噪声降 ~2.8 倍（√8），显示更稳。
+ *   （若实测 ODR 需调整，改 OSR 档位即可：每 +1 档 ODR 减半。）
  * ============================================================ */
 #define ADS_CLOCK_CH_EN_MASK  0x0300u /**< CH1_EN | CH0_EN */
 #define ADS_CLOCK_OSR_SHIFT   2
-#define ADS_CLOCK_OSR_1024    (0x03u << ADS_CLOCK_OSR_SHIFT) /**< OSR[2:0]=011 */
+#define ADS_CLOCK_OSR_8X      (0x06u << ADS_CLOCK_OSR_SHIFT) /**< OSR[2:0]=110（复位档 011 的 8 倍过采样） */
 #define ADS_CLOCK_PWR_HR      (0x02u)                         /**< PWR[1:0]=10 HR */
-#define ADS_CLOCK_VALUE       (ADS_CLOCK_CH_EN_MASK | ADS_CLOCK_OSR_1024 | ADS_CLOCK_PWR_HR)
-/** 配置后的输出数据率（Hz） */
-#define ADS_ODR_HZ            4000u
+#define ADS_CLOCK_VALUE       (ADS_CLOCK_CH_EN_MASK | ADS_CLOCK_OSR_8X | ADS_CLOCK_PWR_HR)
+/** 配置后的输出数据率（Hz）：复位档 4000Hz ÷ 8 = 500Hz */
+#define ADS_ODR_HZ            500u
 
 /* ============================================================
  * 时序参数
@@ -609,9 +616,10 @@ esp_err_t ads131m02_init(void)
     }
     vTaskDelay(pdMS_TO_TICKS(ADS_CMD_GAP_MS));
 
-    /* ---- ⑩.1 写 CLOCK：HR 模式 + OSR=1024 -> 输出数据率 4kSPS ----
-     * 该值虽与芯片复位默认相同，仍显式配置并回读，确保采样率是确定值
-     * （位定义见 ADS_CLOCK_VALUE 上方注释，出自手册 §8.6.4 Table 8-17）。 */
+    /* ---- ⑩.1 写 CLOCK：HR 模式 + OSR=8x 档 -> 输出数据率 500SPS ----
+     * 与芯片复位默认（OSR=1024 档 4kSPS）不同：提高过采样降噪声，
+     * 并给主机读取留出避开"转换完成时刻"的窗口（SBAS839 §8.5.1.5，
+     * 详见 ADS_CLOCK_VALUE 注释）。仍显式写入并回读，保证采样率确定。 */
     err = ads_write_reg(ADS_REG_CLOCK, ADS_CLOCK_VALUE);
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "CLOCK(采样率) 写入未确认: %s", esp_err_to_name(err));
@@ -622,7 +630,7 @@ esp_err_t ads131m02_init(void)
     err = ads_read_reg(ADS_REG_CLOCK, &clock_readback);
     if (err == ESP_OK) {
         if (clock_readback == ADS_CLOCK_VALUE) {
-            ESP_LOGI(TAG, "CLOCK 回读 0x%04X：HR 模式 OSR=1024，ODR=%u SPS", clock_readback,
+            ESP_LOGI(TAG, "CLOCK 回读 0x%04X：HR 模式 OSR=8x 档，ODR=%u SPS", clock_readback,
                      ADS_ODR_HZ);
         } else {
             ESP_LOGW(TAG, "CLOCK 回读 0x%04X 与目标 0x%04X 不符（实际 ODR 可能不是 %u SPS）",
@@ -786,6 +794,76 @@ esp_err_t ads131m02_read(ads131m02_sample_t *out)
 uint32_t ads131m02_get_sample_rate_hz(void)
 {
     return s_initialized ? ADS_ODR_HZ : 0;
+}
+
+/** 自检连续采样帧数：全部为 0 才判定"数据无意义"，单帧为 0 属正常 */
+#define ADS_SELFTEST_FRAMES 8
+
+esp_err_t ads131m02_selftest(void)
+{
+    if (!s_initialized) {
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    /* ---- ① 芯片存在性锚点：ID 寄存器（00h）高字节必须是 0x22 ----
+     * 手册复位值 22xxh（高字节含 CHANCNT 固定，低 8 位可变）。
+     * 芯片没焊时 MISO 悬空（ESP32 内部弱上下拉下读 0 或随机），
+     * ID 读回 0x0000/乱码 → 此处判失败。
+     * ⚠ init() 里 ID 不符只告警不失败（兼容硅片版本差异），
+     *   但启动自检必须把它当硬失败——这正是"自检通过但测量全 0"的盲区。 */
+    uint16_t dev_id = 0;
+    esp_err_t err = ads_read_reg(ADS_REG_ID, &dev_id);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "自检：读 ID 寄存器失败: %s（SPI 通路断或无 DRDY）", esp_err_to_name(err));
+        return err;
+    }
+    if ((dev_id & 0xFF00u) != (ADS_DEV_ID_TYPICAL & 0xFF00u)) {
+        ESP_LOGE(TAG, "自检失败：ID=0x%04X 高字节不是 0x22——ADS131M02 缺失/虚焊或 SPI 通路异常",
+                 dev_id);
+        return ESP_ERR_INVALID_RESPONSE;
+    }
+
+    /* ---- ② 寄存器通路可信：GAIN1 回读必须与初始化写入一致 ----
+     * init() 写 GAIN1 时若未解锁会被静默丢弃（那里只告警），这里再验一道。 */
+    uint16_t gain1 = 0;
+    err = ads_read_reg(ADS_REG_GAIN1, &gain1);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "自检：读 GAIN1 失败: %s", esp_err_to_name(err));
+        return err;
+    }
+    if (gain1 != ADS_GAIN1_VALUE) {
+        ESP_LOGE(TAG, "自检失败：GAIN1 回读 0x%04X ≠ 配置 0x%04X（寄存器写入未生效）", gain1,
+                 ADS_GAIN1_VALUE);
+        return ESP_ERR_INVALID_RESPONSE;
+    }
+
+    /* ---- ③ 数据可信度：连续多帧码值不能全 0 ----
+     * 芯片在但测量前端未接入（分压/分流器虚焊）时码值恒 0：
+     * read() 不报错、旧自检照样通过，但测量数据全是 0——正是待排查现象。
+     * 本设备由被测电源供电，正常运行时电压通道必有码值，全 0 即异常。 */
+    bool any_nonzero = false;
+    for (int i = 0; i < ADS_SELFTEST_FRAMES; i++) {
+        ads131m02_sample_t s;
+        err = ads131m02_read(&s);
+        if (err != ESP_OK) {
+            ESP_LOGE(TAG, "自检：第 %d/%d 帧读取失败: %s", i + 1, ADS_SELFTEST_FRAMES,
+                     esp_err_to_name(err));
+            return err;
+        }
+        if (s.voltage_raw != 0 || s.current_raw != 0) {
+            any_nonzero = true;
+            break;
+        }
+    }
+    if (!any_nonzero) {
+        ESP_LOGE(TAG, "自检失败：连续 %d 帧电压/电流码值全 0——芯片存在(ID=0x%04X)但测量数据无效，"
+                      "排查前端分压 R33/R39、分流器 ISENSE± 是否接入",
+                 ADS_SELFTEST_FRAMES, dev_id);
+        return ESP_ERR_INVALID_RESPONSE;
+    }
+
+    ESP_LOGI(TAG, "自检通过（ID=0x%04X，GAIN1=0x%04X，采样数据非全 0）", dev_id, gain1);
+    return ESP_OK;
 }
 
 uint32_t ads131m02_drdy_count(void)

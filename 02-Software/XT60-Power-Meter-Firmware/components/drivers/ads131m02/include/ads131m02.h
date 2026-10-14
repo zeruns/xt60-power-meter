@@ -37,6 +37,21 @@ esp_err_t ads131m02_init(void);
 esp_err_t ads131m02_read(ads131m02_sample_t *out);
 
 /**
+ * @brief 芯片存在性与数据可信度自检（启动自检用）
+ *
+ * 比 ads131m02_read() 更严格——read() 只验证「DRDY 来了 + SPI 没报错」，
+ * 芯片没焊（MISO 悬空读 0）时也可能通过，表现为"自检通过但测量全 0"。
+ * 本函数补三道闸门：
+ *   ① ID 寄存器高字节必须是 0x22（芯片存在性通信锚点，见实现注释）；
+ *   ② GAIN1 写读一致（寄存器通路可信）；
+ *   ③ 连续多帧电压/电流码值不能全 0（本设备由被测电源供电，全 0 说明
+ *      芯片缺失或测量前端未接入）。
+ *
+ * @return ESP_OK 自检通过；其他为对应失败原因（日志会写明诊断结论）
+ */
+esp_err_t ads131m02_selftest(void);
+
+/**
  * @brief DRDY# 中断累计边沿数（诊断用：区分「DRDY 真的慢」还是「任务处理慢」）
  */
 uint32_t ads131m02_drdy_count(void);
