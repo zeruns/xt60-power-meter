@@ -53,8 +53,8 @@
 /* 快速菜单用色（与设置页同语义） */
 #define COL_PRIMARY lv_color_hex(0x0066CC)
 #define COL_INK     lv_color_hex(0x1A1A1A)
-#define COL_CARD    lv_color_hex(0xF7F9FC)
-#define COL_BORDER  lv_color_hex(0xE3E7EC)
+#define COL_CARD    lv_color_hex(0xF1F4F8) /* 卡片底：与白底拉开可辨差异 */
+#define COL_BORDER  lv_color_hex(0xB4BEC9) /* 边框：约 2.2:1 对比度，边界清晰 */
 
 /** 内容左右边距：四行都在垂直中段，圆角不侵入，故可做到近满宽 */
 #define SAFE_X 6
@@ -291,10 +291,11 @@ void screen_measure_refresh(const data_store_snapshot_t *snap)
  *       -「数据刷新率」→ 在 1/5/10/20/30Hz 间循环切换并立即持久化。
  * 触屏同样可用：点任意档位按钮直接切换，点清除行直接清零并关闭。
  * ============================================================ */
-#define MENU_H 152
+#define MENU_H 164 /* 内边距16 + 把手8+4 + 标题区38+4 + 清除38+4 + 说明14+4 + 档位行34 */
 #define MENU_FOCUS_CNT 2 /* 0=清除行，1=刷新率行 */
 static lv_obj_t *s_menu = NULL;
 static bool s_menu_open = false;
+static bool s_menu_animating = false; /**< 滑板升降动画进行中（防重入） */
 static int s_focus = 0;
 static lv_obj_t *s_clear_btn = NULL;
 static lv_obj_t *s_rate_row = NULL;
@@ -357,13 +358,56 @@ static void menu_rate_refresh(void)
     }
 }
 
-/** 关闭快速菜单（位置按当前分辨率沉到屏外；横屏 y=240 / 竖屏 y=284） */
+/** 关闭快速菜单（滑板下沉动画；位置按当前分辨率沉到屏外） */
+static void menu_close(void); /* 前向声明：手势回调先于定义使用 */
+
+static void anim_menu_y(void *var, int32_t v)
+{
+    lv_obj_set_y((lv_obj_t *)var, v);
+}
+
+static void menu_close_done(lv_anim_t *a)
+{
+    (void)a;
+    lv_obj_set_hidden(s_menu, true);
+    s_menu_animating = false;
+    s_menu_open = false;
+}
+
+static void menu_open_done(lv_anim_t *a)
+{
+    (void)a;
+    s_menu_animating = false;
+    s_menu_open = true;
+}
+
+/** 测量页滑动：底部上滑出快速菜单 / 下滑关闭（由 ui_nav indev 级滑动识别调用） */
+void screen_measure_swipe_cb(lv_dir_t dir)
+{
+    if (dir == LV_DIR_TOP) {
+        screen_measure_open_menu();
+    } else if (dir == LV_DIR_BOTTOM) {
+        menu_close();
+    }
+}
+
 static void menu_close(void)
 {
+    if (s_menu == NULL || (!s_menu_open && !s_menu_animating)) {
+        return;
+    }
     measure_geom_t g = measure_geom();
-    lv_obj_set_hidden(s_menu, true);
-    lv_obj_set_pos(s_menu, 0, g.h);
     s_menu_open = false;
+    s_menu_animating = true;
+    lv_anim_t anim;
+    lv_anim_init(&anim);
+    lv_anim_set_var(&anim, s_menu);
+    lv_anim_set_values(&anim, g.h - MENU_H, g.h); /* 沉回屏外 */
+    lv_anim_set_duration(&anim, 180);
+    lv_anim_set_path_cb(&anim, lv_anim_path_ease_in);
+    lv_anim_set_exec_cb(&anim, anim_menu_y);
+    lv_anim_set_completed_cb(&anim, menu_close_done);
+    lv_anim_start(&anim);
 }
 
 /** 清零动作（触屏/按键共用）：执行 + 提示音 + 自动关闭菜单 */
@@ -436,6 +480,22 @@ static void create_quick_menu(lv_obj_t *tile)
     lv_obj_set_flex_flow(s_menu, LV_FLEX_FLOW_COLUMN);
     lv_obj_set_hidden(s_menu, true);
 
+    /* 顶部拖拽把手（视觉可滑提示，居中 36x4 圆条） */
+    lv_obj_t *handle_row = lv_obj_create(s_menu);
+    lv_obj_remove_style_all(handle_row);
+    lv_obj_set_size(handle_row, LV_PCT(100), 8);
+    lv_obj_set_scrollable(handle_row, false);
+    lv_obj_set_flex_flow(handle_row, LV_FLEX_FLOW_ROW);
+    lv_obj_set_flex_align(handle_row, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER,
+                          LV_FLEX_ALIGN_CENTER);
+    lv_obj_t *handle = lv_obj_create(handle_row);
+    lv_obj_remove_style_all(handle);
+    lv_obj_set_size(handle, 36, 4);
+    lv_obj_set_style_bg_color(handle, COL_BORDER, 0);
+    lv_obj_set_style_bg_opa(handle, LV_OPA_COVER, 0);
+    lv_obj_set_style_radius(handle, LV_RADIUS_CIRCLE, 0);
+    lv_obj_set_clickable(handle, false);
+
     /* 标题区：标题与按键提示分两行，避免窄屏（竖屏 240 宽）同行溢出重叠 */
     lv_obj_t *hdr = lv_obj_create(s_menu);
     lv_obj_remove_style_all(hdr);
@@ -488,7 +548,7 @@ static void create_quick_menu(lv_obj_t *tile)
 
 void screen_measure_open_menu(void)
 {
-    if (s_menu == NULL) {
+    if (s_menu == NULL || s_menu_open || s_menu_animating) {
         return;
     }
     measure_geom_t g = measure_geom();
@@ -496,10 +556,17 @@ void screen_measure_open_menu(void)
     menu_rate_refresh();
     menu_focus_refresh();
     lv_obj_set_hidden(s_menu, false);
-    lv_obj_set_pos(s_menu, 0, g.h - MENU_H); /* 自底部升起：横 92 / 竖 136 */
-    s_menu_open = true;
-    /* 按键反馈音由 ui_nav_handle_key 统一播放，触屏路径（screen_wave 风格手势
-     * 不会走到这里）无需本处再响——避免双响。 */
+    s_menu_animating = true;
+    lv_anim_t anim;
+    lv_anim_init(&anim);
+    lv_anim_set_var(&anim, s_menu);
+    lv_anim_set_values(&anim, g.h, g.h - MENU_H); /* 自底部升起 */
+    lv_anim_set_duration(&anim, 220);
+    lv_anim_set_path_cb(&anim, lv_anim_path_ease_out);
+    lv_anim_set_exec_cb(&anim, anim_menu_y);
+    lv_anim_set_completed_cb(&anim, menu_open_done);
+    lv_anim_start(&anim);
+    /* 按键反馈音由 ui_nav_handle_key 统一播放，触屏路径无需本处再响。 */
 }
 
 bool screen_measure_menu_is_open(void)

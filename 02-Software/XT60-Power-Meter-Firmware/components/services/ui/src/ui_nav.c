@@ -205,6 +205,95 @@ static void update_dots(void)
     }
 }
 
+/* ---- 垂直/水平滑动识别（indev 级 PRESSED/RELEASED 自测向量）----
+ * LVGL 的 LV_EVENT_GESTURE 不可靠：indev_gesture() 里 scroll_obj 非空即
+ * return（被 tileview 滚动抑制），且要求瞬时速度 ≥ gesture_min_velocity，
+ * 慢速上下滑永远收不到——实机"上滑/下滑无反应"根因。
+ * 改为按下记起点、抬起算总位移：垂直为主 → 报上下滑（快速菜单）；
+ * 水平为主且越过阈值、当前在端页且方向朝外 → 环形翻页（替代原
+ * LV_EVENT_SCROLL 内 hack——vect 是单帧增量，抖动/弹性期符号随机，
+ * 造成"轻滑跳第三页、甩动跳回第一页"误环回）。 */
+#define SWIPE_MIN_DIST 30   /**< 垂直判定最小位移（px） */
+#define WRAP_MIN_DIST 60    /**< 水平环回最小位移（px，≈20% 页宽） */
+static lv_point_t s_swipe_start;
+static bool s_swipe_valid = false;
+
+static void goto_page(ui_page_t page); /* 前向声明 */
+
+/**
+ * @brief 环形翻页的异步执行体（延迟到下一帧）
+ *
+ * 为什么不能在 indev RELEASED 回调里直接翻页：
+ *   用户在端页朝外滑时，tileview 被拖出边界（scroll_x 为负/超宽），
+ *   松手瞬间 LVGL 的 indev 释放逻辑会启动**弹性回弹动画**把 scroll_x
+ *   拉回合法范围。若此时在回调里直接 lv_obj_scroll_to_view/scroll_to_x，
+ *   我们设置的目标位置会被紧随其后的回弹动画覆盖——表现为"端页朝外
+ *   滑没反应"（环形翻页失效）。
+ *   用 lv_async_call 把翻页推到下一帧：此时 indev 事件派发已结束，
+ *   弹性回弹要么已完成、要么被我们的 scroll_to_x 直接接管（同时设置
+ *   scroll_x 会中止正在进行的滚动动画）。
+ */
+static void wrap_goto_async(void *arg)
+{
+    ui_page_t page = (ui_page_t)(intptr_t)arg;
+    if (s_tileview == NULL || page < 0 || page >= UI_PAGE_MAX) {
+        return;
+    }
+    /* 直接操作 tileview 的水平滚动：比 scroll_to_view 更直接，
+     * 不会被子对象位置计算干扰；LV_ANIM_ON 让翻页有过渡动画。 */
+    int32_t w = lv_obj_get_width(s_tileview);
+    if (w > 0) {
+        lv_obj_scroll_to_x(s_tileview, (int32_t)page * w, LV_ANIM_ON);
+    }
+}
+
+static void indev_swipe_event_cb(lv_event_t *e)
+{
+    /* ⚠ indev 事件的 target 就是 lv_indev_t*（lv_indev_send_event →
+     * lv_event_push_and_send(&indev->event_list, code, indev, param)），
+     * param 反而是被按下的对象。取错来源会把对象指针当 indev 解析、
+     * lv_indev_get_type() 读垃圾值提前 return，整个滑动识别静默失效
+     * （2026-10 实机"上滑下滑无反应 + 环形翻页失效"根因）。 */
+    lv_indev_t *indev = (lv_indev_t *)lv_event_get_target(e);
+    if (indev == NULL || lv_indev_get_type(indev) != LV_INDEV_TYPE_POINTER) {
+        return;
+    }
+    lv_event_code_t code = lv_event_get_code(e);
+    if (code == LV_EVENT_PRESSED) {
+        lv_indev_get_point(indev, &s_swipe_start);
+        s_swipe_valid = true;
+    } else if (code == LV_EVENT_RELEASED && s_swipe_valid) {
+        s_swipe_valid = false;
+        lv_point_t p;
+        lv_indev_get_point(indev, &p);
+        int32_t dx = p.x - s_swipe_start.x;
+        int32_t dy = p.y - s_swipe_start.y;
+
+        /* 垂直为主：上下滑 → 快速菜单（测量页/波形页都支持）。
+         * 菜单开/关走各自的动画，不需要延迟（不涉及 tileview 滚动冲突）。 */
+        if (LV_ABS(dy) >= SWIPE_MIN_DIST && LV_ABS(dy) > LV_ABS(dx)) {
+            lv_dir_t dir = (dy < 0) ? LV_DIR_TOP : LV_DIR_BOTTOM;
+            if (s_current == UI_PAGE_MEASURE) {
+                screen_measure_swipe_cb(dir);
+            } else if (s_current == UI_PAGE_WAVE) {
+                screen_wave_swipe_cb(dir);
+            }
+            return;
+        }
+
+        /* 水平为主且越阈值：仅端页朝外滑时环形翻页（中间页交给 tileview）。
+         * 延迟到下一帧执行，避免与 tileview 弹性回弹冲突（见 wrap_goto_async）。 */
+        if (LV_ABS(dx) >= WRAP_MIN_DIST && LV_ABS(dx) > LV_ABS(dy)) {
+            if (s_current == UI_PAGE_MEASURE && dx > 0) {
+                lv_async_call(wrap_goto_async, (void *)(intptr_t)UI_PAGE_SETTINGS);
+            } else if (s_current == UI_PAGE_SETTINGS && dx < 0) {
+                lv_async_call(wrap_goto_async, (void *)(intptr_t)UI_PAGE_MEASURE);
+            }
+        }
+    }
+}
+
+/** tileview 滚动跟踪当前页（不再做环回——环回由 indev_swipe_event_cb 负责） */
 static void scroll_event_cb(lv_event_t *e)
 {
     lv_obj_t *tv = lv_event_get_target(e);
@@ -327,6 +416,20 @@ void ui_nav_build(void)
     create_topbar(scr);
     update_dots();
 
+    /* indev 级滑动识别（垂直=快速菜单 / 端页水平=环形翻页）。
+     * indev 生命周期与三页无关，只注册一次。 */
+    static bool s_swipe_hooked = false;
+    if (!s_swipe_hooked) {
+        lv_indev_t *indev = NULL;
+        while ((indev = lv_indev_get_next(indev)) != NULL) {
+            if (lv_indev_get_type(indev) == LV_INDEV_TYPE_POINTER) {
+                lv_indev_add_event_cb(indev, indev_swipe_event_cb, LV_EVENT_PRESSED, NULL);
+                lv_indev_add_event_cb(indev, indev_swipe_event_cb, LV_EVENT_RELEASED, NULL);
+                s_swipe_hooked = true;
+            }
+        }
+    }
+
     /* 旋转（分辨率变化）后按新分辨率重建三页：display 生命周期与三页无关，
      * 此回调只注册一次（重建的是 tileview，不是 display）。 */
     lv_display_t *disp = lv_display_get_default();
@@ -378,17 +481,14 @@ void ui_nav_handle_key(button_id_t id, button_event_t ev)
     } else if (screen_wave_menu_is_open() && screen_wave_menu_key(id, ev)) {
         handled = true;
     } else if (ev == BUTTON_EVENT_SINGLE_CLICK) {
-            if (id == BUTTON_ID_BOOT) {
-                if (s_current > UI_PAGE_MEASURE) {
-                    goto_page((ui_page_t)(s_current - 1));
-                }
-            } else {
-                if (s_current < UI_PAGE_SETTINGS) {
-                    goto_page((ui_page_t)(s_current + 1));
-                }
-            }
-            handled = true;
-        } else if (ev == BUTTON_EVENT_LONG_PRESS_START) {
+        /* 按键翻页循环（三页环形）：K1 从首页环到设置页，K2 从设置页环回 */
+        if (id == BUTTON_ID_BOOT) {
+            goto_page((ui_page_t)((s_current - 1 + UI_PAGE_MAX) % UI_PAGE_MAX));
+        } else {
+            goto_page((ui_page_t)((s_current + 1) % UI_PAGE_MAX));
+        }
+        handled = true;
+    } else if (ev == BUTTON_EVENT_LONG_PRESS_START) {
         if (s_current == UI_PAGE_MEASURE && id == BUTTON_ID_USER) {
             screen_measure_open_menu();
             handled = true;

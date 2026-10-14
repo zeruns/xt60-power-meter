@@ -30,10 +30,11 @@
 #define COLOR_BAR_BG  lv_color_hex(0xE3E7EC)
 
 /** 加载条宽度占比（相对屏宽）、高度 */
-#define BAR_WIDTH_PCT 55
+#define BAR_WIDTH_PCT 80
 #define BAR_H 6
 
 static lv_obj_t *s_bar = NULL;
+static lv_obj_t *s_progress_lbl = NULL;  /**< 进度条下方的阶段文字 */
 
 static lv_obj_t *make_label(lv_obj_t *parent, const char *text, const lv_font_t *font,
                             lv_color_t color)
@@ -91,7 +92,7 @@ void splash_build(lv_obj_t *scr)
     lv_snprintf(ver_text, sizeof(ver_text), "固件版本 v%s", esp_app_get_description()->version);
     make_label(cont, ver_text, lvgl_port_get_font(LVGL_PORT_FONT_14), COLOR_VER);
 
-    /* ③ 加载条：列内最后一项（宽 = 屏宽 55%，高 6px，圆角胶囊） */
+    /* ③ 加载条：列内最后一项（宽 = 屏宽 80%，高 6px，圆角胶囊） */
     s_bar = lv_bar_create(cont);
     lv_obj_set_size(s_bar, w * BAR_WIDTH_PCT / 100, BAR_H);
     lv_bar_set_range(s_bar, 0, 100);
@@ -104,6 +105,16 @@ void splash_build(lv_obj_t *scr)
     lv_obj_set_style_bg_opa(s_bar, LV_OPA_COVER, LV_PART_INDICATOR);
     lv_obj_set_style_radius(s_bar, 3, LV_PART_INDICATOR);
     lv_obj_set_scrollable(s_bar, false);
+
+    /* ④ 进度条下方的阶段文字（14px 浅灰，居中，单行）。
+     * 初始为空，由 ui.c 在启动各阶段调用 splash_set_progress_text() 更新。 */
+    s_progress_lbl = lv_label_create(cont);
+    lv_label_set_text(s_progress_lbl, "");
+    lv_obj_set_style_text_font(s_progress_lbl, lvgl_port_get_font(LVGL_PORT_FONT_14), 0);
+    lv_obj_set_style_text_color(s_progress_lbl, COLOR_SUB, 0);
+    lv_obj_set_width(s_progress_lbl, w * 90 / 100);
+    lv_obj_set_style_text_align(s_progress_lbl, LV_TEXT_ALIGN_CENTER, 0);
+    lv_obj_set_style_pad_top(s_progress_lbl, 6, 0);
 }
 
 void splash_set_progress(uint32_t pct)
@@ -113,5 +124,12 @@ void splash_set_progress(uint32_t pct)
             pct = 100;
         }
         lv_bar_set_value(s_bar, (int32_t)pct, LV_ANIM_OFF);
+    }
+}
+
+void splash_set_progress_text(const char *text)
+{
+    if (s_progress_lbl != NULL) {
+        lv_label_set_text(s_progress_lbl, (text != NULL) ? text : "");
     }
 }

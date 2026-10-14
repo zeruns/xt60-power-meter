@@ -436,6 +436,7 @@ void sim_run_scenes(void)
     /* ---- 01 启动页（横屏）---- */
     splash_build(lv_screen_active());
     splash_set_progress(45);
+    splash_set_progress_text("正在初始化传感器…");
     shot("01_splash");
 
     /* ---- 01b 启动页（竖屏）：验证进度条居中、不与版本行冲突 ---- */
@@ -444,6 +445,7 @@ void sim_run_scenes(void)
     sim_step(100);
     splash_build(lv_screen_active());
     splash_set_progress(45);
+    splash_set_progress_text("正在初始化传感器…");
     shot("01b_splash_90");
     lv_obj_clean(lv_screen_active());
     lvgl_port_set_rotation_angle(0);

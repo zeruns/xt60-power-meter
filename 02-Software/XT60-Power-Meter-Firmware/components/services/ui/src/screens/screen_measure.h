@@ -28,6 +28,13 @@ void screen_measure_refresh(const data_store_snapshot_t *snap);
 void screen_measure_open_menu(void);
 
 /**
+ * @brief 测量页滑动处理（ui_nav indev 级滑动识别调用）
+ *
+ * 上滑（LV_DIR_TOP）出快速菜单，下滑（LV_DIR_BOTTOM）关闭。
+ */
+void screen_measure_swipe_cb(lv_dir_t dir);
+
+/**
  * @brief 快速菜单是否处于打开状态
  */
 bool screen_measure_menu_is_open(void);

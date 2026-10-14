@@ -29,6 +29,7 @@
 #include "lcd_nv3030b.h"
 #include "lvgl.h"
 #include "settings.h"
+#include "system_state.h"
 
 #include "lvgl_port.h"
 #include "screens/screen_measure.h"
@@ -145,6 +146,30 @@ static void drain_key_queue(void)
 }
 
 /**
+ * @brief 启动故障弹窗"确定"按钮回调：设置应答标志，让 UI 任务继续构建主界面
+ *
+ * 运行在 LVGL 任务（taskLVGL）上下文，通过 user_data 拿到 UI 任务的
+ * volatile bool 标志地址。UI 任务在 while 循环里轮询该标志。
+ */
+static void splash_error_ok_cb(lv_event_t *e)
+{
+    volatile bool *ack = (volatile bool *)lv_event_get_user_data(e);
+    if (ack != NULL) {
+        *ack = true;
+    }
+    /* 显式关闭 msgbox：LVGL footer 按钮的内建关闭行为在某些版本不可靠，
+     * 这里双保险确保对话框消失。 */
+    lv_obj_t *btn = lv_event_get_target(e);
+    lv_obj_t *o = btn;
+    while (o != NULL && !lv_obj_check_type(o, &lv_msgbox_class)) {
+        o = lv_obj_get_parent(o);
+    }
+    if (o != NULL) {
+        lv_msgbox_close(o);
+    }
+}
+
+/**
  * @brief 打开背光：优先应用用户已保存的亮度（设置页可调），无效时用出厂默认
  *
  * 亮度值来自 NVS（settings 服务），因此"用户上次调好的亮度"在每次开机都生效。
@@ -185,10 +210,19 @@ static void task_ui(void *arg)
     }
     ESP_LOGI(TAG, "首页数据刷新率：%u Hz", (unsigned)s_rate_hz);
 
-    /* ---- ① 启动画面：边跑 handler 边计时（停留期间必须持续渲染） ---- */
+    /* ---- ① 启动画面：边跑 handler 边计时（停留期间必须持续渲染） ----
+     *
+     * 进度文字按 4 个阶段切换（总时长 UI_SPLASH_HOLD_MS=1800ms）：
+     *   0~30%   正在初始化系统…
+     *   30~60%  正在加载字库…
+     *   60~90%  正在初始化传感器…
+     *   90~100% 正在准备界面…
+     * 注：真实初始化在 app_init 阶段已完成，此处文字用于向用户传达启动阶段感。
+     */
     bool backlight_on = false;
     if (lvgl_port_lock(UI_BUILD_LOCK_TIMEOUT_MS)) {
         splash_build(lv_screen_active());
+        splash_set_progress_text("正在初始化系统…");
         lvgl_port_unlock();
     } else {
         ESP_LOGE(TAG, "构建启动画面时获取 LVGL 锁失败");
@@ -198,7 +232,18 @@ static void task_ui(void *arg)
     uint32_t elapsed_ms = 0;
     while (elapsed_ms < UI_SPLASH_HOLD_MS) {
         if (lvgl_port_lock(UI_HANDLER_WAIT_MAX_MS)) {
-            splash_set_progress(elapsed_ms * 100u / UI_SPLASH_HOLD_MS);
+            uint32_t pct = elapsed_ms * 100u / UI_SPLASH_HOLD_MS;
+            splash_set_progress(pct);
+            /* 按进度切换阶段文字（只在跨越阶段边界时更新，避免每帧刷 label） */
+            if (pct < 30) {
+                splash_set_progress_text("正在初始化系统…");
+            } else if (pct < 60) {
+                splash_set_progress_text("正在加载字库…");
+            } else if (pct < 90) {
+                splash_set_progress_text("正在初始化传感器…");
+            } else {
+                splash_set_progress_text("正在准备界面…");
+            }
             lvgl_port_unlock();
         }
         /* 首帧真正上屏后才打开背光：避免开机先看到黑屏/局部条带（见 lcd 驱动注释） */
@@ -214,6 +259,57 @@ static void task_ui(void *arg)
         apply_backlight();
         backlight_on = true;
         ESP_LOGW(TAG, "启动画面期间未检测到上屏完成，强制打开背光");
+    }
+
+    /* ---- ①.5 启动故障提示 ----
+     * 进度条跑完后检查系统故障位：若有外设初始化失败（降级），弹窗告知用户
+     * 哪些功能不可用，点"确定"后再进入主界面；无故障则直接进入。
+     * 关键故障（ADC/INFRA）时 app_init 已返回 ESP_FAIL，但 UI 任务仍会启动，
+     * 此时弹窗同样能把故障信息呈现给用户。 */
+    uint32_t fault_mask = system_state_get_fault_mask();
+    if (fault_mask != 0) {
+        static volatile bool s_error_ack = false;
+        s_error_ack = false;
+
+        char fault_str[96];
+        system_state_fault_to_str(fault_mask, fault_str, sizeof(fault_str));
+        char msg[160];
+        snprintf(msg, sizeof(msg),
+                 "以下外设初始化失败，\n对应功能将不可用：\n\n%s", fault_str);
+        ESP_LOGW(TAG, "启动存在故障：%s", fault_str);
+
+        if (lvgl_port_lock(UI_BUILD_LOCK_TIMEOUT_MS)) {
+            lv_obj_t *box = lv_msgbox_create(NULL);
+            lv_msgbox_add_title(box, "启动提示");
+            lv_msgbox_add_text(box, msg);
+            lv_obj_set_width(box, 250);
+            /* 中文字体 */
+            lv_obj_t *ttl = lv_msgbox_get_title(box);
+            if (ttl != NULL) {
+                lv_obj_set_style_text_font(ttl, lvgl_port_get_font_bold(LVGL_PORT_FONT_16), 0);
+            }
+            lv_obj_t *content = lv_msgbox_get_content(box);
+            if (content != NULL) {
+                for (uint32_t i = 0; i < lv_obj_get_child_count(content); i++) {
+                    lv_obj_set_style_text_font(lv_obj_get_child(content, i),
+                                               lvgl_port_get_font(LVGL_PORT_FONT_14), 0);
+                }
+            }
+            lv_obj_t *ok = lv_msgbox_add_footer_button(box, "确定");
+            lv_obj_set_style_text_font(lv_obj_get_child(ok, 0),
+                                       lvgl_port_get_font(LVGL_PORT_FONT_14), 0);
+            lv_obj_center(box);
+            /* 确定按钮回调：设置应答标志（运行在 LVGL 任务上下文） */
+            lv_obj_add_event_cb(ok, splash_error_ok_cb, LV_EVENT_CLICKED,
+                                (void *)&s_error_ack);
+            lvgl_port_unlock();
+        }
+
+        /* 等待用户点"确定"：UI 任务挂起，LVGL 任务（taskLVGL）继续跑渲染
+         * 与处理按钮事件。20ms 轮询，对功耗/响应无感知影响。 */
+        while (!s_error_ack) {
+            vTaskDelay(pdMS_TO_TICKS(20));
+        }
     }
 
     /* ---- ② 构建主界面三页 ---- */
