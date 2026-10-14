@@ -55,12 +55,12 @@
 #include "power_measure.h"
 #include "settings.h"
 
-/* ---- 色板（与测量页/波形页同一语义；后续 U1 任务统一抽 ui_theme.h） ---- */
+/* ---- 色板（与测量页/波形页同一语义色） ---- */
 #define COL_PRIMARY  lv_color_hex(0x0066CC)
 #define COL_INK      lv_color_hex(0x1A1A1A)
 #define COL_GRAY     lv_color_hex(0x6B7280)
-#define COL_BORDER   lv_color_hex(0xE3E7EC)
-#define COL_CARD_BG  lv_color_hex(0xF7F9FC)
+#define COL_BORDER   lv_color_hex(0xB4BEC9) /* 控件边框：边界清晰（原 #E3E7EC 过浅） */
+#define COL_CARD_BG  lv_color_hex(0xF1F4F8) /* 卡片底：与白底拉开可辨差异 */
 #define COL_PRESSED  lv_color_hex(0xE8F0FE)
 #define COL_OK       lv_color_hex(0x1E9E4F)
 #define COL_DANGER   lv_color_hex(0xD0392B)
@@ -593,6 +593,27 @@ static void calib_apply_cb(lv_event_t *e)
     lv_timer_create(close_timer_cb, 1400, NULL);
 }
 
+/**
+ * @brief 电流零点一键清零（空载校零）
+ *
+ * 输出空载时点击：把电流零偏 offset 调到「抵消当前读数」的位置，
+ * 使显示立即归零。物理量 = raw×gain + offset，故
+ *   offset_new = offset_old − 当前读数
+ * 之后再施加负载，读数即从 0 起算（消除前端零点漂移）。
+ */
+static void calib_zero_cb(lv_event_t *e)
+{
+    (void)e;
+    power_measure_calib_t cal;
+    power_measure_get_calibration(&cal);
+    cal.current_offset -= s_last_snap.current_a;
+    if (power_measure_set_calibration(&cal) != ESP_OK) {
+        show_notice("清零失败", "参数保存失败，请重试。");
+        return;
+    }
+    show_notice("已清零", "电流零点已校准。\n（空载读数归零）");
+}
+
 /** @brief 校准编辑界面（标准值输入） */
 static void calib_ui_enter(void)
 {
@@ -645,6 +666,12 @@ static void calib_ui_enter(void)
     snprintf(step_buf, sizeof(step_buf), "步长 %.3f", (double)s_cal_steps[s_cal_step_idx]);
     lv_obj_t *step = plain_button(c, step_buf, LV_PCT(60), 30);
     lv_obj_add_event_cb(step, calib_step_cycle_cb, LV_EVENT_CLICKED, NULL);
+
+    /* 电流通道：一键清零（空载校零，输出空载时抵消当前读数） */
+    if (!s_cal_is_voltage) {
+        lv_obj_t *zero = plain_button(c, "一键清零（空载）", LV_PCT(100), 36);
+        lv_obj_add_event_cb(zero, calib_zero_cb, LV_EVENT_CLICKED, NULL);
+    }
 
     /* 应用 */
     lv_obj_t *apply = plain_button(c, "应用校准", LV_PCT(100), 40);
@@ -775,6 +802,23 @@ static void display_open_cb(void)
     lv_obj_set_style_margin_top(auto_row, 8, 0);
     plain_label(auto_row, "自动旋转（随握持方向）", LVGL_PORT_FONT_16, COL_INK, false);
     s_auto_switch = lv_switch_create(auto_row);
+    /* 开关样式自定义：关闭态轨道 #B4BEC9、开启轨道品牌蓝。
+     * ⚠ 旋钮必须加边框：纯白旋钮在白底卡片上会与背景融为一体（实拍
+     * 关闭态时只见右半灰色轨道、左半旋钮"消失"）。加 1px 同色边框
+     * 后，旋钮轮廓在任何背景上都清晰可辨。 */
+    lv_obj_set_size(s_auto_switch, 46, 24);
+    lv_obj_set_style_bg_color(s_auto_switch, COL_BORDER, 0);
+    lv_obj_set_style_bg_opa(s_auto_switch, LV_OPA_COVER, 0);
+    lv_obj_set_style_bg_color(s_auto_switch, COL_PRIMARY, LV_STATE_CHECKED);
+    lv_obj_set_style_bg_opa(s_auto_switch, LV_OPA_COVER, LV_STATE_CHECKED);
+    lv_obj_set_style_bg_color(s_auto_switch, lv_color_white(), LV_PART_KNOB);
+    lv_obj_set_style_bg_opa(s_auto_switch, LV_OPA_COVER, LV_PART_KNOB);
+    /* 旋钮边框用深灰（#6B7280）而非轨道同色：#B4BEC9 在白底上仍偏浅，
+     * 深灰 2px 轮廓让白色旋钮在任何背景上都一眼可辨。 */
+    lv_obj_set_style_border_color(s_auto_switch, COL_GRAY, LV_PART_KNOB);
+    lv_obj_set_style_border_width(s_auto_switch, 1, LV_PART_KNOB);
+    lv_obj_set_style_pad_all(s_auto_switch, 3, LV_PART_KNOB);
+    lv_obj_set_style_radius(s_auto_switch, LV_RADIUS_CIRCLE, LV_PART_KNOB);
     if (settings_get(&cfg) == ESP_OK && cfg.orientation_auto) {
         lv_obj_add_state(s_auto_switch, LV_STATE_CHECKED);
     }
@@ -884,7 +928,8 @@ static void wifi_open_cb(void)
 {
     lv_obj_t *c = subpage_open(SUB_WIFI, "WiFi 与热点");
 
-    lv_obj_t *icon = plain_label(c, LV_SYMBOL_WIFI, LVGL_PORT_FONT_32, COL_PRIMARY, false);
+    /* 图标 24px：32px 时整页超出可视区约 8px，底部提示行被截断（实拍 f05） */
+    lv_obj_t *icon = plain_label(c, LV_SYMBOL_WIFI, LVGL_PORT_FONT_24, COL_PRIMARY, false);
     (void)icon;
 
     lv_obj_t *main_txt = plain_label(c, "联网功能计划于 v0.5.0 提供", LVGL_PORT_FONT_16, COL_INK,
@@ -893,7 +938,7 @@ static void wifi_open_cb(void)
 
     lv_obj_t *list = plain_label(c,
                                  "届时将包含：\n"
-                                 "· 自托管 Web 控制台（手机浏览器实时查看）\n"
+                                 "· 自托管 Web 控制台\n"
                                  "· 历史数据记录与 CSV 导出\n"
                                  "· OTA 固件在线升级",
                                  LVGL_PORT_FONT_14, COL_INK, false);
@@ -901,11 +946,11 @@ static void wifi_open_cb(void)
     lv_label_set_long_mode(list, LV_LABEL_LONG_WRAP);
     lv_obj_set_style_pad_left(list, 6, 0);
 
-    lv_obj_t *note = plain_label(c, "当前版本请直接通过屏幕本体查看数据。", LVGL_PORT_FONT_12,
+    /* 短句一屏放下（原长句折行把底部提示挤出可视区，实拍 f05 底部截断） */
+    lv_obj_t *note = plain_label(c, "当前版本请通过屏幕本体查看数据。", LVGL_PORT_FONT_12,
                                  COL_GRAY, false);
     lv_obj_set_width(note, LV_PCT(100));
     lv_label_set_long_mode(note, LV_LABEL_LONG_WRAP);
-    lv_obj_set_style_margin_top(note, 8, 0);
 }
 
 /* ============================================================
@@ -1005,7 +1050,11 @@ static lv_obj_t *make_cell_dispatch(lv_obj_t *row, const char *icon, const char 
     lv_obj_set_flex_align(btn, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
     lv_obj_set_style_pad_column(btn, 8, 0);
 
-    plain_label(btn, icon, LVGL_PORT_FONT_20, COL_PRIMARY, false);
+    /* 图标与文字同字号（16px），但图标符号来自 montserrat14 fallback，
+     * 字形 box_h/ofs_y 与 Noto 主字体不同，同基线下图标比文字**低约 1.3px**
+     * （3x 截图像素实测 1.2~1.3px）。translate_y -1 补偿后视觉中心对齐。 */
+    lv_obj_t *icon_lbl = plain_label(btn, icon, LVGL_PORT_FONT_16, COL_PRIMARY, false);
+    lv_obj_set_style_translate_y(icon_lbl, -1, 0);
     plain_label(btn, name, LVGL_PORT_FONT_16, COL_INK, false);
 
     lv_obj_add_event_cb(btn, cell_clicked_cb, LV_EVENT_CLICKED, (void *)cb);

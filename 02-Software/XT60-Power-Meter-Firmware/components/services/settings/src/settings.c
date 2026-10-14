@@ -30,6 +30,7 @@ static const char *TAG = "settings";
 #define SETTINGS_KEY_DISPLAY_RATE "rate_hz"
 #define SETTINGS_KEY_ORIENT_AUTO "orient_a"
 #define SETTINGS_KEY_ORIENT_ANG "orient_d"
+#define SETTINGS_KEY_WAVE_SMOOTH "wave_smt"
 
 /** 防抖时长（毫秒）：最后一次修改后静默这么久才真正写 Flash */
 #define SETTINGS_SAVE_DELAY_MS     1500
@@ -81,6 +82,7 @@ static void load_defaults(settings_t *cfg)
     cfg->display_rate_hz = 5; /* 5Hz：40Hz 快拍源上取 8 帧窗口平均，稳与快的折中 */
     cfg->orientation_auto = 0;   /* 出厂手动方向（横屏 0°），避免开机乱转 */
     cfg->orientation_angle = 0;  /* 默认横屏 */
+    cfg->wave_smooth = 0; /* 波形曲线平滑默认关（忠实反映原始趋势） */
 }
 
 /**
@@ -168,6 +170,12 @@ static void load_from_nvs(void)
     ESP_LOGI(TAG, "已载入屏幕方向：自动=%u，角度=%u°", (unsigned)s_cache.orientation_auto,
              (unsigned)s_cache.orientation_angle);
 
+    /* ---- 波形曲线平滑 ---- */
+    uint8_t smooth = 0;
+    if (nvs_get_u8(handle, SETTINGS_KEY_WAVE_SMOOTH, &smooth) == ESP_OK) {
+        s_cache.wave_smooth = smooth ? 1u : 0u;
+    }
+
     nvs_close(handle);
 }
 
@@ -195,6 +203,9 @@ static esp_err_t persist_cache(void)
     }
     if (err == ESP_OK) {
         err = nvs_set_u16(handle, SETTINGS_KEY_ORIENT_ANG, s_cache.orientation_angle);
+    }
+    if (err == ESP_OK) {
+        err = nvs_set_u8(handle, SETTINGS_KEY_WAVE_SMOOTH, s_cache.wave_smooth);
     }
     if (err == ESP_OK) {
         /* nvs_set_xxx 只是写入 RAM 中的 NVS 页缓存，
@@ -377,6 +388,21 @@ esp_err_t settings_set_orientation(uint8_t auto_on, uint16_t angle)
     portENTER_CRITICAL(&s_lock);
     s_cache.orientation_auto = auto_on ? 1u : 0u;
     s_cache.orientation_angle = angle;
+    portEXIT_CRITICAL(&s_lock);
+
+    mark_dirty_and_schedule();
+
+    return ESP_OK;
+}
+
+esp_err_t settings_set_wave_smooth(uint8_t on)
+{
+    if (!s_ready) {
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    portENTER_CRITICAL(&s_lock);
+    s_cache.wave_smooth = on ? 1u : 0u;
     portEXIT_CRITICAL(&s_lock);
 
     mark_dirty_and_schedule();

@@ -19,6 +19,7 @@ static settings_t s_cache = {
     .display_rate_hz = 5,
     .orientation_auto = 0,
     .orientation_angle = 0,
+    .wave_smooth = 0,
 };
 static bool s_ready = false;
 
@@ -87,5 +88,11 @@ esp_err_t settings_set_orientation(uint8_t auto_on, uint16_t angle)
 {
     s_cache.orientation_auto = auto_on;
     s_cache.orientation_angle = angle;
+    return ESP_OK;
+}
+
+esp_err_t settings_set_wave_smooth(uint8_t on)
+{
+    s_cache.wave_smooth = on ? 1u : 0u;
     return ESP_OK;
 }

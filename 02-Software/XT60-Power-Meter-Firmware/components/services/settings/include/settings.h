@@ -61,6 +61,7 @@ typedef struct {
     uint8_t display_rate_hz; /**< 首页数据刷新率（1/5/10/20/30 Hz，出厂默认 5） */
     uint8_t orientation_auto; /**< 屏幕是否随重力自动旋转（1=自动，0=手动，出厂默认 0） */
     uint16_t orientation_angle; /**< 手动方向角度（0/90/180/270，默认 0=横屏） */
+    uint8_t wave_smooth; /**< 波形曲线平滑（1=开启，0=关闭，出厂默认 0） */
 } settings_t;
 
 /**
@@ -127,6 +128,13 @@ esp_err_t settings_set_display_rate_hz(uint8_t hz);
  * @param angle   手动方向角度（auto_on=0 时生效；仅接受 0/90/180/270）
  */
 esp_err_t settings_set_orientation(uint8_t auto_on, uint16_t angle);
+
+/**
+ * @brief 设置波形曲线平滑开关
+ * @param on 1=开启平滑，0=关闭（默认）
+ * @return ESP_OK 成功；ESP_ERR_INVALID_STATE 未初始化
+ */
+esp_err_t settings_set_wave_smooth(uint8_t on);
 
 /**
  * @brief 立即把内存缓存写入 NVS（忽略防抖）
