@@ -13,4 +13,10 @@ set(EXTRA_COMPONENT_DIRS
 
 include($ENV{IDF_PATH}/tools/cmake/project.cmake)
 
+# 版本号唯一来源：version.txt（发版时打 git tag 与之对应）。
+# 在 project() 之前定义 PROJECT_VER，ESP-IDF 会将其写入 app_desc（固件版本），
+# 否则会回退到 git describe 或默认值 1。
+file(READ "${CMAKE_CURRENT_LIST_DIR}/version.txt" PROJECT_VER)
+string(STRIP "${PROJECT_VER}" PROJECT_VER)
+
 project(XT60-Power-Meter-Firmware)
