@@ -53,6 +53,12 @@
 #define CHART_VALUE_SCALE 100.0f
 /** 量程上下留白比例：12%（信号占图面约 3/4 高度，波峰波谷不贴边） */
 #define WAVE_RANGE_PAD_FRAC 0.12f
+/** Y 轴格数（hdiv 线数 - 1，与 chart 创建的 lv_chart_set_div_line_count 一致） */
+#define WAVE_Y_DIVS 4
+/** 电压波形每格最小分辨率（V）：防止微小信号被过放大（用户要求 ≥1V/格） */
+#define WAVE_MIN_DIV_V 1.0f
+/** 电流波形每格最小分辨率（A）：防止微小信号被过放大（用户要求 ≥0.1A/格） */
+#define WAVE_MIN_DIV_A 0.1f
 /* 滑板高度：title 20 + row 88 + 平滑行 28+4 + 提示两行 32 + 行距 4×4 +
  * 内边距 20 ≈ 224。旧值 188 是加"曲线平滑"开关行之前的布局。 */
 #define PANEL_H 224
@@ -586,23 +592,45 @@ static void update_axis_range(int n)
      * chart range 与刻度始终一致，峰谷不会顶框。 */
     const float pad_a = (s_range_a_max - s_range_a_min) * WAVE_RANGE_PAD_FRAC;
     const float pad_b = (s_range_b_max - s_range_b_min) * WAVE_RANGE_PAD_FRAC;
+
+    /* 量化量程：每格最小分辨率（电压 ≥1V/格、电流 ≥0.1A/格），
+     * 防止微小信号被自动量程过放大成"全屏巨浪"（用户要求）。
+     * 做法：跨度不足最小跨度时，以信号中心对称扩到最小跨度。 */
+    float range_lo_a = s_range_a_min - pad_a, range_hi_a = s_range_a_max + pad_a;
+    float range_lo_b = s_range_b_min - pad_b, range_hi_b = s_range_b_max + pad_b;
+    const float min_div_a = (d->ch_a == 0) ? WAVE_MIN_DIV_V : WAVE_MIN_DIV_A;
+    const float min_span_a = WAVE_Y_DIVS * min_div_a;
+    if (range_hi_a - range_lo_a < min_span_a) {
+        const float mid = (range_lo_a + range_hi_a) * 0.5f;
+        range_lo_a = mid - min_span_a * 0.5f;
+        range_hi_a = mid + min_span_a * 0.5f;
+    }
+    if (d->has_b) {
+        const float min_div_b = (d->ch_b == 0) ? WAVE_MIN_DIV_V : WAVE_MIN_DIV_A;
+        const float min_span_b = WAVE_Y_DIVS * min_div_b;
+        if (range_hi_b - range_lo_b < min_span_b) {
+            const float mid = (range_lo_b + range_hi_b) * 0.5f;
+            range_lo_b = mid - min_span_b * 0.5f;
+            range_hi_b = mid + min_span_b * 0.5f;
+        }
+    }
     lv_chart_set_axis_range(s_chart, LV_CHART_AXIS_PRIMARY_Y,
-                            (int32_t)((s_range_a_min - pad_a) * CHART_VALUE_SCALE),
-                            (int32_t)((s_range_a_max + pad_a) * CHART_VALUE_SCALE));
+                            (int32_t)(range_lo_a * CHART_VALUE_SCALE),
+                            (int32_t)(range_hi_a * CHART_VALUE_SCALE));
     if (d->has_b) {
         lv_chart_set_axis_range(s_chart, LV_CHART_AXIS_SECONDARY_Y,
-                                (int32_t)((s_range_b_min - pad_b) * CHART_VALUE_SCALE),
-                                (int32_t)((s_range_b_max + pad_b) * CHART_VALUE_SCALE));
+                                (int32_t)(range_lo_b * CHART_VALUE_SCALE),
+                                (int32_t)(range_hi_b * CHART_VALUE_SCALE));
     }
 
-    /* 轴刻度（上/中/下）：与 chart range 一致的留白范围 */
+    /* 轴刻度（上/中/下）：与 chart range 一致（含留白与量化后的范围） */
     char txt[16];
-    const float avals[3] = { s_range_a_max + pad_a,
-                             (s_range_a_min + s_range_a_max) * 0.5f,
-                             s_range_a_min - pad_a };
-    const float bvals[3] = { s_range_b_max + pad_b,
-                             (s_range_b_min + s_range_b_max) * 0.5f,
-                             s_range_b_min - pad_b };
+    const float avals[3] = { range_hi_a,
+                             (range_lo_a + range_hi_a) * 0.5f,
+                             range_lo_a };
+    const float bvals[3] = { range_hi_b,
+                             (range_lo_b + range_hi_b) * 0.5f,
+                             range_lo_b };
     for (int k = 0; k < 3; k++) {
         format_axis(txt, sizeof(txt), d->ch_a, avals[k]);
         lv_label_set_text(s_axis_a[k], txt);
