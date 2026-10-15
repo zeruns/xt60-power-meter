@@ -22,6 +22,26 @@
  *   · **纵轴量程带滞回**：只有当数据超出当前量程、或缩小到不足一半才改量程，
  *     否则量程每帧抖动、曲线上下乱跳（实测 10s 窗量程在 15.6~-21.6 间乱变）；
  *   · 单位/时间/统计行都留了字号与间距，避免截断。
+ *
+ * 进阶机制（2026-10 波形重构，详见各函数注释）：
+ *   · **时间槽桶聚合**：pm_wave_copy 把整窗切成 CHART_MAX_POINTS 个固定时长
+ *     槽，索引即屏幕列、右端=现在。槽宽与采样周期不同步时旧"最近样本+容差"
+ *     方案会约半数槽落空断线，改桶聚合后每槽恒定覆盖 窗长/点数 的时间；
+ *   · **min/max 包络防混叠**：480 槽 > 屏宽 280 像素，多槽挤进同一像素列，
+ *     LVGL 对 LINE 系列自动画 min/max 竖线包络（示波器 peak-detect 同款），
+ *     毛刺尖峰不会因抽稀被丢掉；
+ *   · **1-2-5 标准格值自动量程**（wave_nice_div）：每格取 1/2/5×10ⁿ 标准格值
+ *     （≥1V/格、≥0.1A/格），下边界锚定格值整数倍，5 条格线全部落在整格值
+ *     上，读数可按格数心算；上下留 12% 呼吸空间；
+ *   · **量程滞回 + 收缩防抖**：扩程立即（带 3% 余量防噪声触发）、收缩需连续
+ *     N 帧确认，单帧误判不会让量程在两个值间横跳；
+ *   · **定宽列数据行**（layout_data_cols）：每个测量量占一列，数值右对齐、
+ *     单位固定列右端，数字变宽向左生长，彻底消除"数值左右晃"；
+ *   · **roller 两阶段触控**（s_roller_edit）：点击选中后才允许滑动，防下滑
+ *     关菜单时误改选项；
+ *   · **三页循环滑动**：测量/波形/设置三页由 ui_nav 的 tileview 承载，
+ *     indev 级 LV_EVENT_RELEASED 按「按下记起点、抬起算总位移」判定横/竖滑
+ *     （横滑翻页、竖滑开/关本页设置滑板），本文件提供 screen_wave_swipe_cb。
  */
 #include "screen_wave.h"
 
@@ -43,14 +63,14 @@
 #define COL_I lv_color_hex(0x58A6FF) /* CH2 电流：亮蓝 */
 #define COL_P lv_color_hex(0xF0883E) /* CH3 功率：亮橙 */
 #define COL_E lv_color_hex(0xA371F7) /* CH4 电能：亮紫 */
-#define COL_DARK lv_color_hex(0x1A1A1A)
-#define COL_GRAY lv_color_hex(0x6B7280)
+#define COL_DARK lv_color_hex(0x1A1A1A) /* 近黑文字（白底主文字/装饰点） */
+#define COL_GRAY lv_color_hex(0x6B7280) /* 中灰文字（次级信息：单位/时间轴） */
 #define COL_CARD_BD lv_color_hex(0xB4BEC9) /* 边框：与白底拉开可辨差异 */
-#define COL_PANEL_BG lv_color_hex(0xF1F4F8)
+#define COL_PANEL_BG lv_color_hex(0xF1F4F8) /* 设置滑板浅灰蓝底 */
 #define COL_PRIMARY lv_color_hex(0x0066CC) /* 品牌蓝（与设置页一致，用于开关开启态） */
 
-#define CHART_MAX_POINTS 480
-#define CHART_VALUE_SCALE 100.0f
+#define CHART_MAX_POINTS 480 /**< 图表槽位数＝时间槽数（每槽一列，见文件头） */
+#define CHART_VALUE_SCALE 100.0f /**< 值放大倍数：LVGL 图表只收整数，×100 保留 2 位小数 */
 /** 量程上下留白比例：12%（信号占图面约 3/4 高度，波峰波谷不贴边） */
 #define WAVE_RANGE_PAD_FRAC 0.12f
 /** Y 轴格数（hdiv 线数 - 1，与 chart 创建的 lv_chart_set_div_line_count 一致） */
@@ -68,12 +88,18 @@
  *   电流基于 0.1A：0.1 / 0.2 / 0.5 / 1 / 2 / 5 A…。
  * 格值取标准值、刻度锚定格值整数倍，读数时可直接按格数心算
  * （用户要求"格子都是整数，如 1V、2V、0.1A、0.5A、1A、2A"）。
+ *
+ * @param min_div 期望的最小格值（每格至少要能分辨这么多物理量）
+ * @param is_volt true=电压（序列基值 1V）/ false=电流（基值 0.1A）
+ * @return ≥ min_div 的最小 1-2-5 标准格值
  */
 static float wave_nice_div(float min_div, bool is_volt)
 {
-    const float base = is_volt ? WAVE_MIN_DIV_V : WAVE_MIN_DIV_A;
-    static const float mant[3] = { 1.0f, 2.0f, 5.0f };
+    const float base = is_volt ? WAVE_MIN_DIV_V : WAVE_MIN_DIV_A; /* 序列基值：1V / 0.1A */
+    static const float mant[3] = { 1.0f, 2.0f, 5.0f }; /* 有效数字：1/2/5 */
     float scale = 1.0f;
+    /* 双层循环枚举 1-2-5×10ⁿ 序列：外层升数量级、内层枚举有效数字，
+     * 取第一个 ≥ min_div 的候选即为答案（序列本身递增）。 */
     for (int dec = 0; dec < 5; dec++) {
         for (int m = 0; m < 3; m++) {
             const float cand = base * mant[m] * scale;
@@ -88,8 +114,8 @@ static float wave_nice_div(float min_div, bool is_volt)
 /* 滑板高度：title 20 + row 88 + 平滑行 28+4 + 提示两行 32 + 行距 4×4 +
  * 内边距 20 ≈ 224。旧值 188 是加"曲线平滑"开关行之前的布局。 */
 #define PANEL_H 224
-#define SAFE_X 12
-#define AXIS_LABEL_W 62
+#define SAFE_X 12          /**< 内容区左右安全边距（避屏幕圆角） */
+#define AXIS_LABEL_W 62    /**< 纵轴刻度标签宽（容得下 "19.98 V" 之类） */
 
 /**
  * @brief 波形页布局几何（横/竖屏各一套；旋转重建时重新取值）
@@ -110,9 +136,17 @@ typedef struct {
     int32_t col_mode_w; /**< 滑板"波形模式"列宽 */
 } wave_geom_t;
 
+/**
+ * @brief 取当前屏幕方向对应的布局几何
+ *
+ * @return 几何参数（横/竖屏两套硬编码值；display 缺失时按横屏 284×240 兜底）
+ * @note 用 lv_display_get_horizontal/vertical_resolution 读**逻辑分辨率**
+ *       （LVGL 9 的显示对象默认 display），旋转后分辨率交换，故以宽高
+ *       大小关系判断横竖屏，而非记忆上次方向。
+ */
 static wave_geom_t wave_geom(void)
 {
-    lv_display_t *d = lv_display_get_default();
+    lv_display_t *d = lv_display_get_default(); /* 取默认显示对象（LVGL 9 把 disp 改名 display） */
     int32_t w = (d != NULL) ? lv_display_get_horizontal_resolution(d) : 284;
     int32_t h = (d != NULL) ? lv_display_get_vertical_resolution(d) : 240;
     wave_geom_t g;
@@ -141,17 +175,19 @@ static wave_geom_t wave_geom(void)
     return g;
 }
 
-static lv_obj_t *s_chart = NULL;
-static lv_chart_series_t *s_ser_a = NULL;
-static lv_chart_series_t *s_ser_b = NULL;
-static lv_obj_t *s_lbl_title;
-static lv_obj_t *s_lbl_time_l;
-static lv_obj_t *s_lbl_time_r;
-static lv_obj_t *s_axis_a[3];
-static lv_obj_t *s_axis_b[3];
+/* ---- 波形页 LVGL 对象与页面状态（文件级 static，页面重建时重置/保留策略见
+ * screen_wave_create 注释） ---- */
+static lv_obj_t *s_chart = NULL;              /**< 图表控件（lv_chart） */
+static lv_chart_series_t *s_ser_a = NULL;     /**< 主轴曲线（左刻度，CH1 位） */
+static lv_chart_series_t *s_ser_b = NULL;     /**< 副轴曲线（右刻度，CH2 位） */
+static lv_obj_t *s_lbl_title;                 /**< 顶部标题："模式 · 窗长" */
+static lv_obj_t *s_lbl_time_l;                /**< 时间轴左刻度 "-窗长" */
+static lv_obj_t *s_lbl_time_r;                /**< 时间轴右刻度 "0"（现在） */
+static lv_obj_t *s_axis_a[3];                 /**< 主轴刻度（上/中/下 ×3） */
+static lv_obj_t *s_axis_b[3];                 /**< 副轴刻度（上/中/下 ×3） */
 
-static pm_wave_window_t s_window = PM_WAVE_10S;
-static pm_wave_mode_t s_mode = PM_WAVE_MODE_VI;
+static pm_wave_window_t s_window = PM_WAVE_10S; /**< 当前时间窗（旋转重建时保留） */
+static pm_wave_mode_t s_mode = PM_WAVE_MODE_VI; /**< 当前波形模式（默认电压+电流） */
 
 /* 纵轴量程滞回状态（避免每帧改量程导致曲线乱跳） */
 static bool s_range_valid = false;
@@ -175,8 +211,8 @@ static bool s_panel_animating = false;
  *   「点击选中后才能滑动」，既防下滑菜单时误改，又保留触控能力。） */
 static int8_t s_roller_edit = -1;
 
-static float s_buf_a[CHART_MAX_POINTS];
-static float s_buf_b[CHART_MAX_POINTS];
+static float s_buf_a[CHART_MAX_POINTS];      /**< 主轴绘图值（平滑后，喂给 chart） */
+static float s_buf_b[CHART_MAX_POINTS];      /**< 副轴绘图值（平滑后） */
 static float s_buf_a_raw[CHART_MAX_POINTS]; /**< 平滑前原值（平滑开时暂存） */
 static float s_buf_b_raw[CHART_MAX_POINTS]; /**< 副轴平滑前原值（Step2 降噪用） */
 
@@ -210,14 +246,16 @@ static lv_obj_t *s_rt_unit[WAVE_DATA_COLS] = { NULL };
 static lv_obj_t *s_av_unit[WAVE_DATA_COLS] = { NULL };
 static int s_data_ncol = 0; /**< 当前列数（变化时才重新排版，避免每帧 set_pos） */
 
+/** 波形模式描述：每种模式画哪两个通道、单位是什么（索引 = pm_wave_mode_t） */
 typedef struct {
-    int8_t ch_a;
-    int8_t ch_b;
-    bool has_b;
-    const char *unit_a;
-    const char *unit_b;
+    int8_t ch_a;        /**< 主轴通道号：0=V 1=I 2=P 3=E */
+    int8_t ch_b;        /**< 副轴通道号（无副轴时 -1） */
+    bool has_b;         /**< 是否有第二条曲线 */
+    const char *unit_a; /**< 主轴单位字符串 */
+    const char *unit_b; /**< 副轴单位字符串 */
 } mode_desc_t;
 
+/** 5 种波形模式的通道/单位映射表（用 [枚举名] = 显式下标，与枚举顺序解耦） */
 static const mode_desc_t s_mode_desc[PM_WAVE_MODE_MAX] = {
     [PM_WAVE_MODE_P]  = { 2, -1, false, "W",  "" },
     [PM_WAVE_MODE_IP] = { 1, 2, true,  "A",  "W" },
@@ -226,6 +264,12 @@ static const mode_desc_t s_mode_desc[PM_WAVE_MODE_MAX] = {
     [PM_WAVE_MODE_E]  = { 3, -1, false, "Wh", "" },
 };
 
+/**
+ * @brief 通道号 → 曲线颜色（V 绿 / I 蓝 / P 橙 / E 紫，见顶部 COL_* 宏）
+ *
+ * @param ch 通道号 0~3（0=V 1=I 2=P 其余=E）
+ * @return 该通道的曲线颜色
+ */
 static lv_color_t channel_color(int ch)
 {
     switch (ch) {
@@ -236,7 +280,17 @@ static lv_color_t channel_color(int ch)
     }
 }
 
-/** 按通道单位格式化轴值（带单位后缀） */
+/**
+ * @brief 按通道单位格式化轴值（数值 + 空格 + 单位后缀），用于纵轴刻度
+ *
+ * 小数位按通道固定（V 2 位 / A 3 位 / W 1 位 / Wh 3 位），
+ * 刻度文本宽度稳定、不随数值跳动。
+ *
+ * @param dst  输出缓冲
+ * @param n    缓冲大小
+ * @param ch   通道号 0~3（0=V 1=I 2=P 3=Wh）
+ * @param v    待格式化数值
+ */
 static void format_axis(char *dst, size_t n, int ch, float v)
 {
     const char *u = "";
@@ -257,6 +311,11 @@ static void format_axis(char *dst, size_t n, int ch, float v)
  *
  * 小数位按通道单位固定（V 2 位 / A 3 位 / W 1 位 / Wh 3 位），
  * 保证同一列内数字宽度恒定，负号跳动时只有符号位变化、末位不跳。
+ *
+ * @param dst  输出缓冲
+ * @param n    缓冲大小
+ * @param ch   通道号 0~3（决定小数位；-1 等无效值走 default 3 位）
+ * @param v    待格式化数值
  */
 static void format_axis_val(char *dst, size_t n, int ch, float v)
 {
@@ -276,6 +335,8 @@ static void format_axis_val(char *dst, size_t n, int ch, float v)
  * 布局：[前缀 24px][列 0: 数值(定宽) + 单位(定宽)] × ncol
  * 列宽 = (屏宽 - 2×SAFE_X - 前缀宽) / ncol；每列内数值右对齐、单位固定右端。
  * 数值框宽 = 列宽 - 单位宽 - 固定间隔，负号/位数变化时数字向左生长不推挤。
+ *
+ * @param g 布局几何（列宽随屏宽均分，自适应横/竖屏）
  */
 static void layout_data_cols(const wave_geom_t *g)
 {
@@ -295,10 +356,10 @@ static void layout_data_cols(const wave_geom_t *g)
     lv_obj_t **units[2] = { s_rt_unit, s_av_unit };
     const int32_t ys[2] = { g->rt_y, g->av_y };
     for (int row = 0; row < 2; row++) {
-        lv_obj_set_pos(prefix[row], SAFE_X, ys[row]);
+        lv_obj_set_pos(prefix[row], SAFE_X, ys[row]); /* 设置对象相对父级的 x/y 位置 */
         for (int c = 0; c < WAVE_DATA_COLS; c++) {
             const bool on = (c < ncol);
-            lv_obj_set_hidden(vals[row][c], !on);
+            lv_obj_set_hidden(vals[row][c], !on); /* 隐藏多余列（不参与绘制） */
             lv_obj_set_hidden(units[row][c], !on);
             if (!on) {
                 continue;
@@ -306,17 +367,23 @@ static void layout_data_cols(const wave_geom_t *g)
             const int32_t x0 = SAFE_X + WAVE_DATA_PREFIX_W + c * col_w;
             /* 数值右对齐 + 定宽框：数字变宽向左生长，单位位置纹丝不动 */
             lv_obj_set_pos(vals[row][c], x0, ys[row]);
-            lv_obj_set_size(vals[row][c], val_w, line_h);
+            lv_obj_set_size(vals[row][c], val_w, line_h); /* 定宽框（数值右对齐在其内） */
             /* 单位贴列右端 */
             lv_obj_set_pos(units[row][c], x0 + val_w + WAVE_DATA_VAL_GAP, ys[row]);
         }
     }
 }
 
+/**
+ * @brief 更新两个 roller 的焦点边框（选中项加粗蓝色、未选中细灰）
+ *
+ * 无参数无返回值；读写全局 s_focus_idx / s_roller_win / s_roller_mode。
+ */
 static void update_focus_style(void)
 {
     lv_obj_t *targets[2] = { s_roller_win, s_roller_mode };
     for (int i = 0; i < 2; i++) {
+        /* lv_obj_set_style_* 的第 3 个参数 0 = 仅默认状态（不带 state 掩码的样式） */
         lv_obj_set_style_border_color(targets[i],
                                      (i == s_focus_idx) ? lv_color_hex(0x0066CC) : COL_CARD_BD,
                                      0);
@@ -324,14 +391,22 @@ static void update_focus_style(void)
     }
 }
 
-/** roller 触控两阶段：点击选中后才允许滑动（防下滑关菜单时误改） */
+/**
+ * @brief roller 点击回调（LV_EVENT_CLICKED）：两阶段触控的状态切换
+ *
+ * 触摸 roller 时被 LVGL 事件系统调用。同一 roller 再点一次＝确认退出编辑；
+ * 点另一个 roller＝切换编辑对象。实现见文件级注释 s_roller_edit。
+ *
+ * @param e 事件对象（携带被点击的 roller）
+ */
 static void roller_clicked_cb(lv_event_t *e)
 {
-    lv_obj_t *obj = lv_event_get_target(e);
+    lv_obj_t *obj = lv_event_get_target(e); /* 取事件触发源对象 */
     int8_t idx = (obj == s_roller_win) ? 0 : 1;
     if (s_roller_edit == idx) {
         /* 已在编辑态：本次点击视为"确认当前选择"，退出编辑态 */
         s_roller_edit = -1;
+        /* lv_obj_set_scrollable：开关对象自身的滑动能力（false 后手指拖不动） */
         lv_obj_set_scrollable(s_roller_win, false);
         lv_obj_set_scrollable(s_roller_mode, false);
     } else {
@@ -344,7 +419,11 @@ static void roller_clicked_cb(lv_event_t *e)
     }
 }
 
-/** 关闭 roller 编辑态（关菜单/长按确认等调用） */
+/**
+ * @brief 关闭 roller 编辑态（关菜单/长按确认等调用）
+ *
+ * 无参数无返回值；两个 roller 的 scrollable 都恢复 false。
+ */
 static void roller_edit_cancel(void)
 {
     s_roller_edit = -1;
@@ -356,6 +435,13 @@ static void roller_edit_cancel(void)
     }
 }
 
+/**
+ * @brief 把两个 roller 的当前选中项落到页面状态（确认时调用）
+ *
+ * 无参数无返回值。只有真的发生变化才复位量程滞回/极值锚点——
+ * 不变时保持现状，避免无意义的量程重新自适应。
+ * @note lv_roller_get_selected 返回选项索引（0 起），此处先做越界检查再转换。
+ */
 static void apply_roller_selection(void)
 {
     int w = lv_roller_get_selected(s_roller_win);
@@ -378,11 +464,17 @@ static void apply_roller_selection(void)
     }
 }
 
+/**
+ * @brief 刷新标题、时间轴与曲线配色（模式/窗长变化后调用）
+ *
+ * 标题格式 "模式名 · 窗长名"；时间轴三刻度（左 -窗长/中 -半窗/右 0）；
+ * 再按当前模式给两条曲线与 6 个轴刻度换色、隐藏无副轴时刻度。
+ */
 static void update_header(void)
 {
     char t[48];
     snprintf(t, sizeof(t), "%s · %s", pm_wave_mode_name(s_mode), pm_wave_window_name(s_window));
-    lv_label_set_text(s_lbl_title, t);
+    lv_label_set_text(s_lbl_title, t); /* 设置 label 文本（自动重排版/重绘） */
 
     /* 时间轴：左 -窗长、中 -半窗、右 0（贴图面左右缘） */
     char tl[16];
@@ -390,6 +482,7 @@ static void update_header(void)
     lv_label_set_text(s_lbl_time_l, tl);
     lv_label_set_text(s_lbl_time_r, "0");
     if (s_lbl_time_m != NULL) {
+        /* 半窗刻度：与 PM_WAVE_WINDOW_MAX 一一对应的"窗长一半"文本表 */
         static const char *const half_name[PM_WAVE_WINDOW_MAX] = {
             "0.5s", "5s", "15s", "30s", "60s", "5min",
         };
@@ -399,13 +492,13 @@ static void update_header(void)
     }
 
     const mode_desc_t *d = &s_mode_desc[s_mode];
-    lv_chart_set_series_color(s_chart, s_ser_a, channel_color(d->ch_a));
-    lv_chart_hide_series(s_chart, s_ser_b, !d->has_b);
+    lv_chart_set_series_color(s_chart, s_ser_a, channel_color(d->ch_a)); /* 改曲线系列颜色 */
+    lv_chart_hide_series(s_chart, s_ser_b, !d->has_b); /* 隐藏/显示副轴系列（true=隐藏） */
     if (d->has_b) {
         lv_chart_set_series_color(s_chart, s_ser_b, channel_color(d->ch_b));
     }
     for (int k = 0; k < 3; k++) {
-        lv_obj_set_style_text_color(s_axis_a[k], channel_color(d->ch_a), 0);
+        lv_obj_set_style_text_color(s_axis_a[k], channel_color(d->ch_a), 0); /* 刻度文字着色 */
         lv_obj_set_style_text_color(s_axis_b[k], channel_color(d->ch_b), 0);
         if (d->has_b) {
             lv_obj_set_hidden(s_axis_b[k], false);
@@ -415,12 +508,25 @@ static void update_header(void)
     }
 }
 
-/* ---- 滑板动画 ---- */
+/* ---- 滑板动画 ----
+ * LVGL 动画用法：lv_anim_init 建模板 → set_var 指定目标对象 → set_values
+ * 给起止值 → set_exec_cb 指定"每帧怎么改属性" → lv_anim_start 启动。
+ * set_completed_cb 在动画跑完时回调（用于落定状态/隐藏对象）。 */
+
+/**
+ * @brief 动画 exec 回调：把对象 y 坐标设为当前插值 v（滑板升降共用）
+ * @param var 目标对象（由 lv_anim_set_var 传入）
+ * @param v   本帧插值出的 y 值
+ */
 static void anim_panel_y(void *var, int32_t v)
 {
     lv_obj_set_y((lv_obj_t *)var, v);
 }
 
+/**
+ * @brief 滑板升起动画完成回调：置"菜单已打开"标志
+ * @param a 动画描述符（本函数不用，故 (void) 忽略）
+ */
 static void panel_open_done(lv_anim_t *a)
 {
     (void)a;
@@ -428,6 +534,10 @@ static void panel_open_done(lv_anim_t *a)
     s_menu_open = true;
 }
 
+/**
+ * @brief 滑板沉底动画完成回调：隐藏滑板对象并清"菜单打开"标志
+ * @param a 动画描述符（本函数不用，故 (void) 忽略）
+ */
 static void panel_close_done(lv_anim_t *a)
 {
     (void)a;
@@ -436,6 +546,11 @@ static void panel_close_done(lv_anim_t *a)
     s_menu_open = false;
 }
 
+/**
+ * @brief 打开设置滑板（自屏幕底部升起，220ms ease-out）
+ *
+ * 无参数无返回值。已在打开/动画中则直接返回（防重入）。
+ */
 void screen_wave_open_menu(void)
 {
     if (s_panel == NULL || s_menu_open || s_panel_animating) {
@@ -447,19 +562,26 @@ void screen_wave_open_menu(void)
     update_focus_style();
 
     lv_anim_t anim;
-    lv_anim_init(&anim);
-    lv_anim_set_var(&anim, s_panel);
+    lv_anim_init(&anim);                      /* 初始化动画描述符（清零/默认值） */
+    lv_anim_set_var(&anim, s_panel);          /* 动画目标：滑板对象 */
     lv_anim_set_values(&anim, g.h, g.h - PANEL_H); /* 自底部升起（横240/竖284） */
-    lv_anim_set_duration(&anim, 220);
-    lv_anim_set_path_cb(&anim, lv_anim_path_ease_out);
-    lv_anim_set_exec_cb(&anim, anim_panel_y);
-    lv_anim_set_completed_cb(&anim, panel_open_done);
-    lv_anim_start(&anim);
+    lv_anim_set_duration(&anim, 220);         /* 动画时长 220ms */
+    lv_anim_set_path_cb(&anim, lv_anim_path_ease_out); /* 缓动曲线：先快后慢 */
+    lv_anim_set_exec_cb(&anim, anim_panel_y); /* 每帧执行：改 y 坐标 */
+    lv_anim_set_completed_cb(&anim, panel_open_done); /* 跑完回调 */
+    lv_anim_start(&anim);                     /* 启动动画（进 LVGL 动画链表） */
 }
 
+/**
+ * @brief 关闭设置滑板（沉回屏外，180ms ease-in）
+ *
+ * @param apply true=把 roller 选择落盘到页面状态并刷新头部（"确定"）；
+ *              false=放弃本次修改（"退出"），页面保持原设置
+ */
 void screen_wave_close_menu(bool apply)
 {
     if (s_panel == NULL || (!s_menu_open && !s_panel_animating)) {
+        /* 滑板不存在或本就未开：只做状态复位（含"动画中被关"的边界情况） */
         s_menu_open = false;
         s_panel_animating = false;
         if (s_panel != NULL) {
@@ -468,6 +590,7 @@ void screen_wave_close_menu(bool apply)
         return;
     }
     if (s_menu_open && apply) {
+        /* 只有"菜单已完全打开"且要求确定时才落盘——升起途中就关＝放弃修改 */
         apply_roller_selection();
         update_header();
     }
@@ -487,11 +610,25 @@ void screen_wave_close_menu(bool apply)
     lv_anim_start(&anim);
 }
 
+/**
+ * @brief 查询设置滑板是否处于打开态
+ * @return true=已打开（供 ui_nav 把按键路由到本页菜单）
+ */
 bool screen_wave_menu_is_open(void)
 {
     return s_menu_open;
 }
 
+/**
+ * @brief 设置滑板打开时的按键路由（K1=BOOT、K2=USER 两键）
+ *
+ * 单击＝当前焦点 roller 上下换项（BOOT 上、USER 下，环形）；
+ * 双击 USER＝切换焦点到另一个 roller；长按＝关菜单（USER 长按顺带"确定"）。
+ *
+ * @param id 按键 ID（BUTTON_ID_BOOT / BUTTON_ID_USER）
+ * @param ev 按键事件（单击/双击/长按起始等）
+ * @return true=事件已消费（ui_nav 不再翻页）
+ */
 bool screen_wave_menu_key(button_id_t id, button_event_t ev)
 {
     if (!s_menu_open) {
@@ -504,10 +641,11 @@ bool screen_wave_menu_key(button_id_t id, button_event_t ev)
         int cnt = (s_focus_idx == 0) ? PM_WAVE_WINDOW_MAX : PM_WAVE_MODE_MAX;
         int sel = lv_roller_get_selected(roller);
         if (id == BUTTON_ID_BOOT) {
-            sel = (sel - 1 + cnt) % cnt;
+            sel = (sel - 1 + cnt) % cnt; /* 上一项，环形（-1 越界回末项） */
         } else {
-            sel = (sel + 1) % cnt;
+            sel = (sel + 1) % cnt;       /* 下一项，环形 */
         }
+        /* LV_ANIM_ON：换项带滚动动画；OFF 则瞬间跳 */
         lv_roller_set_selected(roller, (uint16_t)sel, LV_ANIM_ON);
         return true;
     }
@@ -525,7 +663,14 @@ bool screen_wave_menu_key(button_id_t id, button_event_t ev)
     }
 }
 
-/** 波形页滑动：上滑出设置滑板 / 下滑关闭（由 ui_nav indev 级滑动识别调用） */
+/**
+ * @brief 波形页滑动处理：上滑出设置滑板 / 下滑关闭（由 ui_nav indev 级滑动识别调用）
+ *
+ * 三页循环滑动中，竖向滑动不归 tileview（它只管横滑翻页），而是经
+ * indev_swipe_event_cb 的「按下记起点、抬起算总位移」判定后回调到本函数。
+ *
+ * @param dir 滑动方向（LV_DIR_TOP=上滑 / LV_DIR_BOTTOM=下滑）
+ */
 void screen_wave_swipe_cb(lv_dir_t dir)
 {
     if (dir == LV_DIR_TOP) {
@@ -545,13 +690,17 @@ void screen_wave_swipe_cb(lv_dir_t dir)
  * 性能：只需求第 i0/i1 个顺序统计量，不必全排序。原实现每帧 qsort
  * 240 个 float（O(n log n) 且写快排常数），改为两次快速选择 O(n)。
  */
-/** 快速选择：把第 k 小的元素放到 a[k]，左侧 ≤、右侧 ≥（原地，不保证整体有序） */
+/** 快速选择：把第 k 小的元素放到 a[k]，左侧 ≤、右侧 ≥（原地，不保证整体有序）
+ *
+ *  与快速排序同源（挖坑-填数 partition），区别是每次只沿 k 所在的一侧
+ *  递归，平均 O(n)——比 qsort 全排序 O(n log n) 便宜，量程计算每帧都跑。 */
 static void select_kth(float *a, int n, int k)
 {
     int lo = 0, hi = n - 1;
     while (lo < hi) {
-        float pivot = a[lo + (hi - lo) / 2];
+        float pivot = a[lo + (hi - lo) / 2]; /* 取中点元素当基准（防有序数组退化） */
         int i = lo, j = hi;
+        /* 分区：i 从左找 ≥ pivot、j 从右找 ≤ pivot，两者相遇即本轮分区完成 */
         while (i <= j) {
             while (a[i] < pivot) {
                 i++;
@@ -560,7 +709,7 @@ static void select_kth(float *a, int n, int k)
                 j--;
             }
             if (i <= j) {
-                float t = a[i];
+                float t = a[i]; /* 双指针交换逆序对 */
                 a[i] = a[j];
                 a[j] = t;
                 i++;
@@ -568,15 +717,25 @@ static void select_kth(float *a, int n, int k)
             }
         }
         if (k <= j) {
-            hi = j;
+            hi = j;      /* k 在左半段，收缩右界 */
         } else if (k >= i) {
-            lo = i;
+            lo = i;      /* k 在右半段，收缩左界 */
         } else {
             return; /* pivot 就位 */
         }
     }
 }
 
+/**
+ * @brief 稳健量程：过滤 NaN 后取 2%~98% 分位的 [lo, hi]
+ *
+ * @param buf 输入样本数组（可含 NaN，会被跳过）
+ * @param n   样本个数
+ * @param lo  [out] 下界（2% 分位）
+ * @param hi  [out] 上界（98% 分位）
+ * @return true=成功 / false=无有效样本
+ * @note 内部拷贝到 tmp 上做两次快速选择，不破坏调用方的 s_buf_* 原数据。
+ */
 static bool robust_range(const float *buf, int n, float *lo, float *hi)
 {
     if (buf == NULL || n <= 0) {
@@ -592,10 +751,11 @@ static bool robust_range(const float *buf, int n, float *lo, float *hi)
     if (m == 0) {
         return false;
     }
+    /* 分位索引：2% 与 98% 处的顺序统计量下标（按排序后名次换算） */
     int i0 = (int)((float)(m - 1) * 0.02f);
     int i1 = (int)((float)(m - 1) * 0.98f);
     if (i1 <= i0) {
-        i0 = 0;
+        i0 = 0;      /* 样本太少（<50 个）时退化为全范围，保证不越界 */
         i1 = m - 1;
     }
     /* 两次快速选择必须**分区间**做，否则后者会挪动前者的结果：
@@ -611,6 +771,7 @@ static bool robust_range(const float *buf, int n, float *lo, float *hi)
     if (*hi - *lo < 1e-6f) {
         /* 信号几乎恒定：给一点最小跨度，避免除零/全平线 */
         float mid = *lo;
+        /* 留白按中值 1% + 微量，保证量程跨度非零且不夸张 */
         float pad = fabsf(mid) * 0.01f + 1e-4f;
         *lo = mid - pad;
         *hi = mid + pad;
@@ -625,6 +786,8 @@ static bool robust_range(const float *buf, int n, float *lo, float *hi)
  *       数据跨度不足当前量程的 40% → 收缩，但需**连续 N 帧**满足才执行
  *       （防抖：单帧的收缩误判会让量程在两个值间反复横跳）；
  *       其余情况保持不变。
+ *
+ * @param n 参与量程统计的样本数（= CHART_MAX_POINTS，含 NaN 空槽会被跳过）
  */
 
 /** 收缩防抖：连续满足收缩条件的帧数阈值（实测 3~5 帧较稳） */
@@ -634,12 +797,15 @@ static void update_axis_range(int n)
 {
     const mode_desc_t *d = &s_mode_desc[s_mode];
     float a_min, a_max, b_min, b_max;
+    /* 稳健分位：主轴用平滑前原值（量程该反映真实峰谷，不被平滑抹掉） */
     if (!robust_range(s_buf_a_raw, n, &a_min, &a_max)) {
         return;
     }
     bool has_b = d->has_b && robust_range(s_buf_b, n, &b_min, &b_max);
+    /* 副轴无数据（has_b=false）时 b_min/b_max 未初始化，下面只在 has_b 分支使用 */
 
     if (!s_range_valid) {
+        /* 首帧/模式切换后：直接采用当前分位范围作为量程基准 */
         s_range_a_min = a_min;
         s_range_a_max = a_max;
         s_range_b_min = b_min;
@@ -649,7 +815,8 @@ static void update_axis_range(int n)
         s_shrink_cnt_b = 0;
     } else {
         /* a 通道：扩程加滞回余量（数据超出当前量程 3% 才扩，防单点噪声
-         * 触发扩程跳动）；缩程需连续帧确认（防抖） */
+         * 触发扩程跳动）；缩程需连续帧确认（防抖）。
+         * 判定基于"分位范围"而非原始 min/max——单个坏点再尖也进不了 2% 分位。 */
         bool outside = (a_min < s_range_a_min - (s_range_a_max - s_range_a_min) * 0.03f) ||
                        (a_max > s_range_a_max + (s_range_a_max - s_range_a_min) * 0.03f);
         float cur_span = s_range_a_max - s_range_a_min;
@@ -708,9 +875,12 @@ static void update_axis_range(int n)
     const bool a_is_volt = (d->ch_a == 0);
     const float min_div_a = a_is_volt ? WAVE_MIN_DIV_V : WAVE_MIN_DIV_A;
     const float span_a = range_hi_a - range_lo_a;
+    /* 目标格值 = 跨度/格数，但至少 WAVE_Y_DIVS×min_div（宁可放大格值也不许过细） */
     const float div_a = wave_nice_div(fmaxf(span_a, WAVE_Y_DIVS * min_div_a) / (float)WAVE_Y_DIVS,
                                       a_is_volt);
     {
+        /* 以跨度中心为锚：先算"下边界该落在第几格"，floorf 取整后回乘格值——
+         * 下边界因此是格值的整数倍，中间 3 条格线也全部落在整格值上 */
         const float mid = (range_lo_a + range_hi_a) * 0.5f;
         const float lo_units = floorf((mid - 0.5f * (float)WAVE_Y_DIVS * div_a) / div_a + 1e-3f);
         range_lo_a = lo_units * div_a;
@@ -718,6 +888,8 @@ static void update_axis_range(int n)
     }
 
     if (d->has_b) {
+        /* 副轴量化逻辑与主轴完全相同（1-2-5 格值 + floorf 锚定），只是基值
+         * 按副轴通道选 1V/0.1A */
         const bool b_is_volt = (d->ch_b == 0);
         const float min_div_b = b_is_volt ? WAVE_MIN_DIV_V : WAVE_MIN_DIV_A;
         const float span_b = range_hi_b - range_lo_b;
@@ -728,6 +900,9 @@ static void update_axis_range(int n)
         range_lo_b = lo_units * div_b;
         range_hi_b = range_lo_b + (float)WAVE_Y_DIVS * div_b;
     }
+    /* lv_chart_set_axis_range：设置图表指定轴的数值范围（比 lv_chart_set_range
+     * 更精确——可分别指定主/副 Y 轴）。LVGL 图表内部存整数，故物理值 ×100 后
+     * 传入（CHART_VALUE_SCALE），绘图时再按此范围线性映射到像素高度。 */
     lv_chart_set_axis_range(s_chart, LV_CHART_AXIS_PRIMARY_Y,
                             (int32_t)(range_lo_a * CHART_VALUE_SCALE),
                             (int32_t)(range_hi_a * CHART_VALUE_SCALE));
@@ -737,7 +912,8 @@ static void update_axis_range(int n)
                                 (int32_t)(range_hi_b * CHART_VALUE_SCALE));
     }
 
-    /* 轴刻度（上/中/下）：与 chart range 一致（含留白与量化后的范围） */
+    /* 轴刻度（上/中/下）：与 chart range 一致（含留白与量化后的范围）。
+     * 取上/中/下 3 个值：上=range_hi、中=两者均值、下=range_lo。 */
     char txt[16];
     const float avals[3] = { range_hi_a,
                              (range_lo_a + range_hi_a) * 0.5f,
@@ -764,6 +940,10 @@ static void update_axis_range(int n)
  * 极值点防跳动：圆点钉住「窗口内同一个极值事件」，随窗口滚动平移；
  * 只有当该事件滑出窗口、或出现显著更极端的新值时才切换锚点。
  * 否则窗口内小幅波动会让 min/max 在多个相近点间反复横跳、圆点来回抖。
+ *
+ * @param n 样本数（= CHART_MAX_POINTS）
+ * @param d 当前波形模式描述（判断有无副轴；当前实现只画主轴趋势）
+ * @note 仅当 WAVE_DECOR_ENABLE=1 时被 screen_wave_refresh 调用（现默认关闭）。
  */
 static void trend_update(int n, const mode_desc_t *d)
 {
@@ -780,11 +960,12 @@ static void trend_update(int n, const mode_desc_t *d)
     float dclose_min = 1e30f, dclose_max = 1e30f;
     bool has_any = false;
     int cnt = 0;
+    /* 显著更极端阈值：超出当前量程跨度 2% 才换锚（否则视为同一极值事件） */
     const float ext_thresh = (s_range_a_max - s_range_a_min) * 0.02f + 1e-6f;
     for (int i = 0; i < n; i++) {
         const float v = s_buf_a_raw[i];
         if (!isfinite(v)) {
-            continue;
+            continue; /* NaN 空槽：无数据不参与统计 */
         }
         if (!has_any) {
             vmin = vmax = v;
@@ -878,10 +1059,13 @@ static void trend_update(int n, const mode_desc_t *d)
     }
 
     /* min/max 极值点：深色小圆点钉在对应数据点。
-     * 不用曲线同色（绿点压绿线几乎不可见）；深色在任何通道色上都清晰。 */
+     * 不用曲线同色（绿点压绿线几乎不可见）；深色在任何通道色上都清晰。
+     * lv_chart_get_point_pos_by_id：取第 id 个数据点在 chart 内容区的像素
+     * 坐标（自动完成"数值→像素"换算与 padding 偏移），免得自己按量程反算。 */
     if (s_dot_min != NULL && s_ser_a != NULL) {
         lv_point_t pm;
         lv_chart_get_point_pos_by_id(s_chart, s_ser_a, (uint32_t)i_min_dot, &pm);
+        /* -2 使 4px 圆心对准数据点（圆点左上角 = 中心 - 半径） */
         lv_obj_set_pos(s_dot_min, pm.x - 2, pm.y - 2);
         lv_obj_set_hidden(s_dot_min, false);
     }
@@ -894,6 +1078,12 @@ static void trend_update(int n, const mode_desc_t *d)
     (void)d;
 }
 
+/**
+ * @brief 波形页主刷新：拉数据 → 平滑 → 量程 → 写入 chart → 刷新数据行
+ *
+ * 每帧由 UI 任务周期调用（约 100ms 级）。核心契约是"时间槽一比一映射"：
+ * 缓冲区第 j 槽 = 屏幕第 j 列，右端 = 现在。
+ */
 void screen_wave_refresh(void)
 {
     if (s_chart == NULL) {
@@ -911,7 +1101,8 @@ void screen_wave_refresh(void)
 
     /* 平滑（可选）：对主轴/副轴相邻三个**都有效**的槽做 3 点移动平均；
      * 空槽（NaN）与端点保持原值，避免把断线抹成假波形。
-     * 【Step2 降噪】副轴（常为电流，空载噪声大）同样平滑——原先只平滑主轴。 */
+     * 【Step2 降噪】副轴（常为电流，空载噪声大）同样平滑——原先只平滑主轴。
+     * 先备份原值到 s_buf_*_raw：量程统计与趋势装饰都基于原值（平滑会削峰）。 */
     settings_t scfg;
     bool smooth = (settings_get(&scfg) == ESP_OK && scfg.wave_smooth);
     for (int i = 0; i < CHART_MAX_POINTS; i++) {
@@ -920,6 +1111,7 @@ void screen_wave_refresh(void)
     }
     if (smooth) {
         for (int i = 1; i < CHART_MAX_POINTS - 1; i++) {
+            /* 3 点均值：相邻三槽都有效才平滑，任一为 NaN 则保持原值（不跨断线） */
             if (isfinite(s_buf_a_raw[i - 1]) && isfinite(s_buf_a_raw[i]) &&
                 isfinite(s_buf_a_raw[i + 1])) {
                 s_buf_a[i] = (s_buf_a_raw[i - 1] + s_buf_a_raw[i] + s_buf_a_raw[i + 1]) / 3.0f;
@@ -933,7 +1125,10 @@ void screen_wave_refresh(void)
 
     update_axis_range(CHART_MAX_POINTS);
 
-    /* 一比一映射到 chart 槽位：j → 第 j 列；NaN → LV_CHART_POINT_NONE（断线） */
+    /* 一比一映射到 chart 槽位：j → 第 j 列；NaN → LV_CHART_POINT_NONE（断线）。
+     * lv_chart_set_series_value_by_id：按槽位 id 直接覆写该点的值（整帧刷新用；
+     * 相邻追加点用 lv_chart_set_next_value）。LV_CHART_POINT_NONE 是 LVGL 内置的
+     * "无数据"哨兵值，渲染时该点断线不画，正好对应本页的 NaN 空槽语义。 */
     for (int k = 0; k < CHART_MAX_POINTS; k++) {
         if (isfinite(s_buf_a[k])) {
             lv_chart_set_series_value_by_id(s_chart, s_ser_a, (uint32_t)k,
@@ -948,6 +1143,8 @@ void screen_wave_refresh(void)
             lv_chart_set_series_value_by_id(s_chart, s_ser_b, (uint32_t)k, LV_CHART_POINT_NONE);
         }
     }
+    /* 批量写完槽位后手动触发重绘：lv_chart_refresh 让 chart 立即按最新
+     * 数据重画曲线（否则要等下个刷新周期才见效果）。 */
     lv_chart_refresh(s_chart);
 #if WAVE_DECOR_ENABLE
     trend_update(CHART_MAX_POINTS, d); /* 均值线 + min/max 极值点 */
@@ -960,6 +1157,7 @@ void screen_wave_refresh(void)
      * 跳过无数据的 NaN 空槽。 */
     float a_last = 0.0f, b_last = 0.0f, a_avg = 0.0f, b_avg = 0.0f;
     int cnt = 0;
+    /* 用 double 累加：480 个 float 累加用 float 会积累舍入误差 */
     double sa = 0.0, sb = 0.0;
     for (int k = 0; k < CHART_MAX_POINTS; k++) {
         if (isfinite(s_buf_a[k])) {
@@ -973,7 +1171,7 @@ void screen_wave_refresh(void)
         }
     }
     if (cnt == 0) {
-        return;
+        return; /* 整窗无有效数据：数据行保持上一帧内容，不刷 "--" */
     }
     a_avg = (float)(sa / cnt);
     b_avg = d->has_b ? (float)(sb / cnt) : 0.0f;
@@ -994,7 +1192,8 @@ void screen_wave_refresh(void)
     }
 
     /* 列内容：列 0/1/2 = a 通道值 / b 通道值 / 派生功率。
-     * 数值按通道单位定小数位，负号自然右对齐、末位稳定不跳。 */
+     * 数值按通道单位定小数位，负号自然右对齐、末位稳定不跳。
+     * VI 模式第 3 列是瞬时功率＝电压×电流（UI 侧派生，非通道直读）。 */
     float col_v[WAVE_DATA_COLS];
     int col_ch[WAVE_DATA_COLS];
     switch (s_mode) {
@@ -1035,10 +1234,11 @@ void screen_wave_refresh(void)
         if (c >= ncol) {
             break; /* 未用列隐藏 */
         }
+        /* lv_label_set_text：给 label 赋新文本，LVGL 自动重算尺寸并重绘 */
         format_axis_val(vt, sizeof(vt), col_ch[c], col_v[c]);
-        lv_label_set_text(s_rt_val[c], vt);
+        lv_label_set_text(s_rt_val[c], vt); /* 实时行数值 */
         format_axis_val(vt, sizeof(vt), col_ch[c], col_av[c]);
-        lv_label_set_text(s_av_val[c], vt);
+        lv_label_set_text(s_av_val[c], vt); /* 平均行数值 */
         /* 单位固定列右端（模式切换时随之更新） */
         static const char *const unit_txt[4] = { "V", "A", "W", "Wh" };
         const char *u = (col_ch[c] >= 0 && col_ch[c] < 4) ? unit_txt[col_ch[c]] : "";
@@ -1053,10 +1253,17 @@ void screen_wave_refresh(void)
  * 2026-10 改：波形铺满整宽，刻度不再占 padding 留白（原先两侧各让出
  * 66px，曲线被挤在中间很不协调）。刻度改贴左右边缘、加半透明白底，
  * 压在曲线之上仍可读。
+ *
+ * @param e 事件对象（绑定在 chart 的 LV_EVENT_SIZE_CHANGED 上，
+ *          chart 尺寸变化时由 LVGL 自动调用）
+ * @note 用 lv_event_get_current_target 取绑定事件的对象（chart 本身），
+ *       而非 lv_event_get_target（本回调中两者相同，但语义上前者更准）。
  */
 static void chart_size_event_cb(lv_event_t *e)
 {
     lv_obj_t *chart = lv_event_get_current_target(e);
+    /* lv_obj_get_content_width/height：取对象内容区尺寸（不含 border/padding），
+     * 刻度定位基于曲线实际绘制区域，故用 content 尺寸而非对象总宽高。 */
     lv_coord_t w = lv_obj_get_content_width(chart);
     lv_coord_t h = lv_obj_get_content_height(chart);
     for (int k = 0; k < 3; k++) {
@@ -1066,44 +1273,61 @@ static void chart_size_event_cb(lv_event_t *e)
     }
 }
 
-/** 曲线平滑开关：写 settings 并持久化（立即生效，下一次刷新即用新设置） */
+/**
+ * @brief 曲线平滑开关回调（LV_EVENT_VALUE_CHANGED）
+ *
+ * 读取开关状态写入 settings 并立即持久化（下一次刷新即用新设置）。
+ * @param e 事件对象（携带开关对象）
+ */
 static void smooth_switch_cb(lv_event_t *e)
 {
     lv_obj_t *sw = lv_event_get_target(e);
+    /* lv_obj_has_state：查询对象是否处于某状态（开关选中＝LV_STATE_CHECKED） */
     bool on = lv_obj_has_state(sw, LV_STATE_CHECKED);
     (void)settings_set_wave_smooth(on ? 1u : 0u);
     (void)settings_save_now();
 }
 
+/**
+ * @brief 构建底部设置滑板（标题 + 双 roller + 平滑开关 + 两行提示）
+ *
+ * 滑板挂 **screen 层**（lv_screen_active）而非 tile——旋转重建 tile 时
+ * 滑板可复用/单独清理（见 screen_wave_create 的清理逻辑）。
+ *
+ * @param scr 父级 screen 对象
+ * @param g   布局几何（决定两列 roller 宽度）
+ */
 static void create_panel(lv_obj_t *scr, const wave_geom_t *g)
 {
-    s_panel = lv_obj_create(scr);
-    lv_obj_set_size(s_panel, LV_PCT(100), PANEL_H);
+    s_panel = lv_obj_create(scr); /* lv_obj_create：创建基础容器对象（带默认样式） */
+    lv_obj_set_size(s_panel, LV_PCT(100), PANEL_H); /* LV_PCT(100)=父级宽度 100% */
     lv_obj_set_pos(s_panel, 0, g->h); /* 初始沉在屏外（横 240 / 竖 284） */
-    lv_obj_set_style_bg_color(s_panel, COL_PANEL_BG, 0);
-    lv_obj_set_style_bg_opa(s_panel, LV_OPA_COVER, 0);
-    lv_obj_set_style_radius(s_panel, 12, 0);
+    lv_obj_set_style_bg_color(s_panel, COL_PANEL_BG, 0); /* 背景色（0=默认状态） */
+    lv_obj_set_style_bg_opa(s_panel, LV_OPA_COVER, 0);   /* 背景不透明度 100% */
+    lv_obj_set_style_radius(s_panel, 12, 0); /* 圆角半径 12px */
     lv_obj_set_style_border_color(s_panel, COL_CARD_BD, 0);
     lv_obj_set_style_border_width(s_panel, 1, 0);
-    lv_obj_set_style_pad_all(s_panel, 10, 0);
-    lv_obj_set_style_pad_hor(s_panel, 16, 0); /* 面板内也避开圆角 */
+    lv_obj_set_style_pad_all(s_panel, 10, 0); /* 四边统一内边距 10px */
+    lv_obj_set_style_pad_hor(s_panel, 16, 0); /* 面板内也避开圆角（左右内边距 16） */
+    /* lv_obj_set_flex_flow：把容器设为弹性布局（COLUMN=子对象纵向排列） */
     lv_obj_set_flex_flow(s_panel, LV_FLEX_FLOW_COLUMN);
+    /* lv_obj_set_flex_align：主轴/交叉轴/整体对齐方式（START/CENTER/CENTER） */
     lv_obj_set_flex_align(s_panel, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER,
                           LV_FLEX_ALIGN_CENTER);
-    lv_obj_set_style_pad_row(s_panel, 4, 0);
-    lv_obj_set_hidden(s_panel, true);
-    lv_obj_set_scrollable(s_panel, false);
+    lv_obj_set_style_pad_row(s_panel, 4, 0); /* 弹性布局子项行间距 4px */
+    lv_obj_set_hidden(s_panel, true);        /* 初始隐藏（动画时才显示） */
+    lv_obj_set_scrollable(s_panel, false);   /* 滑板自身不可滚动 */
 
-    lv_obj_t *title = lv_label_create(s_panel);
+    lv_obj_t *title = lv_label_create(s_panel); /* lv_label_create：创建文本标签 */
     lv_label_set_text(title, "波形设置");
     lv_obj_set_style_text_font(title, lvgl_port_get_font_bold(LVGL_PORT_FONT_16), 0);
     lv_obj_set_style_text_color(title, COL_DARK, 0);
 
     lv_obj_t *row = lv_obj_create(s_panel);
-    lv_obj_remove_style_all(row);
+    lv_obj_remove_style_all(row); /* 清掉默认样式（无边框/无背景的纯布局行） */
     lv_obj_set_size(row, LV_PCT(100), 88);
     lv_obj_set_scrollable(row, false);
-    lv_obj_set_flex_flow(row, LV_FLEX_FLOW_ROW);
+    lv_obj_set_flex_flow(row, LV_FLEX_FLOW_ROW); /* 横向弹性排列两个 roller 列 */
     lv_obj_set_flex_align(row, LV_FLEX_ALIGN_SPACE_EVENLY, LV_FLEX_ALIGN_CENTER,
                           LV_FLEX_ALIGN_CENTER);
 
@@ -1118,14 +1342,16 @@ static void create_panel(lv_obj_t *scr, const wave_geom_t *g)
     lv_label_set_text(lw, "时间窗");
     lv_obj_set_style_text_font(lw, lvgl_port_get_font(LVGL_PORT_FONT_12), 0);
     lv_obj_set_style_text_color(lw, COL_GRAY, 0);
-    s_roller_win = lv_roller_create(col_w);
+    s_roller_win = lv_roller_create(col_w); /* lv_roller_create：创建滚轮选择器 */
+    /* lv_roller_set_options：设置选项列表，'\n' 分隔各项（LV_ROLLER_MODE_NORMAL=普通模式） */
     lv_roller_set_options(s_roller_win, "1s\n10s\n30s\n60s\n120s\n10min",
                           LV_ROLLER_MODE_NORMAL);
-    lv_roller_set_visible_row_count(s_roller_win, 3);
-    lv_roller_set_selected(s_roller_win, (uint16_t)s_window, LV_ANIM_OFF);
+    lv_roller_set_visible_row_count(s_roller_win, 3); /* 可见行数 3（中间为选中项） */
+    lv_roller_set_selected(s_roller_win, (uint16_t)s_window, LV_ANIM_OFF); /* 初始选中当前窗 */
     lv_obj_set_size(s_roller_win, g->col_win_w - 8, 68);
     /* 两阶段触控：初始禁滑动（防下滑关闭菜单时误改），点击选中后才可滑 */
     lv_obj_set_scrollable(s_roller_win, false);
+    /* lv_obj_add_event_cb：给对象挂事件回调（LV_EVENT_CLICKED=点击释放时触发） */
     lv_obj_add_event_cb(s_roller_win, roller_clicked_cb, LV_EVENT_CLICKED, NULL);
 
     lv_obj_t *col_m = lv_obj_create(row);
@@ -1140,6 +1366,7 @@ static void create_panel(lv_obj_t *scr, const wave_geom_t *g)
     lv_obj_set_style_text_font(lm, lvgl_port_get_font(LVGL_PORT_FONT_12), 0);
     lv_obj_set_style_text_color(lm, COL_GRAY, 0);
     s_roller_mode = lv_roller_create(col_m);
+    /* 5 种波形模式，顺序与 pm_wave_mode_t 枚举一致（P/IP/VP/VI/E） */
     lv_roller_set_options(s_roller_mode,
                           "功率\n电流+功率\n电压+功率\n电压+电流\n电能", LV_ROLLER_MODE_NORMAL);
     lv_roller_set_visible_row_count(s_roller_mode, 3);
@@ -1161,9 +1388,11 @@ static void create_panel(lv_obj_t *scr, const wave_geom_t *g)
     lv_label_set_text(smooth_lbl, "曲线平滑");
     lv_obj_set_style_text_font(smooth_lbl, lvgl_port_get_font(LVGL_PORT_FONT_14), 0);
     lv_obj_set_style_text_color(smooth_lbl, COL_DARK, 0);
-    lv_obj_t *sw = lv_switch_create(smooth_row);
+    lv_obj_t *sw = lv_switch_create(smooth_row); /* lv_switch_create：创建开关控件 */
     /* 与设置页自动旋转开关统一样式：关闭轨道灰、开启轨道品牌蓝、
-     * 白色旋钮带 1px 灰边框（避免白底上旋钮"消失"）。 */
+     * 白色旋钮带 1px 灰边框（避免白底上旋钮"消失"）。
+     * LV_STATE_CHECKED=开关开启态、LV_PART_KNOB=旋钮子部件——LVGL 样式可以
+     * 按「部件+状态」分别设置，同一个对象不同状态/子件各配各的外观。 */
     lv_obj_set_size(sw, 46, 24);
     lv_obj_set_style_bg_color(sw, COL_CARD_BD, 0);
     lv_obj_set_style_bg_opa(sw, LV_OPA_COVER, 0);
@@ -1195,12 +1424,19 @@ static void create_panel(lv_obj_t *scr, const wave_geom_t *g)
     lv_obj_set_style_text_color(hint2, COL_GRAY, 0);
 }
 
+/**
+ * @brief 构建波形页（tile 重建＝横竖屏旋转后 ui_nav 会调用）
+ *
+ * 先清理旧滑板/置空全部对象指针，再按 wave_geom() 逐层搭 UI。
+ * @param tile lv_tileview 的波形页 tile（本页所有内容的父级）
+ */
 void screen_wave_create(lv_obj_t *tile)
 {
     wave_geom_t g = wave_geom();
 
     /* ---- 旋转重建清理：底部滑板挂在 screen 层（不随 tile 删除），
-     * 必须先停掉位移动画再删对象，否则动画回调会访问已释放的 panel ---- */
+     * 必须先停掉位移动画再删对象，否则动画回调会访问已释放的 panel。
+     * lv_anim_del(obj, exec_cb)：按 exec 回调删除该对象上的动画 ---- */
     if (s_panel != NULL) {
         lv_anim_del(s_panel, anim_panel_y);
         lv_obj_delete(s_panel);
@@ -1246,15 +1482,16 @@ void screen_wave_create(lv_obj_t *tile)
     lv_obj_set_width(s_lbl_title, g.w);
     lv_obj_set_style_text_align(s_lbl_title, LV_TEXT_ALIGN_CENTER, 0);
 
-    /* 图表 */
+    /* 图表：LVGL 的 lv_chart 控件——多系列折线/柱状图，自带格线与坐标映射 */
     s_chart = lv_chart_create(tile);
     lv_obj_set_size(s_chart, g.w - 2 * SAFE_X, g.chart_h);
     lv_obj_set_pos(s_chart, SAFE_X, g.chart_y);
-    lv_chart_set_type(s_chart, LV_CHART_TYPE_LINE);
-    lv_chart_set_point_count(s_chart, CHART_MAX_POINTS);
+    lv_chart_set_type(s_chart, LV_CHART_TYPE_LINE);      /* 图表类型：折线图 */
+    lv_chart_set_point_count(s_chart, CHART_MAX_POINTS); /* 每系列的点（槽）数 480 */
     /* 每帧用 set_series_value_by_id 整帧重写全部槽位（时间槽映射，不是
      * "逐点追加"），update_mode 只影响 set_next_value，这里无需设置。 */
-    /* 格线密度：LVGL 的 div_line_count 是「线数」，格数 = 线数 - 1。
+    /* lv_chart_set_div_line_count(chart, x, y)：图表内部格线数量（横线数/纵线数）。
+     * 注意参数是「线数」不是「格数」：5 条横线 → 4 格（即 WAVE_Y_DIVS）。
      * 波形重构 Step1（做减法）：5×10 格 → 4×8 格（线数 5×9），
      * 暗灰 1px，降低视觉密度——DSO Nano 等小屏示波器的通用密度。 */
     lv_chart_set_div_line_count(s_chart, 5, 9);
@@ -1280,8 +1517,12 @@ void screen_wave_create(lv_obj_t *tile)
     lv_obj_set_scrollbar_mode(s_chart, LV_SCROLLBAR_MODE_OFF);
     lv_obj_add_event_cb(s_chart, chart_size_event_cb, LV_EVENT_SIZE_CHANGED, NULL);
 
+    /* lv_chart_add_series：给图表加一条曲线（颜色 + 绑定主/副 Y 轴）。
+     * 主轴=左刻度、副轴=右刻度，双轴曲线各按各的量程映射到同一图面高度。 */
     s_ser_a = lv_chart_add_series(s_chart, COL_V, LV_CHART_AXIS_PRIMARY_Y);
     s_ser_b = lv_chart_add_series(s_chart, COL_I, LV_CHART_AXIS_SECONDARY_Y);
+    /* lv_chart_set_all_values：把整条系列所有槽位一次性置为某值——
+     * 开局置 LV_CHART_POINT_NONE 表示"全空"，避免显示残留垃圾值 */
     lv_chart_set_all_values(s_chart, s_ser_a, LV_CHART_POINT_NONE);
     lv_chart_set_all_values(s_chart, s_ser_b, LV_CHART_POINT_NONE);
 
@@ -1369,7 +1610,8 @@ void screen_wave_create(lv_obj_t *tile)
     /* 实时 / 平均：定宽列标签组（行首"实"/"均" + 每列 定宽数值 + 定宽单位）。
      * 数值右对齐定宽框、单位固定列右端——数字正负跳动时列间不互挤。
      * 字体分级：数值 20px（主读数，大）、前缀 16px、单位 12px（小、不抢眼）。
-     * 行高按最大字体 20px 计算，三者底部对齐（基线约在行内居中）。 */
+     * 行高按最大字体 20px 计算，三者底部对齐（基线约在行内居中）。
+     * 建标签时位置先给"默认值"，最终位置由 layout_data_cols 统一摆放。 */
     const lv_font_t *f20 = lvgl_port_get_font(LVGL_PORT_FONT_20);
     const lv_font_t *f16 = lvgl_port_get_font(LVGL_PORT_FONT_16);
     const lv_font_t *f12u = lvgl_port_get_font(LVGL_PORT_FONT_12);
@@ -1407,11 +1649,19 @@ void screen_wave_create(lv_obj_t *tile)
     create_panel(lv_screen_active(), &g);
 }
 
+/**
+ * @brief 取当前时间窗（供 pm_wave_copy 之外的调用方查询页面状态）
+ * @return 当前时间窗枚举
+ */
 pm_wave_window_t screen_wave_get_window(void)
 {
     return s_window;
 }
 
+/**
+ * @brief 取当前波形模式
+ * @return 当前波形模式枚举
+ */
 pm_wave_mode_t screen_wave_get_mode(void)
 {
     return s_mode;

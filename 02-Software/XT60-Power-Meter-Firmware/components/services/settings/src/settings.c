@@ -2,21 +2,37 @@
  * @file settings.c
  * @brief 配置持久化服务实现（NVS + 内存缓存 + 防抖落盘）
  *
- * 数据流：
- *   用户改设置 → settings_set_xxx() 更新内存缓存 → 标记"脏" → 启动防抖定时器
- *              → 定时器到点（期间无新改动）→ settings_save_now() 写 NVS
+ * 本文件是 settings.h 所述"三层结构"的具体实现：
+ *   Kconfig（CONFIG_BUZZER_VOLUME_PERCENT 等）→ 只提供"出厂默认值"；
+ *   NVS（Flash 上的键值库）                  → 保存用户实际调整后的值；
+ *   内存缓存 s_cache                          → 提供快速读取，读取不碰 Flash。
  *
- * 读取时只访问内存缓存，不碰 Flash，因此可以高频调用。
+ * 数据流（写路径）：
+ *   用户改设置 → settings_set_xxx() 更新内存缓存 → 标记"脏" → 重置防抖定时器
+ *              → 静默 SETTINGS_SAVE_DELAY_MS 毫秒后定时器到点 → persist_cache() 写 NVS
+ *
+ * 为什么写入要"防抖"？
+ *   NVS 位于 Flash 上，Flash 扇区有擦写寿命（约 10 万次）。
+ *   用户拖动滑块时会连续产生几十次设置变化，若每次都立刻写 Flash，
+ *   一次拖动就消耗几十次擦写寿命。防抖把"连续 N 次改动"合并成
+ *   "最后一次改动后写一次"，从源头减少写入次数，延长 Flash 寿命。
+ *   （详见 settings.h 文件头的完整说明。）
+ *
+ * 为什么读取可以直接读缓存？
+ *   读取走内存变量、不碰 Flash，没有磨损问题，因此可以高频调用。
+ *
+ * 容错设计：即使 NVS 完全不可用（首次上电、分区损坏），本服务也用
+ * 出厂默认值继续工作（"优雅降级"），只是无法记住用户的调整。
  */
 #include "settings.h"
 
 #include <string.h>
 
-#include "esp_log.h"
-#include "esp_timer.h"
-#include "freertos/FreeRTOS.h"
-#include "nvs.h"
-#include "nvs_flash.h"
+#include "esp_log.h"     /* ESP-IDF 日志库：ESP_LOGx 宏按级别打印带标签的日志 */
+#include "esp_timer.h"   /* ESP-IDF 软件定时器：微秒精度的单次/周期回调 */
+#include "freertos/FreeRTOS.h" /* FreeRTOS 核心头文件（portMUX_TYPE 等） */
+#include "nvs.h"         /* NVS 键值读写接口（nvs_open/nvs_get_xxx/nvs_set_xxx） */
+#include "nvs_flash.h"   /* NVS 分区管理接口（nvs_flash_init/erase） */
 
 /** 日志标签 */
 static const char *TAG = "settings";
@@ -43,7 +59,15 @@ static const char *TAG = "settings";
 #define SETTINGS_BRIGHT_MIN        10
 #define SETTINGS_BRIGHT_MAX        100
 
-/** 刷新率合法档位（与测量页快速菜单一致） */
+/**
+ * @brief 检查刷新率是否为合法档位
+ *
+ * @param hz 待检查的刷新率
+ * @return true 合法（1/5/10/20/30 之一）
+ *
+ * 与测量页快速菜单保持同一套档位：菜单里能选什么，这里就认什么，
+ * 避免 UI 与持久化层两份白名单不一致。
+ */
 static bool settings_rate_valid(uint8_t hz)
 {
     return hz == 1 || hz == 5 || hz == 10 || hz == 20 || hz == 30;
@@ -67,6 +91,12 @@ static esp_timer_handle_t s_save_timer = NULL;
  * 缓存会被多个任务读写（UI 任务写、其他任务读），
  * 而脏标记会被任务与防抖定时器回调共同访问，因此需要保护。
  * 临界区里只做几个字节的赋值，开销可忽略。
+ *
+ * 配套 API（FreeRTOS/Xtensa 提供）：
+ *   portMUX_TYPE                 —— 自旋锁对象，portMUX_INITIALIZER_UNLOCKED 表示初始未上锁；
+ *   portENTER_CRITICAL(&s_lock)  —— 进临界区：上锁并关中断，保证极短的共享数据访问不被打断；
+ *   portEXIT_CRITICAL(&s_lock)   —— 出临界区：恢复中断并解锁。
+ * 临界区内只做赋值/比较这类几条指令的操作，绝不能打印日志或做耗时动作。
  */
 static portMUX_TYPE s_lock = portMUX_INITIALIZER_UNLOCKED;
 
@@ -74,6 +104,11 @@ static portMUX_TYPE s_lock = portMUX_INITIALIZER_UNLOCKED;
  * @brief 把配置重置为出厂默认值
  *
  * 出厂默认值来自 Kconfig，也就是"编译时确定的初始设定"。
+ *
+ * @param cfg 输出配置结构体，所有字段都会被写入默认值
+ *
+ * 注意：必须先于 load_from_nvs() 调用——NVS 里缺失的键就保留这里的默认值，
+ * 相当于"先铺一层底，再用 Flash 里存的值逐项覆盖"。
  */
 static void load_defaults(settings_t *cfg)
 {
@@ -92,18 +127,25 @@ static void load_defaults(settings_t *cfg)
  *   · 分区里还没有有效数据（首次上电、刚换芯片）
  *   · 分区的 NVS 版本与当前 IDF 不一致（升级了 IDF）
  * 这两种情况的标准处理方式是"擦除分区并用新格式重建"。
+ *
+ * @return ESP_OK NVS 可用；其他值表示 NVS 完全不可用（调用方应降级为纯默认值运行）
  */
 static esp_err_t nvs_init_with_recovery(void)
 {
+    /* nvs_flash_init()：初始化 NVS Flash 分区。它会扫描分区、装载键值索引；
+     * 首次使用（分区全空）或版本不匹配时会返回下面两种错误码 */
     esp_err_t err = nvs_flash_init();
 
     if (err == ESP_ERR_NVS_NO_FREE_PAGES || err == ESP_ERR_NVS_NEW_VERSION_FOUND) {
         ESP_LOGW(TAG, "NVS 需要重建（%s），执行擦除", esp_err_to_name(err));
+        /* nvs_flash_erase()：擦除整个 NVS 分区，让 nvs_flash_init() 能以全新格式重建。
+         * 代价是丢掉所有已保存的配置——对"首次上电/版本升级"场景可接受 */
         err = nvs_flash_erase();
         if (err != ESP_OK) {
             ESP_LOGE(TAG, "擦除 NVS 失败: %s", esp_err_to_name(err));
             return err;
         }
+        /* 擦除后必须再 init 一次，才会真正装载起"空但可用"的 NVS */
         err = nvs_flash_init();
     }
 
@@ -112,10 +154,15 @@ static esp_err_t nvs_init_with_recovery(void)
 
 /**
  * @brief 从 NVS 载入各配置项到缓存（缺失项保持默认值）
+ *
+ * 载入前 s_cache 必须已填好默认值（见 load_defaults），这里只把
+ * "NVS 里确实存在且合法"的项覆盖上去，读失败/值越界都保持默认。
  */
 static void load_from_nvs(void)
 {
     nvs_handle_t handle;
+    /* nvs_open(命名空间, 模式, &句柄)：打开 NVS 里的一个"配置文件夹"。
+     * 命名空间相当于文件夹名，键名相当于里面的文件名；NVS_READONLY 表示只读打开 */
     esp_err_t err = nvs_open(SETTINGS_NVS_NAMESPACE, NVS_READONLY, &handle);
     if (err != ESP_OK) {
         /* 首次上电时这个命名空间还不存在，属于正常情况：
@@ -124,7 +171,9 @@ static void load_from_nvs(void)
         return;
     }
 
-    /* ---- 蜂鸣器响度 ---- */
+    /* ---- 蜂鸣器响度 ----
+     * nvs_get_u8(句柄, 键名, &输出)：按键名读出一个 uint8_t 值。
+     * 键不存在时返回 ESP_ERR_NVS_NOT_FOUND（首次使用时的正常情况） */
     uint8_t volume = 0;
     err = nvs_get_u8(handle, SETTINGS_KEY_BUZZER_VOLUME, &volume);
     if (err == ESP_OK && volume >= SETTINGS_VOLUME_MIN && volume <= SETTINGS_VOLUME_MAX) {
@@ -176,21 +225,33 @@ static void load_from_nvs(void)
         s_cache.wave_smooth = smooth ? 1u : 0u;
     }
 
+    /* nvs_close(句柄)：关闭命名空间句柄，释放 NVS 内部的缓存页占用。
+     * 句柄用完必须关闭，否则会泄漏 NVS 句柄槽位 */
     nvs_close(handle);
 }
 
 /**
  * @brief 把内存缓存写入 NVS（内部使用，调用前需确保已初始化）
+ *
+ * 整个写入流程是"逐项 set → 最后 commit"：
+ * nvs_set_xxx() 只把值写进 RAM 中的 NVS 页缓存，并没有真正写 Flash；
+ * 只有 nvs_commit() 才把整批改动一次性落到 Flash。
+ * 因此多个键的改动要么一起落盘，要么都不落盘，不会出现写一半的中间状态。
+ *
+ * @return ESP_OK 全部写入并提交成功；其他值表示失败（此时缓存仍有效，不影响当前运行）
  */
 static esp_err_t persist_cache(void)
 {
     nvs_handle_t handle;
+    /* 与读取不同，这里要用 NVS_READWRITE 打开，否则 nvs_set_xxx 会拒绝写入 */
     esp_err_t err = nvs_open(SETTINGS_NVS_NAMESPACE, NVS_READWRITE, &handle);
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "打开 NVS 失败: %s", esp_err_to_name(err));
         return err;
     }
 
+    /* nvs_set_u8/nvs_set_u16(句柄, 键名, 值)：按键名写入一个整数值。
+     * 任一步失败就不再继续，把错误留到函数末尾统一返回 */
     err = nvs_set_u8(handle, SETTINGS_KEY_BUZZER_VOLUME, s_cache.buzzer_volume);
     if (err == ESP_OK) {
         err = nvs_set_u8(handle, SETTINGS_KEY_LCD_BRIGHTNESS, s_cache.lcd_brightness);
@@ -223,15 +284,23 @@ static esp_err_t persist_cache(void)
 
 /**
  * @brief 防抖定时器回调：静默期结束，执行落盘
+ *
+ * 这是 esp_timer 的单次回调，运行在 esp_timer 任务的上下文里（不是中断），
+ * 因此里面可以做写 NVS 这类较长的操作。
+ *
+ * @param arg 创建定时器时传入的用户参数（本模块未使用）
  */
 static void save_timer_callback(void *arg)
 {
     (void)arg;
 
+    /* 进临界区读脏标记：防止与任务侧的 mark_dirty_and_schedule() 竞争 */
     portENTER_CRITICAL(&s_lock);
     bool need_save = s_dirty;
     portEXIT_CRITICAL(&s_lock);
 
+    /* 静默期内若已被 settings_save_now() 提前落盘并清掉脏标记，
+     * 这里就无事可做——不重复写 Flash，也不多耗一次擦写寿命 */
     if (!need_save) {
         return;
     }
@@ -242,19 +311,28 @@ static void save_timer_callback(void *arg)
         portEXIT_CRITICAL(&s_lock);
         ESP_LOGI(TAG, "配置已保存（防抖 %d ms 后落盘）", SETTINGS_SAVE_DELAY_MS);
     }
+    /* persist_cache() 失败时故意保留脏标记：下次任意一次改动或
+     * settings_save_now() 还会再次尝试落盘 */
 }
 
 /**
  * @brief 标记"有改动待保存"，并重置防抖定时器
+ *
+ * 每次设置变化都会调用它。定时器不断被重置，只有连续静默
+ * SETTINGS_SAVE_DELAY_MS 毫秒后才会真正写 Flash——这就是"防抖"。
  */
 static void mark_dirty_and_schedule(void)
 {
+    /* 脏标记被任务与定时器回调共享，进临界区改 */
     portENTER_CRITICAL(&s_lock);
     s_dirty = true;
     portEXIT_CRITICAL(&s_lock);
 
     /* 先停止再启动：esp_timer 要求启动前定时器处于停止状态。
-     * 每来一次新改动就重置，从而实现"静默一段时间后才落盘"。 */
+     * 每来一次新改动就重置，从而实现"静默一段时间后才落盘"。
+     * esp_timer_stop()：停止定时器（没在运行时返回错误，这里可以忽略）。
+     * esp_timer_start_once()：启动一个"只触发一次"的定时器，参数单位是微秒
+     * （所以毫秒值要乘 1000ULL）；回调即上面的 save_timer_callback() */
     esp_timer_stop(s_save_timer);
     esp_err_t err = esp_timer_start_once(s_save_timer, (uint64_t)SETTINGS_SAVE_DELAY_MS * 1000ULL);
     if (err != ESP_OK) {
@@ -262,8 +340,17 @@ static void mark_dirty_and_schedule(void)
     }
 }
 
+/**
+ * @brief 初始化配置服务：初始化 NVS 并把配置载入内存缓存
+ *
+ * 完整的初始化顺序与容错策略见函数体内的 ①②③ 注释。
+ *
+ * @return ESP_OK 成功（含"NVS 不可用但已用默认值"的降级情况）
+ *         ESP_ERR_NO_MEM 创建定时器失败
+ */
 esp_err_t settings_init(void)
 {
+    /* 防重复初始化：重复创建定时器会泄漏句柄 */
     if (s_ready) {
         ESP_LOGW(TAG, "已初始化，忽略重复调用");
         return ESP_OK;
@@ -273,7 +360,10 @@ esp_err_t settings_init(void)
      *    设备也一定能拿到一份合法配置继续运行（优雅降级） */
     load_defaults(&s_cache);
 
-    /* ② 创建防抖定时器（与 NVS 是否可用无关，先建好备用） */
+    /* ② 创建防抖定时器（与 NVS 是否可用无关，先建好备用）。
+     *    esp_timer_create_args_t 是定时器参数结构体：
+     *      callback —— 到点时调用的函数；arg —— 传给回调的参数；name —— 任务名前缀（便于调试）。
+     *    esp_timer_create() 按参数创建定时器，返回句柄供后续 start/stop 使用 */
     const esp_timer_create_args_t timer_cfg = {
         .callback = save_timer_callback,
         .arg = NULL,
@@ -303,6 +393,14 @@ esp_err_t settings_init(void)
     return ESP_OK;
 }
 
+/**
+ * @brief 读取当前生效的配置（从内存缓存，速度很快）
+ *
+ * @param out 输出配置，不可为 NULL
+ * @return ESP_OK 成功
+ *         ESP_ERR_INVALID_ARG out 为 NULL
+ *         ESP_ERR_INVALID_STATE 尚未初始化
+ */
 esp_err_t settings_get(settings_t *out)
 {
     if (out == NULL) {
@@ -321,6 +419,14 @@ esp_err_t settings_get(settings_t *out)
     return ESP_OK;
 }
 
+/**
+ * @brief 更新蜂鸣器响度：写入内存缓存并安排延迟落盘
+ *
+ * @param percent 响度 1~100
+ * @return ESP_OK 成功
+ *         ESP_ERR_INVALID_ARG 超出范围
+ *         ESP_ERR_INVALID_STATE 尚未初始化
+ */
 esp_err_t settings_set_buzzer_volume(uint8_t percent)
 {
     if (!s_ready) {
@@ -340,6 +446,16 @@ esp_err_t settings_set_buzzer_volume(uint8_t percent)
     return ESP_OK;
 }
 
+/**
+ * @brief 更新屏幕背光亮度：写入内存缓存并安排延迟落盘
+ *
+ * 亮度"立即生效"由调用方负责同步调用背光驱动，本函数只管保存。
+ *
+ * @param percent 亮度 10~100（下限 10 防止调到全黑后无法操作）
+ * @return ESP_OK 成功
+ *         ESP_ERR_INVALID_ARG 超出范围
+ *         ESP_ERR_INVALID_STATE 尚未初始化
+ */
 esp_err_t settings_set_lcd_brightness(uint8_t percent)
 {
     if (!s_ready) {
@@ -358,6 +474,14 @@ esp_err_t settings_set_lcd_brightness(uint8_t percent)
     return ESP_OK;
 }
 
+/**
+ * @brief 更新首页数据刷新率（测量页快速菜单中可调）
+ *
+ * @param hz 刷新率，仅接受 1/5/10/20/30（见 settings_rate_valid）
+ * @return ESP_OK 成功
+ *         ESP_ERR_INVALID_ARG 非合法档位
+ *         ESP_ERR_INVALID_STATE 尚未初始化
+ */
 esp_err_t settings_set_display_rate_hz(uint8_t hz)
 {
     if (!s_ready) {
@@ -376,6 +500,15 @@ esp_err_t settings_set_display_rate_hz(uint8_t hz)
     return ESP_OK;
 }
 
+/**
+ * @brief 更新屏幕方向设置（显示设置页调用；立即防抖落盘）
+ *
+ * @param auto_on 是否启用重力自动旋转（1/0）
+ * @param angle   手动方向角度（auto_on=0 时生效；仅接受 0/90/180/270）
+ * @return ESP_OK 成功
+ *         ESP_ERR_INVALID_ARG 非法角度
+ *         ESP_ERR_INVALID_STATE 尚未初始化
+ */
 esp_err_t settings_set_orientation(uint8_t auto_on, uint16_t angle)
 {
     if (!s_ready) {
@@ -385,6 +518,8 @@ esp_err_t settings_set_orientation(uint8_t auto_on, uint16_t angle)
         return ESP_ERR_INVALID_ARG;
     }
 
+    /* 开关与角度放在同一个临界区里更新，避免读者看到
+     * "新开关 + 旧角度"的不一致组合 */
     portENTER_CRITICAL(&s_lock);
     s_cache.orientation_auto = auto_on ? 1u : 0u;
     s_cache.orientation_angle = angle;
@@ -395,6 +530,12 @@ esp_err_t settings_set_orientation(uint8_t auto_on, uint16_t angle)
     return ESP_OK;
 }
 
+/**
+ * @brief 设置波形曲线平滑开关
+ *
+ * @param on 1=开启平滑，0=关闭（默认）
+ * @return ESP_OK 成功；ESP_ERR_INVALID_STATE 未初始化
+ */
 esp_err_t settings_set_wave_smooth(uint8_t on)
 {
     if (!s_ready) {
@@ -410,6 +551,15 @@ esp_err_t settings_set_wave_smooth(uint8_t on)
     return ESP_OK;
 }
 
+/**
+ * @brief 立即把内存缓存写入 NVS（忽略防抖）
+ *
+ * 典型用法：用户离开设置页、或设备即将关机前调用。
+ *
+ * @return ESP_OK 成功（含"无待保存改动"的空操作情况）
+ *         ESP_ERR_INVALID_STATE 尚未初始化
+ *         其他值 NVS 写入失败（内存缓存仍然有效，不影响当前运行）
+ */
 esp_err_t settings_save_now(void)
 {
     if (!s_ready) {
@@ -427,7 +577,8 @@ esp_err_t settings_save_now(void)
         return ESP_OK;
     }
 
-    /* 取消待执行的防抖任务，改为当前立即落盘 */
+    /* 取消待执行的防抖任务，改为当前立即落盘。
+     * esp_timer_stop()：停掉还没到点的单次定时器（没在运行也无害） */
     esp_timer_stop(s_save_timer);
 
     esp_err_t err = persist_cache();

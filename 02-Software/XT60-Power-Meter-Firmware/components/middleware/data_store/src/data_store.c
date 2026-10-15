@@ -16,10 +16,16 @@
  *   memory_order_acquire / release 就是在告诉编译器：
  *   「这条语句前后的内存访问顺序不能乱动」，从而保证别的核
  *   要么看到全部新数据，要么全部看不到。
+ *
+ * seqlock 的读写协议（配合 data_store_update/data_store_get 阅读）：
+ *   写端：序号+1（变奇数，宣告"写入中"）→ 拷贝数据 → 序号+1（变偶数，宣告"写完了"）；
+ *   读端：读序号 → 拷贝数据 → 再读序号，两次相同且为偶数才算成功。
+ *   序号检查要"做两次"，是为了抓住"拷贝到一半时写者插了进来"的情况——
+ *   这种撕裂数据（新老字段混搭）正是 seqlock 要消灭的问题。
  */
 #include "data_store.h"
 
-#include <stdatomic.h>
+#include <stdatomic.h> /* C11 原子操作：atomic_load/store、atomic_thread_fence 等 */
 #include <string.h>
 
 #include "esp_log.h"
@@ -50,9 +56,18 @@ static struct {
     atomic_bool has_data;           /**< 是否已有过至少一次有效写入 */
 } s_store;
 
+/**
+ * @brief 初始化数据仓库
+ *
+ * 只做内部状态清零，不分配动态内存（整份数据是静态分配的）。
+ *
+ * @return ESP_OK 成功
+ */
 esp_err_t data_store_init(void)
 {
-    /* 全部清零即可。atomic 类型支持直接赋值 0 */
+    /* 全部清零即可。atomic 类型支持直接赋值 0。
+     * memory_order_relaxed：纯初始化清零，此时还没有别的核在读，
+     * 不需要额外的顺序保证，用最弱的约束换取最少的性能开销 */
     atomic_store_explicit(&s_store.seq, 0, memory_order_relaxed);
     atomic_store_explicit(&s_store.update_count, 0, memory_order_relaxed);
     atomic_store_explicit(&s_store.has_data, false, memory_order_relaxed);
@@ -63,6 +78,15 @@ esp_err_t data_store_init(void)
     return ESP_OK;
 }
 
+/**
+ * @brief 写入最新快照（只能由测量核调用，单写者！）
+ *
+ * 完整的 seqlock 写协议共 6 步，见函数体内 ①~⑥ 注释。
+ * 本函数不会阻塞，任何时刻调用都能立即返回。
+ *
+ * @param snapshot 要写入的快照，不可为 NULL
+ * @return ESP_OK 成功；ESP_ERR_INVALID_ARG 参数为 NULL
+ */
 esp_err_t data_store_update(const data_store_snapshot_t *snapshot)
 {
     if (snapshot == NULL) {
@@ -76,7 +100,9 @@ esp_err_t data_store_update(const data_store_snapshot_t *snapshot)
     atomic_store_explicit(&s_store.seq, seq + 1, memory_order_relaxed);
 
     /* 第 ② 步：这一句保证「序号变奇数」先于「数据拷贝」被其他核看到，
-     *          否则读者可能先看到新数据再看到奇数序号，导致误判 */
+     *          否则读者可能先看到新数据再看到奇数序号，导致误判。
+     * atomic_thread_fence(release)：内存栅栏，禁止其前后的内存访问
+     * 被编译器/CPU 重排序（release 侧约束写入顺序） */
     atomic_thread_fence(memory_order_release);
 
     /* 第 ③ 步：拷贝数据本体（24 字节，几条指令即可完成） */
@@ -89,13 +115,27 @@ esp_err_t data_store_update(const data_store_snapshot_t *snapshot)
     /* 第 ⑤ 步：序号 +2（seq+1 → seq+2），变回偶数 —— 宣告「数据已完整」 */
     atomic_store_explicit(&s_store.seq, seq + 2, memory_order_relaxed);
 
-    /* 第 ⑥ 步：更新计数与「已有数据」标志，供读取方判断数据是否可用 */
+    /* 第 ⑥ 步：更新计数与「已有数据」标志，供读取方判断数据是否可用。
+     * atomic_fetch_add：原子地"读出旧值并加一"，多核下也不会数错 */
     atomic_fetch_add_explicit(&s_store.update_count, 1, memory_order_relaxed);
     atomic_store_explicit(&s_store.has_data, true, memory_order_relaxed);
 
     return ESP_OK;
 }
 
+/**
+ * @brief 读取最新快照（交互核 / 任意任务可调用）
+ *
+ * 内部采用 seqlock 重试机制，保证读到的是一份「自洽」的数据，
+ * 不会出现新老字段混搭（数据撕裂）的情况。
+ *
+ * @param out 输出快照，不可为 NULL
+ * @return ESP_OK 成功读到一致数据
+ *         ESP_ERR_INVALID_ARG 参数为 NULL
+ *         ESP_ERR_INVALID_STATE 尚无任何数据写入过
+ *         ESP_ERR_TIMEOUT 连续重试仍未能读到一致数据（理论上极少发生，
+ *                         通常意味着写入过于频繁或系统异常）
+ */
 esp_err_t data_store_get(data_store_snapshot_t *out)
 {
     if (out == NULL) {
@@ -108,6 +148,7 @@ esp_err_t data_store_get(data_store_snapshot_t *out)
         return ESP_ERR_INVALID_STATE;
     }
 
+    /* 读端核心：最多重试 DATA_STORE_MAX_RETRY 次，直到拿到一致的数据 */
     for (int retry = 0; retry < DATA_STORE_MAX_RETRY; retry++) {
         /* 读序号。用 acquire 语义确保下面读到的数据不会"跑到"序号读取之前 */
         unsigned int seq_before = atomic_load_explicit(&s_store.seq, memory_order_acquire);
@@ -129,7 +170,8 @@ esp_err_t data_store_get(data_store_snapshot_t *out)
             return ESP_OK;
         }
 
-        /* 序号变了 → 拷贝过程中被写入打断，重来一次 */
+        /* 序号变了 → 拷贝过程中被写入打断（读到了撕裂数据），重来一次。
+         * 这就是"读端校验序号两次"的原因：只查一次抓不住中途插进来的写者 */
     }
 
     /* 重试若干次仍不稳定：可能是写入频率异常高，返回超时让调用方决定如何处理 */
@@ -137,7 +179,16 @@ esp_err_t data_store_get(data_store_snapshot_t *out)
     return ESP_ERR_TIMEOUT;
 }
 
+/**
+ * @brief 查询累计写入次数
+ *
+ * 用途：交互核可以据此判断"数据是否有更新"，避免重复处理同一份数据；
+ * 也便于在调试时确认测量核是否真的在跑。
+ *
+ * @return 自初始化以来 data_store_update() 被调用的总次数
+ */
 uint32_t data_store_update_count(void)
 {
+    /* memory_order_relaxed：只读个统计数字，不需要与其他数据保持顺序关系 */
     return atomic_load_explicit(&s_store.update_count, memory_order_relaxed);
 }
