@@ -38,9 +38,10 @@ static TaskHandle_t s_task = NULL;
  * IMU 姿态 → 屏幕角度（以默认横屏为 0°，顺时针）。
  *
  * ⚠ 装配相关：SC7A20H 的轴方向与屏幕的对应关系取决于焊接方向。
- *   当前为自然约定（LANDSCAPE=0°、PORTRAIT=90°）；若上板发现自动旋转
- *   横竖对调或镜像，**只改这张表**（驱动 classify_orientation 的符号
- *   判定也可能需要一起翻转，见 imu_sc7a20h.c 文件头调试说明）。
+ *   2026-10 实机标定：竖屏两向原表反了（PORTRAIT 应对 270°、
+ *   PORTRAIT_INV 应对 90°），已按实测对调；横屏两向不变。
+ *   换板/换 IMU 贴片方向时**只改这张表**（驱动 classify_orientation 的
+ *   符号判定也可能需要一起翻转，见 imu_sc7a20h.c 文件头调试说明）。
  */
 static uint16_t imu_orient_to_angle(imu_sc7a20h_orientation_t o)
 {
@@ -48,11 +49,11 @@ static uint16_t imu_orient_to_angle(imu_sc7a20h_orientation_t o)
     case IMU_SC7A20H_ORIENT_LANDSCAPE:
         return 0;
     case IMU_SC7A20H_ORIENT_PORTRAIT:
-        return 90;
+        return 270;
     case IMU_SC7A20H_ORIENT_LANDSCAPE_INV:
         return 180;
     case IMU_SC7A20H_ORIENT_PORTRAIT_INV:
-        return 270;
+        return 90;
     default:
         return ORIENT_INVALID_ANG;
     }
