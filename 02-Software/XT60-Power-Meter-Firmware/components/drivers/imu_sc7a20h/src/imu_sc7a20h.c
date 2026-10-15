@@ -156,12 +156,33 @@ static void classify_orientation(int16_t x, int16_t y, int16_t z,
     }
 }
 
+/**
+ * @brief 卸载 SC7A20H 器件句柄（初始化失败回滚用）
+ *
+ * i2c_master_bus_add_device()（新版 esp_driver_i2c）在总线上**注册**一个器件
+ * 句柄（占一条地址映射），而 i2c_master_bus_rm_device() 把它从总线上**注销**
+ * 并释放句柄。两者成对：add 之后若 init 中途失败却不 rm，重试 init 会再次
+ * add 同一地址——旧句柄泄漏（总线器件表不断增长），最终 add 返回错误或耗尽
+ * 资源。故任何 add 成功之后的失败路径都必须 rm 并把句柄置 NULL。
+ */
+static void imu_release_dev(void)
+{
+    if (s_dev != NULL) {
+        i2c_master_bus_rm_device(s_dev);
+        s_dev = NULL;
+    }
+}
+
 esp_err_t imu_sc7a20h_init(void)
 {
     if (s_initialized) {
         ESP_LOGW(TAG, "已初始化，忽略重复调用");
         return ESP_ERR_INVALID_STATE;
     }
+
+    /* 防御：若上次 init 中途失败留下残留句柄，先注销再重建
+     * （正常路径 imu_release_dev() 已保证 s_dev == NULL） */
+    imu_release_dev();
 
     /* ---- ① 取共享传感器 I2C 总线（与 AHT20 共用同一总线控制器） ---- */
     i2c_master_bus_handle_t bus = NULL;
@@ -188,7 +209,7 @@ esp_err_t imu_sc7a20h_init(void)
     err = imu_read_reg(IMU_REG_WHO_AM_I, &who);
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "读 SC7A20H ID 失败: %s", esp_err_to_name(err));
-        return err;
+        goto fail_dev;
     }
     if (who != IMU_WHO_AM_I_EXPECT) {
         ESP_LOGW(TAG, "SC7A20H ID = 0x%02X（预期 0x%02X），批次可能不同，继续尝试初始化", who,
@@ -201,17 +222,22 @@ esp_err_t imu_sc7a20h_init(void)
     err = imu_write_reg(IMU_REG_CTRL4, IMU_CTRL4_BDU_FS2G);
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "配置 CTRL_REG4 失败: %s", esp_err_to_name(err));
-        return err;
+        goto fail_dev;
     }
     err = imu_write_reg(IMU_REG_CTRL1, IMU_CTRL1_ODR_100HZ_XYZ);
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "配置 CTRL_REG1 失败: %s", esp_err_to_name(err));
-        return err;
+        goto fail_dev;
     }
 
     s_initialized = true;
     ESP_LOGI(TAG, "初始化完成（I2C 地址 0x%02X，ID=0x%02X，±2g @100Hz）", IMU_I2C_ADDR, who);
     return ESP_OK;
+
+fail_dev:
+    /* 失败回滚：注销器件句柄，保证重试 init 不泄漏（见 imu_release_dev 注释） */
+    imu_release_dev();
+    return err;
 }
 
 esp_err_t imu_sc7a20h_get_orientation(imu_sc7a20h_orientation_t *out)

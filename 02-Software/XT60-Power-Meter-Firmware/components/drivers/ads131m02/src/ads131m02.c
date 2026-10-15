@@ -131,6 +131,29 @@ static const char *TAG = "ads131m02";
  *   而 ads131m02_read()（等 DRDY 后读一帧）一直是对的，正说明帧同步是关键。
  */
 
+/**
+ * 并发模型（所有 SPI 访问的串行化规则，出并发问题先看这里）
+ *
+ * 访问者有两类，且运行期可能并发：
+ *   ① ads131m02_read()        —— 测量核高频采样；
+ *   ② ads_read_reg/write_reg/send_cmd() —— init 写配置 + 运行期诊断/自检读寄存器。
+ * 本板无片选，帧边界只靠「等 DRDY 后连续时钟整帧」维持（见上）：两路访问
+ * 一旦交错时钟，就会互相吞 DRDY、帧错位，读到的值全乱。
+ *
+ * 规则：**任何 SPI 访问都必须持有 s_bus_mutex**，且「清残留信号量 → 等 DRDY →
+ * 交换帧」是锁内一个不可分割的序列：
+ *   · 「清残留」必须在锁内、紧挨着「等 DRDY」：若在锁外清，清完到进入等待
+ *     之间别人的传输完成会产生新的残留，等待者就把别人那一轮的 DRDY 当成
+ *     自己的帧起点，帧边界随即错位；
+ *   · 「等 DRDY」也在锁内短等：ODR=500Hz（一帧 2ms），正常等待 ≤2ms，
+ *     超时上限 ADS_DRDY_TIMEOUT_MS。代价是诊断的两帧寄存器访问会短暂挡住
+ *     采样 read()，故 ADS_MUTEX_TIMEOUT_MS 按「一次两帧寄存器访问的最坏
+ *     持锁时间」取值；
+ *   · 不采用「锁外等 DRDY、锁内交换帧」：那样同一时刻可有多个等待者，
+ *     各自拿到 DRDY 后排队进锁，轮到自己时帧早被别人时钟走，照样错位。
+ * 任一时刻只有一个访问者，DRDY 等待者也只有一个——这就是本驱动的并发模型。
+ */
+
 /* ============================================================
  * 命令编码（手册 Table 8-11）
  * ============================================================ */
@@ -214,8 +237,14 @@ static const char *TAG = "ads131m02";
 #define ADS_RESET_LOW_MS    2   /**< RESET# 低电平保持（手册要求 ≥ 1ms） */
 #define ADS_POWERUP_MS      50  /**< 复位释放后等待（上电 + 时钟起振） */
 #define ADS_CMD_GAP_MS      2   /**< 命令之间留出的间隔 */
-#define ADS_DRDY_TIMEOUT_MS 100 /**< 等 DRDY# 超时（采样周期 1ms，余量充足） */
-#define ADS_MUTEX_TIMEOUT_MS 50 /**< 取总线互斥锁超时 */
+#define ADS_DRDY_TIMEOUT_MS 100 /**< 等 DRDY# 超时（一帧 2ms，余量充足） */
+/**
+ * 取总线互斥锁超时。
+ * 「等 DRDY + 交换帧」整个序列都在锁内（见文件头并发模型），因此一次两帧的
+ * 寄存器访问最坏持锁 ≈ 2×ADS_DRDY_TIMEOUT_MS，取 300ms 留裕量；
+ * 采样侧取不到锁只丢一帧（500Hz 下一帧 2ms），不构成问题。
+ */
+#define ADS_MUTEX_TIMEOUT_MS 300
 
 /** 是否已初始化 */
 static bool s_initialized = false;
@@ -223,7 +252,7 @@ static bool s_initialized = false;
 static spi_device_handle_t s_spi = NULL;
 /** DRDY# 下降沿信号量（ISR 给、任务取） */
 static SemaphoreHandle_t s_drdy_sem = NULL;
-/** SPI 事务互斥锁：测量核与诊断可能并发调用 ads131m02_read() */
+/** SPI 事务互斥锁：所有 SPI 访问（采样 read / 寄存器读写 / 命令）统一持锁，见文件头并发模型 */
 static SemaphoreHandle_t s_bus_mutex = NULL;
 /** DRDY# 边沿累计（诊断：区分 DRDY 真实速率与任务处理速率） */
 static atomic_uint s_drdy_count;
@@ -326,13 +355,34 @@ static esp_err_t ads_xfer_raw(const uint32_t *tx24, uint32_t *rx24, size_t word_
 }
 
 /**
+ * @brief 取总线互斥锁（所有 SPI 访问的统一入口，见文件头「并发模型」）
+ *
+ * @return true 已持锁；false 超时（有其他访问者长时间占用）
+ */
+static bool ads_bus_lock(void)
+{
+    return xSemaphoreTake(s_bus_mutex, pdMS_TO_TICKS(ADS_MUTEX_TIMEOUT_MS)) == pdTRUE;
+}
+
+/** @brief 归还总线互斥锁（与 ads_bus_lock() 成对） */
+static void ads_bus_unlock(void)
+{
+    xSemaphoreGive(s_bus_mutex);
+}
+
+/**
  * @brief 等一次 DRDY# 下降沿（= 一帧的起点）
  *
- * 先清掉可能残留的信号量，再阻塞等待，保证拿到的是"最新的一帧起点"。
+ * ⚠ 调用前提：必须已持 s_bus_mutex。「清残留 → 等 DRDY → 交换帧」是锁内
+ * 不可分割的序列（并发模型见文件头）：清残留与等待之间不允许任何人插进来
+ * 产生新的 DRDY，否则等待者会把别人的帧当成自己的帧起点。
+ *
+ * 先清掉可能残留的信号量（上一轮传输完成后 ISR 给出、没人取的），
+ * 再阻塞等待，保证拿到的是"最新的一帧起点"。正常等待 ≤ 一帧周期 2ms。
  *
  * @return ESP_OK；ESP_ERR_TIMEOUT 超时（通常意味着 ADC 无时钟 / DRDY 未接）
  */
-static esp_err_t ads_wait_drdy(void)
+static esp_err_t ads_wait_drdy_locked(void)
 {
     (void)xSemaphoreTake(s_drdy_sem, 0); /* 清残留 */
     if (xSemaphoreTake(s_drdy_sem, pdMS_TO_TICKS(ADS_DRDY_TIMEOUT_MS)) != pdTRUE) {
@@ -364,28 +414,34 @@ static esp_err_t ads_read_reg(uint8_t addr, uint16_t *value)
     uint32_t tx[ADS_FRAME_WORDS] = { 0 };
     uint32_t rx[ADS_FRAME_WORDS] = { 0 };
 
+    /* 寄存器访问与采样 read() 同样是 SPI 访问，必须持锁（见文件头并发模型）。
+     * 两帧都完成才放锁，中途任何错误路径都统一在解锁处归还。 */
+    if (!ads_bus_lock()) {
+        return ESP_ERR_TIMEOUT;
+    }
+
     /* 帧 N：发 RREG */
-    esp_err_t err = ads_wait_drdy();
+    esp_err_t err = ads_wait_drdy_locked();
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "等 DRDY 超时（RREG 0x%02X 命令帧）", addr);
-        return err;
+        goto done;
     }
     tx[0] = ADS_W(ADS_CMD_RREG(addr, 1));
     err = ads_xfer_raw(tx, rx, ADS_FRAME_WORDS);
     if (err != ESP_OK) {
-        return err;
+        goto done;
     }
 
     /* 帧 N+1：帧首字即寄存器内容 */
-    err = ads_wait_drdy();
+    err = ads_wait_drdy_locked();
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "等 DRDY 超时（RREG 0x%02X 响应帧）", addr);
-        return err;
+        goto done;
     }
     tx[0] = ADS_W(ADS_CMD_NULL);
     err = ads_xfer_raw(tx, rx, ADS_FRAME_WORDS);
     if (err != ESP_OK) {
-        return err;
+        goto done;
     }
 
     *value = (uint16_t)(rx[0] >> 8);
@@ -393,7 +449,10 @@ static esp_err_t ads_read_reg(uint8_t addr, uint16_t *value)
     /* 诊断：开 DEBUG 级日志可看到整帧原始字，便于核对 */
     ESP_LOGD(TAG, "RREG 0x%02X -> 0x%04X（响应帧: %06X %06X %06X）", addr, *value, (unsigned)rx[0],
              (unsigned)rx[1], (unsigned)rx[2]);
-    return ESP_OK;
+
+done:
+    ads_bus_unlock();
+    return err;
 }
 
 /**
@@ -413,29 +472,34 @@ static esp_err_t ads_write_reg(uint8_t addr, uint16_t value)
     uint32_t tx[ADS_FRAME_WORDS] = { 0 };
     uint32_t rx[ADS_FRAME_WORDS] = { 0 };
 
+    /* 寄存器访问统一持锁（见文件头并发模型），两帧完成才放锁 */
+    if (!ads_bus_lock()) {
+        return ESP_ERR_TIMEOUT;
+    }
+
     /* 帧 N：发 WREG + 数据 */
-    esp_err_t err = ads_wait_drdy();
+    esp_err_t err = ads_wait_drdy_locked();
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "等 DRDY 超时（WREG 0x%02X 命令帧）", addr);
-        return err;
+        goto done;
     }
     tx[0] = ADS_W(ADS_CMD_WREG(addr, 1));
     tx[1] = ADS_W(value);
     err = ads_xfer_raw(tx, rx, ADS_FRAME_WORDS);
     if (err != ESP_OK) {
-        return err;
+        goto done;
     }
 
     /* 帧 N+1：取应答字 */
-    err = ads_wait_drdy();
+    err = ads_wait_drdy_locked();
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "等 DRDY 超时（WREG 0x%02X 应答帧）", addr);
-        return err;
+        goto done;
     }
     tx[0] = ADS_W(ADS_CMD_NULL);
     err = ads_xfer_raw(tx, rx, ADS_FRAME_WORDS);
     if (err != ESP_OK) {
-        return err;
+        goto done;
     }
 
     const uint16_t ack = (uint16_t)(rx[0] >> 8);
@@ -443,10 +507,14 @@ static esp_err_t ads_write_reg(uint8_t addr, uint16_t value)
     if ((ack & 0xE000u) != 0x4000u || (ack & 0x7Fu) != 0u) {
         ESP_LOGE(TAG, "WREG 0x%02X=0x%04X 应答异常: 0x%04X（应答帧: %06X %06X %06X）", addr, value,
                  ack, (unsigned)rx[0], (unsigned)rx[1], (unsigned)rx[2]);
-        return ESP_ERR_INVALID_RESPONSE;
+        err = ESP_ERR_INVALID_RESPONSE;
+        goto done;
     }
     ESP_LOGI(TAG, "WREG 0x%02X=0x%04X 已确认（应答 0x%04X）", addr, value, ack);
-    return ESP_OK;
+
+done:
+    ads_bus_unlock();
+    return err;
 }
 
 /**
@@ -461,35 +529,43 @@ static esp_err_t ads_send_cmd(uint16_t cmd, uint16_t *response)
     uint32_t tx[ADS_FRAME_WORDS] = { 0 };
     uint32_t rx[ADS_FRAME_WORDS] = { 0 };
 
+    /* 命令同样是 SPI 访问，统一持锁（见文件头并发模型） */
+    if (!ads_bus_lock()) {
+        return ESP_ERR_TIMEOUT;
+    }
+
     /* 帧 N：发命令 */
-    esp_err_t err = ads_wait_drdy();
+    esp_err_t err = ads_wait_drdy_locked();
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "等 DRDY 超时（命令 0x%04X 帧）", cmd);
-        return err;
+        goto done;
     }
     tx[0] = ADS_W(cmd);
     err = ads_xfer_raw(tx, rx, ADS_FRAME_WORDS);
     if (err != ESP_OK) {
-        return err;
+        goto done;
     }
 
     if (response == NULL) {
-        return ESP_OK;
+        goto done;
     }
 
     /* 帧 N+1：响应帧 */
-    err = ads_wait_drdy();
+    err = ads_wait_drdy_locked();
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "等 DRDY 超时（命令 0x%04X 响应帧）", cmd);
-        return err;
+        goto done;
     }
     tx[0] = ADS_W(ADS_CMD_NULL);
     err = ads_xfer_raw(tx, rx, ADS_FRAME_WORDS);
     if (err != ESP_OK) {
-        return err;
+        goto done;
     }
     *response = (uint16_t)(rx[0] >> 8);
-    return ESP_OK;
+
+done:
+    ads_bus_unlock();
+    return err;
 }
 
 esp_err_t ads131m02_init(void)
@@ -787,14 +863,16 @@ esp_err_t ads131m02_read(ads131m02_sample_t *out)
         return ESP_ERR_INVALID_STATE;
     }
 
-    /* 串行化整段「等 DRDY + 读一帧」，避免并发调用把帧交错打乱 */
-    if (xSemaphoreTake(s_bus_mutex, pdMS_TO_TICKS(ADS_MUTEX_TIMEOUT_MS)) != pdTRUE) {
+    /* 串行化整段「等 DRDY + 读一帧」：与寄存器访问共用同一把锁，
+     * 避免并发调用互相吞 DRDY、把帧交错打乱（见文件头并发模型） */
+    if (!ads_bus_lock()) {
         return ESP_ERR_TIMEOUT;
     }
 
-    /* 等 DRDY# 下降沿：代表一轮新的同步采样已就绪 */
-    if (xSemaphoreTake(s_drdy_sem, pdMS_TO_TICKS(ADS_DRDY_TIMEOUT_MS)) != pdTRUE) {
-        xSemaphoreGive(s_bus_mutex);
+    /* 等 DRDY# 下降沿：代表一轮新的同步采样已就绪。
+     * 锁内先清残留再等，保证等的是"最新一帧起点"（与寄存器访问同一序列）。 */
+    if (ads_wait_drdy_locked() != ESP_OK) {
+        ads_bus_unlock();
         return ESP_ERR_TIMEOUT;
     }
 
@@ -829,7 +907,7 @@ esp_err_t ads131m02_read(ads131m02_sample_t *out)
         out->crc_ok = (crc_calc == crc_rx);
     }
 
-    xSemaphoreGive(s_bus_mutex);
+    ads_bus_unlock();
     return err;
 }
 

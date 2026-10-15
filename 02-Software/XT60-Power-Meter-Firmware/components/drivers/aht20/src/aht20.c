@@ -110,12 +110,33 @@ static esp_err_t aht20_wait_ready(void)
     return ESP_ERR_TIMEOUT;
 }
 
+/**
+ * @brief 卸载 AHT20 器件句柄（初始化失败回滚用）
+ *
+ * i2c_master_bus_add_device()（新版 esp_driver_i2c）在总线上**注册**一个器件
+ * 句柄（占一条地址映射），而 i2c_master_bus_rm_device() 把它从总线上**注销**
+ * 并释放句柄。两者成对：add 之后若 init 中途失败却不 rm，重试 init 会再次
+ * add 同一地址——旧句柄泄漏（总线器件表不断增长），最终 add 返回错误或耗尽
+ * 资源。故任何 add 成功之后的失败路径都必须 rm 并把句柄置 NULL。
+ */
+static void aht20_release_dev(void)
+{
+    if (s_dev != NULL) {
+        i2c_master_bus_rm_device(s_dev);
+        s_dev = NULL;
+    }
+}
+
 esp_err_t aht20_init(void)
 {
     if (s_initialized) {
         ESP_LOGW(TAG, "已初始化，忽略重复调用");
         return ESP_ERR_INVALID_STATE;
     }
+
+    /* 防御：若上次 init 中途失败留下残留句柄，先注销再重建
+     * （正常路径 aht20_release_dev() 已保证 s_dev == NULL） */
+    aht20_release_dev();
 
     /* ---- ① 取共享传感器 I2C 总线（与 SC7A20H 共用同一总线控制器） ---- */
     i2c_master_bus_handle_t bus = NULL;
@@ -145,14 +166,14 @@ esp_err_t aht20_init(void)
     err = aht20_read_status(&status);
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "读 AHT20 状态失败: %s", esp_err_to_name(err));
-        return err;
+        goto fail_dev;
     }
     if ((status & AHT20_STATUS_CALIBRATED) == 0) {
         err = i2c_master_transmit(s_dev, AHT20_CMD_INIT, sizeof(AHT20_CMD_INIT),
                                   AHT20_I2C_TIMEOUT_MS);
         if (err != ESP_OK) {
             ESP_LOGE(TAG, "AHT20 初始化命令失败: %s", esp_err_to_name(err));
-            return err;
+            goto fail_dev;
         }
         vTaskDelay(pdMS_TO_TICKS(AHT20_INIT_WAIT_MS));
     }
@@ -162,13 +183,18 @@ esp_err_t aht20_init(void)
                               AHT20_I2C_TIMEOUT_MS);
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "AHT20 首次触发失败: %s", esp_err_to_name(err));
-        return err;
+        goto fail_dev;
     }
     vTaskDelay(pdMS_TO_TICKS(AHT20_MEASURE_WAIT_MS));
 
     s_initialized = true;
     ESP_LOGI(TAG, "初始化完成（I2C 地址 0x%02X）", AHT20_I2C_ADDR);
     return ESP_OK;
+
+fail_dev:
+    /* 失败回滚：注销器件句柄，保证重试 init 不泄漏（见 aht20_release_dev 注释） */
+    aht20_release_dev();
+    return err;
 }
 
 esp_err_t aht20_read(aht20_reading_t *out)

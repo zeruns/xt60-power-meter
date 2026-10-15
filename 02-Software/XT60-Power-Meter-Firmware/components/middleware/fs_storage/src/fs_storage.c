@@ -9,8 +9,10 @@
  *
  * 关键设计：
  *   · 幂等：重复调用 fs_storage_init() 直接返回成功，不重复向 VFS 注册；
- *   · 首次烧录的分区是空白的（没有有效 SPIFFS 结构），普通挂载必然失败，
- *     所以打开 format_if_mount_failed 让驱动自动格式化一次再挂，保证首启可用；
+ *   · **格式化是最后手段**：分区里存的是 UI 字体资源（中文显示依赖），
+ *     静默格式化会把已烧录的字库抹掉、只剩空文件系统。故先按
+ *     format_if_mount_failed=false 正常挂载，失败后先告警再允许格式化重挂
+ *     ——只在"分区确实是空白/已损坏"时才走到格式化，且格式化前明确告知后果；
  *   · 挂载成功后查询并打印容量占用，方便提前发现"字体快放不下"。
  *
  * 时序约束：必须在 lvgl_port 创建字体之前调用（启动表已保证顺序），
@@ -33,9 +35,18 @@ static const char *TAG = "fs_storage";
 static bool s_mounted = false;
 
 /**
- * @brief 挂载 storage 分区到 /spiffs（失败自动格式化重试一次）
+ * @brief 挂载 storage 分区到 /spiffs（格式化是最后手段，格式化前必告警）
  *
- * 流程：填 VFS 配置结构 → esp_vfs_spiffs_register() 挂载 → esp_spiffs_info() 查容量。
+ * 流程：
+ *   ① 先用 format_if_mount_failed=false 正常挂载一次（不动分区内容）——
+ *      已烧录字体的量产设备绝大多数走这条路，零风险；
+ *   ② 仅当 ① 失败（分区空白/文件系统损坏）才允许格式化重挂一次，
+ *      且格式化前用 ESP_LOGW 明确告知"字体分区将被格式化，中文显示需重烧资源"；
+ *   ③ 成功后 esp_spiffs_info() 查容量。
+ *
+ * 为什么不一上来就 format_if_mount_failed=true（历史写法的坑）：
+ *   它会**静默**把分区抹掉重建——如果只是偶发挂载错误或版本不匹配，
+ *   烧录好的中文字库就没了，且日志上看不出数据已丢，属于高代价的隐性破坏。
  *
  * @return ESP_OK 成功；其他为 SPIFFS/VFS 错误（此时上层应回退内置字体）
  * @note 本函数只负责把分区挂起来，不创建/写入任何文件。
@@ -55,17 +66,28 @@ esp_err_t fs_storage_init(void)
         .base_path = FS_STORAGE_MOUNT_POINT,
         .partition_label = FS_STORAGE_PARTITION_LABEL,
         .max_files = FS_STORAGE_MAX_FILES,
-        /* 首次烧录分区可能是空白（无有效 SPIFFS 结构），让驱动自动格式化，
-         * 避免首启失败；镜像损坏的情况同理。 */
-        .format_if_mount_failed = true,
+        /* ① 第一次挂载禁止自动格式化：先把分区当"已有数据"对待 */
+        .format_if_mount_failed = false,
     };
 
     esp_err_t err = esp_vfs_spiffs_register(&conf);
     /* ^ 把 SPIFFS 分区注册为 VFS，挂到 base_path 指定的 /spiffs 路径，
      *   之后即可用标准 fopen("/spiffs/xxx", ...) 读写分区里的文件 */
     if (err != ESP_OK) {
-        ESP_LOGE(TAG, "SPIFFS 挂载失败（已尝试自动格式化）: %s", esp_err_to_name(err));
-        return err;
+        /* ② 正常挂载失败（分区空白/文件系统损坏/label 找不到等）：
+         * 格式化重挂是最后手段，但会抹掉字体资源——必须显式告警后再做，
+         * 绝不静默格式化。先反注册兜底，避免重复 register 报"已注册"。 */
+        ESP_LOGW(TAG, "SPIFFS 首次挂载失败（%s）：字体分区将被格式化，"
+                      "中文显示需重烧资源！（仅在分区空白/损坏时才会走到这里）",
+                 esp_err_to_name(err));
+        esp_vfs_spiffs_unregister(FS_STORAGE_PARTITION_LABEL);
+
+        conf.format_if_mount_failed = true;
+        err = esp_vfs_spiffs_register(&conf);
+        if (err != ESP_OK) {
+            ESP_LOGE(TAG, "SPIFFS 格式化重挂仍失败: %s", esp_err_to_name(err));
+            return err;
+        }
     }
 
     size_t total = 0, used = 0;

@@ -76,9 +76,11 @@ static const char *TAG = "lcd_nv3030b";
 #define LCD_QSPI_HOST        SPI2_HOST
 /* QSPI 写显存时钟。
  * 实测结论（本模组 + 本板走线）：40MHz 花屏；30MHz 表面正常但持续刷屏数秒后
- * 面板失锁（软件全链路 ESP_OK，但 GRAM 不再更新，屏幕冻结）；降到 10MHz 后
- * 横屏长时间运行稳定。根因是该面板/走线的信号完整性裕量不足。
- * ⚠ 该值与显示稳定性强相关，不要随意调高；换批次若仍异常可再降档。
+ * 面板失锁（软件全链路 ESP_OK，但 GRAM 不再更新，屏幕冻结），根因是该面板/
+ * 走线的信号完整性裕量不足。曾在排查中降到 10MHz 临时稳定；后续做了「台阶1」
+ * 走线/时序优化后，现状 23MHz 实测长时间稳定，为当前量产取值。
+ * ⚠ 该值与显示稳定性强相关：若换批次/改板出现刷屏冻结，优先降档排查；
+ *   反向调高必须重新长时间刷屏实测验证，不可只看短时正常。
  * 注意：只影响写显存速率，不影响命令时序。 */
 #define LCD_QSPI_PCLK_HZ     (23 * 1000 * 1000)
 #define LCD_QSPI_CMD_BITS    32
@@ -173,8 +175,31 @@ static lcd_nv3030b_rotation_t s_rotation = LCD_NV3030B_ROT_90;
 
 static uint8_t s_fill_buf[LCD_NV3030B_H_RES * LCD_FILL_ROWS * 2];
 
-/** 清屏 / 自检图案的「等待传输完成」同步信号量（运行期置 NULL，改用上层回调） */
+/**
+ * 清屏 / 自检图案的「等待传输完成」同步信号量（**创建一次、常驻不删**）
+ *
+ * ⚠ 为什么不删（曾踩的竞态）：颜色完成回调 lcd_panel_io_color_done_cb() 在
+ * SPI 中断上下文执行，会先判 s_clear_sem != NULL 再 give；若 init 任务在
+ * 清屏完成后 vSemaphoreDelete() 并置 NULL，回调可能恰好在「判断非空」与
+ * 「give」之间执行删除 → 对已释放内存 give，use-after-free 直接崩。
+ * 「删除前注销回调」也堵不住：esp_lcd 没有注销 on_color_trans_done 的接口，
+ * 且可能已有 DMA 传输在飞、回调已在中断里排队。
+ * 故采用**常驻方案**：init 时创建一次、永不删除（一个二值信号量的内存开销
+ * 可忽略），每次清屏块之间 take 掉可能残留的 give 即可；
+ * 运行期刷屏由上层注册的 s_flush_done_cb 通知（见该回调实现）。
+ */
 static SemaphoreHandle_t s_clear_sem = NULL;
+
+/**
+ * 「清屏/自检进行中」标志（回调据此决定给信号量还是转发上层回调）
+ *
+ * 信号量常驻后不能再用「s_clear_sem 是否为 NULL」判断阶段（它永远非 NULL），
+ * 故用本标志：清屏/自检期间为 true（回调 give 信号量），其余时间为 false
+ * （回调转发 s_flush_done_cb 给 LVGL）。只在任务侧写、ISR 侧读，
+ * 用 volatile 保证可见性；写入时机都在「提交 DMA 之前」与「DMA 已确认完成后」，
+ * 不存在 ISR 读到中间态的问题。
+ */
+static volatile bool s_clear_waiting = false;
 
 /* 开机显示自检图案（诊断用，0 = 关闭）。
  *
@@ -205,6 +230,10 @@ static esp_err_t panel_draw_test_pattern(void)
 
     const int bar_rows = LCD_NV3030B_V_RES / 5; /* 240/5 = 48 行/条 */
 
+    /* 本函数独立于 panel_clear 被调用，自行置「清屏等待」标志，
+     * 让颜色完成回调把完成发给信号量而不是上层回调 */
+    s_clear_waiting = true;
+
     for (int i = 0; i < 5; i++) {
         for (size_t k = 0; k < sizeof(row_buf); k += 2) {
             /* big-endian：先高字节、后低字节（与 RGB565_SWAPPED 一致） */
@@ -217,12 +246,17 @@ static esp_err_t panel_draw_test_pattern(void)
 
         esp_err_t err = lcd_nv3030b_draw_bitmap(0, y0, LCD_NV3030B_H_RES, y1, row_buf);
         if (err != ESP_OK) {
+            s_clear_waiting = false;
             return err;
         }
+        /* 先清残留 give 再等本轮 DMA（信号量常驻，残留会给假完成，见 panel_clear） */
+        (void)xSemaphoreTake(s_clear_sem, 0);
         if (xSemaphoreTake(s_clear_sem, pdMS_TO_TICKS(200)) != pdTRUE) {
+            s_clear_waiting = false;
             return ESP_ERR_TIMEOUT;
         }
     }
+    s_clear_waiting = false;
     return ESP_OK;
 }
 #endif /* LCD_BOOT_TEST_PATTERN_MS */
@@ -233,6 +267,10 @@ static esp_err_t panel_draw_test_pattern(void)
  * esp_lcd 对颜色数据走 spi_device_queue_trans（异步），只有这个回调触发时
  * 才代表 DMA 真正结束、缓冲可安全复用。
  *
+ * ⚠ 信号量常驻（见 s_clear_sem 注释）：这里不再判「s_clear_sem != NULL」，
+ * 而是看 s_clear_waiting 标志分流「清屏等待」与「上层回调」两条路径；
+ * 对已删除信号量 give 的 use-after-free 风险由此消除。
+ *
  * @return 固定返回 false：不在回调里额外触发任务切换
  */
 static bool lcd_panel_io_color_done_cb(esp_lcd_panel_io_handle_t panel_io,
@@ -242,8 +280,8 @@ static bool lcd_panel_io_color_done_cb(esp_lcd_panel_io_handle_t panel_io,
     (void)edata;
     (void)user_ctx;
 
-    if (s_clear_sem != NULL) {
-        /* 清屏/自检阶段：发信号量让任务等传输完成 */
+    if (s_clear_waiting) {
+        /* 清屏/自检阶段：发信号量让任务等传输完成（信号量常驻，无需判 NULL） */
         BaseType_t hp = pdFALSE;
         xSemaphoreGiveFromISR(s_clear_sem, &hp);
         portYIELD_FROM_ISR(hp);
@@ -317,6 +355,8 @@ static esp_err_t panel_clear(uint16_t rgb565)
         s_fill_buf[i + 1] = (uint8_t)(rgb565 & 0xFF);
     }
 
+    /* 置「清屏等待」标志：本阶段颜色完成回调只给信号量，不转发上层回调 */
+    s_clear_waiting = true;
     for (int y = 0; y < LCD_NV3030B_V_RES; y += LCD_FILL_ROWS) {
         int y_end = y + LCD_FILL_ROWS;
         if (y_end > LCD_NV3030B_V_RES) {
@@ -324,13 +364,19 @@ static esp_err_t panel_clear(uint16_t rgb565)
         }
         esp_err_t err = lcd_nv3030b_draw_bitmap(0, y, LCD_NV3030B_H_RES, y_end, s_fill_buf);
         if (err != ESP_OK) {
+            s_clear_waiting = false;
             return err;
         }
+        /* 先清残留 give 再等本轮 DMA：信号量常驻，上一轮/上一块的残留 give
+         * 可能还在，不清会把旧完成当成新完成（缓冲提前复用 -> 撕裂） */
+        (void)xSemaphoreTake(s_clear_sem, 0);
         if (xSemaphoreTake(s_clear_sem, pdMS_TO_TICKS(200)) != pdTRUE) {
             ESP_LOGE(TAG, "清屏等待传输完成超时（行块 y=%d）", y);
+            s_clear_waiting = false;
             return ESP_ERR_TIMEOUT;
         }
     }
+    s_clear_waiting = false;
     return ESP_OK;
 }
 
@@ -447,6 +493,18 @@ esp_err_t lcd_nv3030b_init(void)
         goto fail_io;
     }
 
+    /* ---- ④.1 创建清屏同步信号量（**常驻不删**，原因见 s_clear_sem 注释） ----
+     * 一个二值信号量的内存开销可忽略；相比「清屏后删除」带来的
+     * ISR 判空→删除→give 的 use-after-free 竞态，常驻是零风险方案。
+     * 「只在为空时创建」：init 失败后重试时不重复创建、不泄漏旧句柄。 */
+    if (s_clear_sem == NULL) {
+        s_clear_sem = xSemaphoreCreateBinary();
+        if (s_clear_sem == NULL) {
+            ESP_LOGE(TAG, "创建清屏同步信号量失败");
+            goto fail_bl;
+        }
+    }
+
     /* ---- ⑤ 创建面板：注入厂商验证初始化序列 ---- */
     const spd2010_vendor_config_t vendor_cfg = {
         .init_cmds = s_lcd_init_cmds,
@@ -489,17 +547,11 @@ esp_err_t lcd_nv3030b_init(void)
      * 本驱动 init 到 LVGL 首帧之间还有一段时间（自检、字体加载等），
      * 这段窗口里面板只有清屏色/未定义内容，此时若已开背光，用户会先看到
      * 「黑底 + 局部条带」再跳到启动画面。保持背光关闭，用户看到的第一帧
-     * 就是完整的启动画面。上层可通过 lcd_nv3030b_set_backlight() 打开。 */
-    s_clear_sem = xSemaphoreCreateBinary();
-    if (s_clear_sem == NULL) {
-        ESP_LOGE(TAG, "创建清屏同步信号量失败");
-        goto fail_panel;
-    }
+     * 就是完整的启动画面。上层可通过 lcd_nv3030b_set_backlight() 打开。
+     * 清屏同步信号量已在 ④.1 创建（常驻），此处直接用。 */
     err = panel_clear(LCD_CLEAR_COLOR);
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "清屏失败: %s", esp_err_to_name(err));
-        vSemaphoreDelete(s_clear_sem);
-        s_clear_sem = NULL;
         s_initialized = false;
         goto fail_panel;
     }
@@ -515,8 +567,9 @@ esp_err_t lcd_nv3030b_init(void)
     (void)panel_clear(LCD_CLEAR_COLOR);
 #endif
 
-    vSemaphoreDelete(s_clear_sem);
-    s_clear_sem = NULL;
+    /* ⚠ 不在此处删除 s_clear_sem（历史写法，曾引入 ISR use-after-free 竞态）：
+     * 颜色完成回调在 SPI 中断上下文判 s_clear_waiting 后 give 该信号量，
+     * 删除与回调并发会踩已释放内存。信号量常驻（见 s_clear_sem 注释）。 */
 
     ESP_LOGI(TAG, "初始化完成（%dx%d 横屏，QSPI %d Hz，esp_lcd_spd2010 + 厂商序列(MADCTL=0x68)，背光 IO%d）",
              LCD_NV3030B_H_RES, LCD_NV3030B_V_RES, LCD_QSPI_PCLK_HZ, BOARD_PIN_LCD_BL);

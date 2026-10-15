@@ -72,9 +72,17 @@ static i2c_master_dev_handle_t s_dev = NULL;
  * @brief 解析 8 字节寄存器原始数据为触摸点
  *
  * 采用厂商例程（STM32 Touch_Test）的实测映射（本模块批次已验证）：
- *   buf[3]        == 0x80            → 有按下（状态标志字节）
+ *   buf[3] 高 2bit 为手势/事件标志位（event flag）：
+ *     10b = 按下（press down）、00b/01b/11b = 抬起/滑动/无事件等。
+ *     → 有按下判据 **(buf[3] & 0xC0) == 0x80**（掩码判据）。
  *   X             =  buf[4]          → 横坐标（8bit，0~239，竖屏域）
  *   Y             = (buf[5]&0x0F)<<8 | buf[6] → 纵坐标（12bit，0~283，竖屏域）
+ *
+ * ⚠ 判据为什么用掩码而不用 buf[3] == 0x80 严格相等：
+ *   buf[3] 低 6bit 会携带手势/序号等附加信息（滑动方向、事件序号等），
+ *   严格等于 0x80 时只要低位带任何手势位就判成"未按下"，表现为拖动/滑动
+ *   中丢点、按下识别过于敏感。按数据手册语义只认高 2bit 的事件标志位，
+ *   低位无论携带什么都应视为"有按下"。
  *
  * 若换触摸批次后坐标不对，改用标准 CST816D 映射（见文件头注释）：
  *   pressed = buf[1] > 0;
@@ -86,7 +94,7 @@ static i2c_master_dev_handle_t s_dev = NULL;
  */
 static void parse_point(const uint8_t buf[TP_READ_LEN], touch_cst816d_point_t *out)
 {
-    if (buf[3] == 0x80) {
+    if ((buf[3] & 0xC0u) == 0x80u) {
         out->pressed = true;
         out->x = buf[4];
         out->y = (uint16_t)(((buf[5] & 0x0F) << 8) | buf[6]);

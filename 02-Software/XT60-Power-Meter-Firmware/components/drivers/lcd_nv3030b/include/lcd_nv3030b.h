@@ -54,10 +54,16 @@ typedef enum {
 } lcd_nv3030b_rotation_t;
 
 /**
- * @brief 切换显示旋转档位（写 MADCTL）
+ * @brief 切换显示旋转档位（**纯软件记录，不向面板发 MADCTL**）
  *
- * 只改面板方向，不改分辨率相关的软件状态——LVGL 侧的分辨率与触摸映射
- * 需由 lvgl_port_set_rotation() 同步（它内部会调用本函数）。
+ * ⚠ 不写 MADCTL：面板物理方向永久固定为 ROT_90（MADCTL 0x68，仅在厂商 init
+ * 序列里写过一次）。运行期向面板写寄存器命令会与 QSPI 颜色 DMA 并发
+ * （esp_lcd panel IO 非线程安全），实测会导致丢刷屏完成回调、整屏冻结，
+ * 因此本函数只记录档位、不产生任何总线事务；屏幕方向由 LVGL 软件旋转完成
+ * （lvgl_port 的 sw_rotate + lv_display_set_rotation）。
+ *
+ * LVGL 侧的分辨率与触摸映射需由 lvgl_port_set_rotation() 同步
+ * （它内部会调用本函数）。
  *
  * @param rot 目标档位
  * @return ESP_OK 成功；ESP_ERR_INVALID_ARG 档位非法；ESP_ERR_INVALID_STATE 未初始化
@@ -82,11 +88,12 @@ void lcd_nv3030b_get_resolution(lcd_nv3030b_rotation_t rot, int *width, int *hei
  * @brief 初始化显示链路（QSPI 总线、面板、背光 PWM、开显示、现场清屏）
  *
  * 内部流程：建 QSPI 总线 → 建 panel IO → 配背光 PWM（占空比 0 = 灭）→
- * 用 esp_lcd_spd2010 创建面板 → 复位/初始化/设横屏/开显示 →
- * 刷一屏清屏色 → 点亮背光。
+ * 用 esp_lcd_spd2010 创建面板 → 复位/初始化/开显示 → 刷一屏清屏色。
  *
- * 「先刷清屏色再开背光」是刻意为之：面板刚复位时显存内容未定义，
- * 若先开背光会看到「上电白屏」闪过。
+ * ⚠ 本函数**不点亮背光**：背光由上层（lvgl_port）在第一帧真正上屏后
+ * 通过 lcd_nv3030b_set_backlight() 打开。init 完成到 LVGL 首帧之间还有
+ * 一段窗口（自检、字体加载），面板只有清屏色，提前开背光会让用户先看到
+ * 「黑底 + 局部条带」再跳到启动画面。
  *
  * @return ESP_OK 成功；
  *         ESP_ERR_INVALID_STATE 已初始化过（重复调用）；

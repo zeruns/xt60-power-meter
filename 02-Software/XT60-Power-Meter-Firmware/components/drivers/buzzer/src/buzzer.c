@@ -58,6 +58,7 @@
 #include "esp_log.h"
 #include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
+#include "freertos/semphr.h"
 
 /** 日志标签 */
 static const char *TAG = "buzzer";
@@ -153,6 +154,33 @@ static volatile uint8_t s_volume_percent = CONFIG_BUZZER_VOLUME_PERCENT;
 static portMUX_TYPE s_lock = portMUX_INITIALIZER_UNLOCKED;
 
 /**
+ * 「发声状态 + 定时器操作」互斥锁
+ *
+ * sound_for()（任务上下文：UI 提示音 / 报警回调里调用）与 s_tone_timer_callback()
+ * （esp_timer 任务）会并发操作发声状态。esp_timer_stop() 只能撤销**尚未触发**的
+ * 定时，**不能撤销已在 esp_timer 任务里排队/执行中的旧回调**——旧回调的
+ * sound_off() 可能晚于新一轮 sound_on() 执行，把刚打开的声音关掉（表现为
+ * 提示音时断时续、偶发无声）。因此「查代际 → 开声/关声 → 启停定时器」整段
+ * 都在本锁内完成，任意时刻只有一个执行者碰发声状态。
+ * 锁内只做 LEDC 占空比设置与 esp_timer 启停（均为微秒级、不阻塞），
+ * 用 mutex 而非临界区是因为 esp_timer API 内部可能睡眠，不可进临界区。
+ */
+static SemaphoreHandle_t s_sound_mutex = NULL;
+
+/**
+ * 发声代际计数（与 s_sound_mutex 配套的"迟到回调丢弃"判据）
+ *
+ * 每次开启新一轮发声就 +1，并把「本次发声应停止的代际」传给定时器回调
+ * （经 s_tone_gen_expected 传递）。回调执行时若 s_tone_gen_expected 与当前
+ * 代际不匹配，说明它是**旧一轮发声的迟到回调**（esp_timer_stop 没拦住），
+ * 直接返回、不做 sound_off()——新的声音不受它影响。
+ * 计数操作都在 s_sound_mutex 内，无需 volatile/原子。
+ */
+static uint32_t s_sound_gen = 0;
+/** 一次性定时器回调应"生效"的代际（= 启动该定时器时的 s_sound_gen） */
+static uint32_t s_tone_gen_expected = 0;
+
+/**
  * @brief 根据当前响度计算 PWM 占空比
  *
  * 换算关系见上方"响度 → 占空比 换算"的说明。
@@ -199,10 +227,20 @@ static void sound_off(void)
  * s_tone_timer_callback() 静音。这样调用方无需阻塞等待，
  * 避免在事件回调里"睡"上几百毫秒。
  *
+ * 并发保护：整段「推进代际 → 开声 → 重启定时器」都在 s_sound_mutex 内完成。
+ * esp_timer_stop() 拦不住已在执行的旧回调，所以再用代际计数兜底——
+ * 迟到的旧回调发现代际不匹配就放弃 sound_off()（见 s_sound_gen 注释）。
+ *
  * @param on_ms 发声时长（毫秒）
  */
 static void sound_for(uint32_t on_ms)
 {
+    xSemaphoreTake(s_sound_mutex, portMAX_DELAY);
+
+    /* 推进代际：本轮发声从现在开始算新一代，此前任何迟到回调都失效 */
+    s_sound_gen++;
+    s_tone_gen_expected = s_sound_gen;
+
     sound_on();
 
     /* 若上一次提示音还没结束，先取消它的停止定时，改为本次的时长 */
@@ -212,22 +250,37 @@ static void sound_for(uint32_t on_ms)
     if (err != ESP_OK) {
         ESP_LOGW(TAG, "启动发声定时器失败: %s", esp_err_to_name(err));
     }
+
+    xSemaphoreGive(s_sound_mutex);
 }
 
 /**
- * @brief 关闭发声的一次性定时器回调
+ * @brief 关闭发声的一次性定时器回调（esp_timer 任务上下文）
+ *
+ * 与 sound_for() 用 s_sound_mutex 串行化；再核对代际——本回调启动时所在的
+ * 那轮发声若已被更新的 sound_for() 取代（s_sound_gen 已推进），说明自己是
+ * esp_timer_stop 没拦住的迟到回调，必须放弃 sound_off()，否则会把新一轮
+ * 刚打开的声音错误关掉。
  */
 static void s_tone_timer_callback(void *arg)
 {
     (void)arg;
-    sound_off();
+
+    xSemaphoreTake(s_sound_mutex, portMAX_DELAY);
+    if (s_tone_gen_expected == s_sound_gen) {
+        /* 代际未变：就是本轮发声到点，正常静音 */
+        sound_off();
+    }
+    /* 代际不匹配 = 迟到的旧回调，直接忽略（不 sound_off） */
+    xSemaphoreGive(s_sound_mutex);
 }
 
 /**
  * @brief 报警定时器回调：每到一个周期就长鸣一声
  *
- * 本回调与 s_tone_timer_callback 由同一个 esp_timer 任务依次执行，
- * 因此两者不会并发，内部状态无需加锁。
+ * 本回调与 s_tone_timer_callback 由同一个 esp_timer 任务依次执行（不会并发），
+ * 但 sound_for() 还会被普通任务（buzzer_play）调用，发声状态的并发保护
+ * 统一在 s_sound_mutex + 代际计数里做（见 sound_for）。
  */
 static void s_alarm_timer_callback(void *arg)
 {
@@ -280,6 +333,13 @@ esp_err_t buzzer_init(void)
         return err;
     }
 
+    /* ---- 创建发声状态互斥锁（sound_for / 定时器回调共用，见 s_sound_mutex 注释） ---- */
+    s_sound_mutex = xSemaphoreCreateMutex();
+    if (s_sound_mutex == NULL) {
+        ESP_LOGE(TAG, "创建发声状态互斥锁失败（内存不足）");
+        return ESP_ERR_NO_MEM;
+    }
+
     /* ---- 创建两个定时器 ---- */
     const esp_timer_create_args_t tone_timer_cfg = {
         .callback = s_tone_timer_callback,
@@ -289,6 +349,8 @@ esp_err_t buzzer_init(void)
     err = esp_timer_create(&tone_timer_cfg, &s_tone_timer);
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "创建发声定时器失败: %s", esp_err_to_name(err));
+        vSemaphoreDelete(s_sound_mutex); /* 回滚已建资源，保证重试 init 不泄漏 */
+        s_sound_mutex = NULL;
         return err;
     }
 
@@ -302,6 +364,8 @@ esp_err_t buzzer_init(void)
         ESP_LOGE(TAG, "创建报警定时器失败: %s", esp_err_to_name(err));
         esp_timer_delete(s_tone_timer);
         s_tone_timer = NULL;
+        vSemaphoreDelete(s_sound_mutex); /* 回滚已建资源，保证重试 init 不泄漏 */
+        s_sound_mutex = NULL;
         return err;
     }
 
@@ -408,9 +472,14 @@ esp_err_t buzzer_set_alarm(bool enable)
     } else {
         ESP_LOGI(TAG, "报警关闭");
 
+        /* 关声也进锁 + 推进代际：esp_timer_stop 拦不住已在执行的迟到回调，
+         * 推进代际让它发现"自己过期"而放弃 sound_off 复活/误关（见 s_sound_gen） */
+        xSemaphoreTake(s_sound_mutex, portMAX_DELAY);
         esp_timer_stop(s_alarm_timer);
         esp_timer_stop(s_tone_timer);
+        s_sound_gen++; /* 使任何在途的旧 tone 回调失效 */
         sound_off();
+        xSemaphoreGive(s_sound_mutex);
     }
 
     return ESP_OK;
@@ -423,9 +492,14 @@ esp_err_t buzzer_stop(void)
     }
 
     s_alarm_enabled = false;
+
+    /* 同 buzzer_set_alarm(关闭)：锁内停定时器 + 推进代际 + 静音 */
+    xSemaphoreTake(s_sound_mutex, portMAX_DELAY);
     esp_timer_stop(s_alarm_timer);
     esp_timer_stop(s_tone_timer);
+    s_sound_gen++; /* 使任何在途的旧 tone 回调失效 */
     sound_off();
+    xSemaphoreGive(s_sound_mutex);
 
     return ESP_OK;
 }
