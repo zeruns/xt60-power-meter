@@ -119,21 +119,22 @@ static wave_geom_t wave_geom(void)
     g.w = w;
     g.h = h;
     if (w >= h) {
-        /* 横屏 284×240 */
+        /* 横屏 284×240：数据行下移、两行间隔拉大（20px 字体行高 22px，
+         * 均行底 ≤ 240 不裁切，故 chart 微缩、两行上收 4px） */
         g.chart_y = 44;
-        g.chart_h = 138;
-        g.time_y = 184;
-        g.rt_y = 196;
-        g.av_y = 209;
+        g.chart_h = 130;
+        g.time_y = 177;
+        g.rt_y = 190;
+        g.av_y = 213;
         g.col_win_w = 116;
         g.col_mode_w = 146;
     } else {
         /* 竖屏 240×284：图表加高，时间轴/数据行整体下移 */
         g.chart_y = 44;
-        g.chart_h = 170;
-        g.time_y = 220;
-        g.rt_y = 232;
-        g.av_y = 245;
+        g.chart_h = 162;
+        g.time_y = 213;
+        g.rt_y = 226;
+        g.av_y = 249;
         g.col_win_w = 96;
         g.col_mode_w = 104;
     }
@@ -148,8 +149,6 @@ static lv_obj_t *s_lbl_time_l;
 static lv_obj_t *s_lbl_time_r;
 static lv_obj_t *s_axis_a[3];
 static lv_obj_t *s_axis_b[3];
-static lv_obj_t *s_lbl_realtime;
-static lv_obj_t *s_lbl_average;
 
 static pm_wave_window_t s_window = PM_WAVE_10S;
 static pm_wave_mode_t s_mode = PM_WAVE_MODE_VI;
@@ -193,6 +192,24 @@ static lv_obj_t *s_dot_min = NULL;
 static lv_obj_t *s_dot_max = NULL;
 static lv_obj_t *s_lbl_time_m = NULL; /**< 时间轴中点刻度 */
 
+/* ---- 底部「实时/平均」数据行：定宽列布局 ----
+ * 【问题】原先整行拼成一个字符串（"实 19.97670V 0.01920A 0.38348W"），
+ * 数值正负号跳动/位数变化会让后面所有数字左右晃，观测时很难盯住一个量。
+ * 【方案】每个测量量占一个**定宽列**，列内数值右对齐（定宽框）+ 单位固定在
+ * 列右端——数值变宽时向左生长、单位与列边界纹丝不动，彻底消除位置跳动。
+ * 列宽按屏宽均分，自适应横/竖屏；列数随波形模式（1~3 列）变化。 */
+#define WAVE_DATA_COLS 3      /**< 最多列数：电压+电流+功率 */
+#define WAVE_DATA_PREFIX_W 18 /**< 行首"实"/"均"字样占宽（16px 字体） */
+#define WAVE_DATA_UNIT_W   14 /**< 单位列定宽（12px 字体，容得下 "Wh"） */
+#define WAVE_DATA_VAL_GAP  2  /**< 数值框与单位之间固定间隔 */
+static lv_obj_t *s_rt_prefix = NULL;
+static lv_obj_t *s_av_prefix = NULL;
+static lv_obj_t *s_rt_val[WAVE_DATA_COLS] = { NULL };
+static lv_obj_t *s_av_val[WAVE_DATA_COLS] = { NULL };
+static lv_obj_t *s_rt_unit[WAVE_DATA_COLS] = { NULL };
+static lv_obj_t *s_av_unit[WAVE_DATA_COLS] = { NULL };
+static int s_data_ncol = 0; /**< 当前列数（变化时才重新排版，避免每帧 set_pos） */
+
 typedef struct {
     int8_t ch_a;
     int8_t ch_b;
@@ -233,6 +250,67 @@ static void format_axis(char *dst, size_t n, int ch, float v)
     snprintf(dst, n, fmt, (double)v);
     size_t len = strlen(dst);
     snprintf(dst + len, n - len, " %s", u);
+}
+
+/**
+ * @brief 只格式化数值（不带单位）——底部数据列的单位固定在列右端
+ *
+ * 小数位按通道单位固定（V 2 位 / A 3 位 / W 1 位 / Wh 3 位），
+ * 保证同一列内数字宽度恒定，负号跳动时只有符号位变化、末位不跳。
+ */
+static void format_axis_val(char *dst, size_t n, int ch, float v)
+{
+    const char *fmt;
+    switch (ch) {
+    case 0: fmt = "%.2f"; break;
+    case 1: fmt = "%.3f"; break;
+    case 2: fmt = "%.1f"; break;
+    default: fmt = "%.3f"; break;
+    }
+    snprintf(dst, n, fmt, (double)v);
+}
+
+/**
+ * @brief 摆放底部「实时/平均」数据列（列数变化时才调用）
+ *
+ * 布局：[前缀 24px][列 0: 数值(定宽) + 单位(定宽)] × ncol
+ * 列宽 = (屏宽 - 2×SAFE_X - 前缀宽) / ncol；每列内数值右对齐、单位固定右端。
+ * 数值框宽 = 列宽 - 单位宽 - 固定间隔，负号/位数变化时数字向左生长不推挤。
+ */
+static void layout_data_cols(const wave_geom_t *g)
+{
+    const int ncol = s_data_ncol;
+    if (ncol <= 0) {
+        return;
+    }
+    /* 列可用宽（自适应屏宽），每列均分 */
+    const int32_t avail = g->w - 2 * SAFE_X - WAVE_DATA_PREFIX_W;
+    const int32_t col_w = avail / ncol;
+    const int32_t val_w = col_w - WAVE_DATA_UNIT_W - WAVE_DATA_VAL_GAP;
+    const lv_font_t *f = lvgl_port_get_font(LVGL_PORT_FONT_20);
+    const lv_coord_t line_h = (lv_coord_t)(f->line_height + 2);
+
+    lv_obj_t *prefix[2] = { s_rt_prefix, s_av_prefix };
+    lv_obj_t **vals[2] = { s_rt_val, s_av_val };
+    lv_obj_t **units[2] = { s_rt_unit, s_av_unit };
+    const int32_t ys[2] = { g->rt_y, g->av_y };
+    for (int row = 0; row < 2; row++) {
+        lv_obj_set_pos(prefix[row], SAFE_X, ys[row]);
+        for (int c = 0; c < WAVE_DATA_COLS; c++) {
+            const bool on = (c < ncol);
+            lv_obj_set_hidden(vals[row][c], !on);
+            lv_obj_set_hidden(units[row][c], !on);
+            if (!on) {
+                continue;
+            }
+            const int32_t x0 = SAFE_X + WAVE_DATA_PREFIX_W + c * col_w;
+            /* 数值右对齐 + 定宽框：数字变宽向左生长，单位位置纹丝不动 */
+            lv_obj_set_pos(vals[row][c], x0, ys[row]);
+            lv_obj_set_size(vals[row][c], val_w, line_h);
+            /* 单位贴列右端 */
+            lv_obj_set_pos(units[row][c], x0 + val_w + WAVE_DATA_VAL_GAP, ys[row]);
+        }
+    }
 }
 
 static void update_focus_style(void)
@@ -877,7 +955,9 @@ void screen_wave_refresh(void)
     (void)d;
 #endif
 
-    /* 底部实时/平均数据行：跳过无数据的 NaN 空槽 */
+    /* 底部「实时/平均」数据行：定宽列布局（每列数值右对齐 + 单位固定右端，
+     * 数值正负跳动只在本列内生长，不影响其他列——观测不晃眼）。
+     * 跳过无数据的 NaN 空槽。 */
     float a_last = 0.0f, b_last = 0.0f, a_avg = 0.0f, b_avg = 0.0f;
     int cnt = 0;
     double sa = 0.0, sb = 0.0;
@@ -898,33 +978,73 @@ void screen_wave_refresh(void)
     a_avg = (float)(sa / cnt);
     b_avg = d->has_b ? (float)(sb / cnt) : 0.0f;
 
-    char rt[72], av[72];
+    /* 列数变化才重排版（模式切换时），平时只更新数值文本。
+     * VI 模式 3 列（V/I/派生 W），VP、IP 模式 2 列，P/E 模式 1 列。 */
+    int ncol;
+    switch (s_mode) {
+    case PM_WAVE_MODE_VI: ncol = 3; break;
+    case PM_WAVE_MODE_VP:
+    case PM_WAVE_MODE_IP: ncol = 2; break;
+    default: ncol = 1; break;
+    }
+    if (ncol != s_data_ncol) {
+        s_data_ncol = ncol;
+        const wave_geom_t g_layout = wave_geom();
+        layout_data_cols(&g_layout);
+    }
+
+    /* 列内容：列 0/1/2 = a 通道值 / b 通道值 / 派生功率。
+     * 数值按通道单位定小数位，负号自然右对齐、末位稳定不跳。 */
+    float col_v[WAVE_DATA_COLS];
+    int col_ch[WAVE_DATA_COLS];
     switch (s_mode) {
     case PM_WAVE_MODE_VI:
-        snprintf(rt, sizeof(rt), "实 %.5fV %.5fA %.5fW", (double)a_last, (double)b_last,
-                 (double)(a_last * b_last));
-        snprintf(av, sizeof(av), "均 %.5fV %.5fA %.5fW", (double)a_avg, (double)b_avg,
-                 (double)(a_avg * b_avg));
+        col_v[0] = a_last; col_ch[0] = d->ch_a;
+        col_v[1] = b_last; col_ch[1] = d->ch_b;
+        col_v[2] = a_last * b_last; col_ch[2] = 2;
         break;
     case PM_WAVE_MODE_VP:
-        snprintf(rt, sizeof(rt), "实 %.5fV %.5fW", (double)a_last, (double)b_last);
-        snprintf(av, sizeof(av), "均 %.5fV %.5fW", (double)a_avg, (double)b_avg);
-        break;
     case PM_WAVE_MODE_IP:
-        snprintf(rt, sizeof(rt), "实 %.5fA %.5fW", (double)a_last, (double)b_last);
-        snprintf(av, sizeof(av), "均 %.5fA %.5fW", (double)a_avg, (double)b_avg);
+        col_v[0] = a_last; col_ch[0] = d->ch_a;
+        col_v[1] = b_last; col_ch[1] = d->ch_b;
+        col_v[2] = 0; col_ch[2] = 2;
         break;
     case PM_WAVE_MODE_P:
-        snprintf(rt, sizeof(rt), "实 %.5fW", (double)a_last);
-        snprintf(av, sizeof(av), "均 %.5fW", (double)a_avg);
-        break;
-    default: /* 电能 */
-        snprintf(rt, sizeof(rt), "实 %.5fWh", (double)a_last);
-        snprintf(av, sizeof(av), "均 %.5fWh", (double)a_avg);
+    default:
+        col_v[0] = a_last; col_ch[0] = d->ch_a;
+        col_v[1] = 0; col_ch[1] = -1;
+        col_v[2] = 0; col_ch[2] = -1;
         break;
     }
-    lv_label_set_text(s_lbl_realtime, rt);
-    lv_label_set_text(s_lbl_average, av);
+    float col_av[WAVE_DATA_COLS];
+    switch (s_mode) {
+    case PM_WAVE_MODE_VI:
+        col_av[0] = a_avg; col_av[1] = b_avg; col_av[2] = a_avg * b_avg;
+        break;
+    case PM_WAVE_MODE_VP:
+    case PM_WAVE_MODE_IP:
+        col_av[0] = a_avg; col_av[1] = b_avg; col_av[2] = 0;
+        break;
+    default:
+        col_av[0] = a_avg; col_av[1] = 0; col_av[2] = 0;
+        break;
+    }
+
+    char vt[16];
+    for (int c = 0; c < WAVE_DATA_COLS; c++) {
+        if (c >= ncol) {
+            break; /* 未用列隐藏 */
+        }
+        format_axis_val(vt, sizeof(vt), col_ch[c], col_v[c]);
+        lv_label_set_text(s_rt_val[c], vt);
+        format_axis_val(vt, sizeof(vt), col_ch[c], col_av[c]);
+        lv_label_set_text(s_av_val[c], vt);
+        /* 单位固定列右端（模式切换时随之更新） */
+        static const char *const unit_txt[4] = { "V", "A", "W", "Wh" };
+        const char *u = (col_ch[c] >= 0 && col_ch[c] < 4) ? unit_txt[col_ch[c]] : "";
+        lv_label_set_text(s_rt_unit[c], u);
+        lv_label_set_text(s_av_unit[c], u);
+    }
 }
 
 /**
@@ -1094,8 +1214,16 @@ void screen_wave_create(lv_obj_t *tile)
     s_lbl_title = NULL;
     s_lbl_time_l = NULL;
     s_lbl_time_r = NULL;
-    s_lbl_realtime = NULL;
-    s_lbl_average = NULL;
+    s_data_ncol = 0; /* 下次重建时强制重新排版 */
+    s_lbl_time_m = NULL;
+    s_rt_prefix = NULL;
+    s_av_prefix = NULL;
+    for (int c = 0; c < WAVE_DATA_COLS; c++) {
+        s_rt_val[c] = NULL;
+        s_av_val[c] = NULL;
+        s_rt_unit[c] = NULL;
+        s_av_unit[c] = NULL;
+    }
     s_roller_win = NULL;
     s_roller_mode = NULL;
     for (int k = 0; k < 3; k++) {
@@ -1238,18 +1366,42 @@ void screen_wave_create(lv_obj_t *tile)
     lv_obj_set_style_text_align(s_lbl_time_r, LV_TEXT_ALIGN_RIGHT, 0);
     lv_obj_set_pos(s_lbl_time_r, g.w - SAFE_X - 30, g.time_y);
 
-    /* 实时 / 平均 */
-    s_lbl_realtime = lv_label_create(tile);
-    lv_label_set_text(s_lbl_realtime, "实 --");
-    lv_obj_set_style_text_font(s_lbl_realtime, f12, 0);
-    lv_obj_set_style_text_color(s_lbl_realtime, COL_DARK, 0);
-    lv_obj_set_pos(s_lbl_realtime, SAFE_X, g.rt_y);
+    /* 实时 / 平均：定宽列标签组（行首"实"/"均" + 每列 定宽数值 + 定宽单位）。
+     * 数值右对齐定宽框、单位固定列右端——数字正负跳动时列间不互挤。
+     * 字体分级：数值 20px（主读数，大）、前缀 16px、单位 12px（小、不抢眼）。
+     * 行高按最大字体 20px 计算，三者底部对齐（基线约在行内居中）。 */
+    const lv_font_t *f20 = lvgl_port_get_font(LVGL_PORT_FONT_20);
+    const lv_font_t *f16 = lvgl_port_get_font(LVGL_PORT_FONT_16);
+    const lv_font_t *f12u = lvgl_port_get_font(LVGL_PORT_FONT_12);
+    const lv_coord_t line_h = (lv_coord_t)(f20->line_height + 2);
+    static const char *const prefix_txt[2] = { "实", "均" };
+    const lv_color_t prefix_col[2] = { COL_DARK, COL_GRAY };
+    lv_obj_t **prefix_obj[2] = { &s_rt_prefix, &s_av_prefix };
+    for (int row = 0; row < 2; row++) {
+        *prefix_obj[row] = lv_label_create(tile);
+        lv_label_set_text(*prefix_obj[row], prefix_txt[row]);
+        lv_obj_set_style_text_font(*prefix_obj[row], f16, 0);
+        lv_obj_set_style_text_color(*prefix_obj[row], prefix_col[row], 0);
+    }
+    lv_obj_t **vals[2] = { s_rt_val, s_av_val };
+    lv_obj_t **units[2] = { s_rt_unit, s_av_unit };
+    for (int row = 0; row < 2; row++) {
+        for (int c = 0; c < WAVE_DATA_COLS; c++) {
+            vals[row][c] = lv_label_create(tile);
+            lv_label_set_text(vals[row][c], "--");
+            lv_obj_set_style_text_font(vals[row][c], f20, 0);
+            lv_obj_set_style_text_color(vals[row][c], prefix_col[row], 0);
+            lv_obj_set_width(vals[row][c], 60);
+            lv_obj_set_style_text_align(vals[row][c], LV_TEXT_ALIGN_RIGHT, 0);
 
-    s_lbl_average = lv_label_create(tile);
-    lv_label_set_text(s_lbl_average, "均 --");
-    lv_obj_set_style_text_font(s_lbl_average, f12, 0);
-    lv_obj_set_style_text_color(s_lbl_average, COL_GRAY, 0);
-    lv_obj_set_pos(s_lbl_average, SAFE_X, g.av_y);
+            units[row][c] = lv_label_create(tile);
+            lv_label_set_text(units[row][c], "");
+            lv_obj_set_style_text_font(units[row][c], f12u, 0);
+            lv_obj_set_style_text_color(units[row][c], COL_GRAY, 0);
+        }
+    }
+    s_data_ncol = 0; /* 强制下次刷新时 layout_data_cols 排版 */
+    layout_data_cols(&g);
 
     update_header();
     create_panel(lv_screen_active(), &g);
