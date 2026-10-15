@@ -1,23 +1,26 @@
 /**
  * @file power_measure.h
- * @brief 功率测量服务：4kHz 采样调度、标定、RMS/功率/电能计算与波形缓冲
+ * @brief 功率测量服务：采样调度、标定、均值/功率/电能计算与波形缓冲
  *
  * 运行在 Core 1（APP_CPU，测量核），独占测量任务：
- *   task_sample（Core1）—— 由 ADS131M02 DRDY 节奏驱动，4kSPS：
+ *   task_sample（Core1）—— 由 ADS131M02 DRDY 节奏驱动：
  *     ① 每样本做原始码值→物理量换算（电压 V / 电流 A / 瞬时功率 W），
  *        写入三级 PSRAM 波形环形缓冲；
- *     ② 每 800 样本（200ms）为一块，计算 V/I 真有效值、平均功率、
- *        矩形积分电能，合并温湿度/电池后写入 data_store 快照。
+ *     ② 每 **200ms 墙钟块**（与实际帧率解耦，不按样本数计）结算一次，
+ *        计算 V/I 块内平均值（直流量取平均而非 RMS）、平均功率、
+ *        矩形积分电能，写入 data_store 快照。
  *   task_aux（Core0）—— 2s 周期读 AHT20（≥80ms 阻塞，放交互核避免拖慢采样）
  *     与电池电压，结果由采样任务合并进快照（维持 data_store 单写者约束）。
  *
- * 掉电保存：电能与运行时间每 10s 写入 NVS（命名空间 "pm"），启动时恢复。
+ * 掉电保存：电能与运行时间每 30s（或有清零等改动时）由 task_aux 写入
+ * NVS（命名空间 "pm"），启动时恢复。
  *
  * 波形缓冲（PSRAM，三级降采样）：
  *   tier0  4000Hz × 4000 点  —— 1s 窗（原始逐点）
  *   tier1   400Hz × 24000 点 —— 60s 窗（每 10 点均值）
  *   tier2    10Hz × 6000 点  —— 10min 窗（每 40 个 tier1 点均值）
- * 每个点含 V/I/P/E 四个 float；UI 用 pm_wave_copy() 按窗抽稀取 ≤N 点。
+ * 每个点含 V/I/P/E 四个 float；UI 用 pm_wave_copy() 按**固定时间槽
+ * 桶聚合**取数（每槽固定时长、槽内多样本取均值，与采样率无关）。
  */
 #pragma once
 
@@ -87,7 +90,8 @@ void power_measure_get_calibration(power_measure_calib_t *out);
  *
  * 由 UI 核调用；真正的清零动作交给测量任务在下一个 200ms 块边界执行，
  * 以保持"电能值只有一个写者（测量核）"的约定，避免跨核读写撕裂。
- * 清零完成后立即写入 NVS（掉电不回到旧值）。
+ * 清零只改内存并置"待落盘"标志，由 task_aux 异步写入 NVS
+ * （掉电不回到旧值；采样任务内绝不做耗时的 flash 写入）。
  *
  * @return ESP_OK 已受理（下一个块边界生效）
  *         ESP_ERR_INVALID_STATE 测量服务尚未初始化
@@ -100,17 +104,19 @@ esp_err_t power_measure_reset_energy(void);
 uint32_t power_measure_sample_rate_hz(void);
 
 /**
- * @brief 按时间窗与模式抽稀拷贝波形数据（供 lv_chart 刷新）
+ * @brief 按时间窗与模式填充固定时间槽波形数据（供 lv_chart 刷新）
  *
- * 输出的两条序列 a/b 按时间从旧到新排列；抽稀采用等间隔取点，
- * 点数不超过 max_points。副轴无数据时（单序列模式）返回 has_b=false。
+ * 输出的两条序列 a/b 按时间从旧到新排列，恰好填满 max_points 个
+ * **固定时长的时间槽**（桶聚合：每槽对窗内多样本取均值，空槽插值/留 NaN），
+ * 右端是"现在"。UI 可「一比一」映射到屏幕列，无需再做抽稀/右对齐。
+ * 副轴无数据时（单序列模式）b 槽全为 NaN。
  *
  * @param win        时间窗
  * @param mode       显示模式
  * @param a          主轴序列缓冲，不可为 NULL
- * @param b          副轴序列缓冲，不可为 NULL
- * @param max_points 缓冲容量（建议 240~320，匹配屏宽）
- * @return 实际写入的点数；参数非法返回 0
+ * @param b          副轴序列缓冲（单序列模式可为 NULL）
+ * @param max_points 槽（列）数，建议 240~480，与屏宽对齐
+ * @return 有效（非 NaN）的槽位数；参数非法返回 0
  */
 int pm_wave_copy(pm_wave_window_t win, pm_wave_mode_t mode, float *a, float *b, int max_points);
 

@@ -320,8 +320,15 @@ esp_err_t system_state_report_fault(uint32_t fault_mask)
         return ESP_ERR_INVALID_ARG;
     }
 
-    /* 按位或"累加"故障：多个模块可以同时坏，各自的位互不覆盖 */
-    s_fault_mask |= fault_mask;
+    /* 按位或"累加"故障：多个模块可以同时坏，各自的位互不覆盖。
+     * 【并发修复 P1】必须用原子读-改-写：report（Core1 测量任务）与
+     * clear（Core0）可能并发，普通的 `mask |= x` 编译成"读→改→写"三步，
+     * 两核交错时一方的改动会被另一方覆盖（丢位）。
+     * __atomic_fetch_or：GCC 内建原子操作，硬件上以独占加载/条件存储
+     * （load-exclusive/store-conditional）实现，读-改-写全程不可分割。
+     * 用 RELAXED 即可：这里只要求"位不丢"，状态推导与广播在锁外做，
+     * 不需要跨变量的内存顺序保证。 */
+    (void)__atomic_fetch_or(&s_fault_mask, fault_mask, __ATOMIC_RELAXED);
     refresh_state();
     return ESP_OK;
 }
@@ -345,8 +352,10 @@ esp_err_t system_state_clear_fault(uint32_t fault_mask)
         return ESP_ERR_INVALID_ARG;
     }
 
-    /* 按位与非"抹掉"指定的位：只清除恢复了的模块，不影响其他故障位 */
-    s_fault_mask &= ~fault_mask;
+    /* 按位与非"抹掉"指定的位：只清除恢复了的模块，不影响其他故障位。
+     * 【并发修复 P1】与 report 同理，`mask &= ~x` 也是"读→改→写"三步，
+     * 用 __atomic_fetch_and 原子化，避免与并发的 report 互相覆盖丢位 */
+    (void)__atomic_fetch_and(&s_fault_mask, ~fault_mask, __ATOMIC_RELAXED);
     refresh_state();
     return ESP_OK;
 }

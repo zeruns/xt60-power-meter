@@ -21,6 +21,8 @@
  */
 #include "event_bus.h"
 
+#include <stdatomic.h>         /* C11 原子操作：atomic_fetch_add/atomic_load（丢弃计数） */
+
 #include "esp_log.h"           /* ESP-IDF 日志库：ESP_LOGx 宏按级别打印带标签的日志 */
 #include "freertos/FreeRTOS.h" /* FreeRTOS 核心头文件（portMUX_TYPE、pdMS_TO_TICKS 等） */
 #include "freertos/queue.h"    /* FreeRTOS 队列：线程安全的 FIFO 消息容器 */
@@ -72,8 +74,13 @@ static portMUX_TYPE s_subscriber_lock = portMUX_INITIALIZER_UNLOCKED;
 /** 事件队列句柄（event_bus_init 成功后才有效） */
 static QueueHandle_t s_queue = NULL;
 
-/** 因队列满而丢弃的事件计数（诊断用，只增不减） */
-static volatile uint32_t s_dropped_count = 0;
+/** 因队列满而丢弃的事件计数（诊断用，只增不减）
+ *
+ * 用 atomic_uint 而不是 volatile uint32_t：event_bus_post 可被多个任务/
+ * 核并发调用，普通 ++ 编译成"读→加→写"三步，交错会丢计数
+ * （诊断数字错得离谱会误导排查）。atomic_fetch_add 是原子的读-加-写，
+ * 语义与 FreeRTOS 计数信号量的自增同级，但更轻（无内核调用）。 */
+static atomic_uint s_dropped_count = 0;
 
 /**
  * @brief 查询因队列满而被丢弃的事件总数
@@ -82,7 +89,7 @@ static volatile uint32_t s_dropped_count = 0;
  */
 uint32_t event_bus_dropped_count(void)
 {
-    return s_dropped_count;
+    return atomic_load(&s_dropped_count);
 }
 
 /**
@@ -215,8 +222,9 @@ esp_err_t event_bus_post(const app_event_t *event, uint32_t timeout_ms)
      * pdMS_TO_TICKS()：把毫秒换算成 FreeRTOS 的时钟节拍（tick）数 */
     if (xQueueSend(s_queue, event, pdMS_TO_TICKS(timeout_ms)) != pdPASS) {
         /* 队列满：记录并上报。丢弃而不阻塞，是为了保护发布方的实时性
-         * （见文件头要点 4）；丢失情况可用 event_bus_dropped_count() 观察 */
-        s_dropped_count++;
+         * （见文件头要点 4）；丢失情况可用 event_bus_dropped_count() 观察。
+         * atomic_fetch_add：原子地"读出旧值并加一"，多核并发发布也不会数错 */
+        (void)atomic_fetch_add(&s_dropped_count, 1);
         return ESP_ERR_TIMEOUT;
     }
 

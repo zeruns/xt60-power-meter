@@ -9,7 +9,15 @@
  *
  * 数据流（写路径）：
  *   用户改设置 → settings_set_xxx() 更新内存缓存 → 标记"脏" → 重置防抖定时器
- *              → 静默 SETTINGS_SAVE_DELAY_MS 毫秒后定时器到点 → persist_cache() 写 NVS
+ *              → 静默 SETTINGS_SAVE_DELAY_MS 毫秒后定时器到点 → 通知防抖落盘任务
+ *              → 由低优先级任务执行 persist_cache() 写 NVS
+ *
+ * 为什么防抖落盘要"任务化"而不是在定时器回调里直接写？
+ *   esp_timer 的回调运行在共用的 esp_timer 任务上下文里，同一任务还跑着
+ *   LVGL 的心跳 tick（lv_tick_inc）等回调。NVS 的 nvs_commit 可能耗时
+ *   几十~几百 ms，若在回调里同步写，会连带拖住 LVGL tick，界面卡顿。
+ *   所以回调只做"置脏标记 + 通知任务"两条指令级别的动作，
+ *   真正的 Flash 写入由独立低优先级任务执行——定时器任务毫秒级返回。
  *
  * 为什么写入要"防抖"？
  *   NVS 位于 Flash 上，Flash 扇区有擦写寿命（约 10 万次）。
@@ -28,9 +36,13 @@
 
 #include <string.h>
 
+#include "system_state.h" /* 系统状态机：NVS 初始化失败时上报 STORAGE 故障（让故障可见） */
 #include "esp_log.h"     /* ESP-IDF 日志库：ESP_LOGx 宏按级别打印带标签的日志 */
 #include "esp_timer.h"   /* ESP-IDF 软件定时器：微秒精度的单次/周期回调 */
 #include "freertos/FreeRTOS.h" /* FreeRTOS 核心头文件（portMUX_TYPE 等） */
+#include "freertos/event_groups.h" /* FreeRTOS 事件组：跨任务的"完成"标志同步 */
+#include "freertos/semphr.h"   /* FreeRTOS 信号量/互斥锁：落盘动作互斥 */
+#include "freertos/task.h"   /* FreeRTOS 任务：防抖落盘任务 */
 #include "nvs.h"         /* NVS 键值读写接口（nvs_open/nvs_get_xxx/nvs_set_xxx） */
 #include "nvs_flash.h"   /* NVS 分区管理接口（nvs_flash_init/erase） */
 
@@ -50,6 +62,15 @@ static const char *TAG = "settings";
 
 /** 防抖时长（毫秒）：最后一次修改后静默这么久才真正写 Flash */
 #define SETTINGS_SAVE_DELAY_MS     1500
+
+/** 防抖落盘任务：栈大小（字节）与优先级
+ * 优先级取低（2）：落盘不紧急，不该与 UI/测量抢时间片 */
+#define SETTINGS_SAVE_TASK_STACK   2560
+#define SETTINGS_SAVE_TASK_PRIO    2
+
+/** 落盘任务的周期检查间隔（毫秒）：无通知时也醒来看看有没有没落成的盘
+ * （persist_cache 失败时保留脏标记，靠这个节拍自动重试） */
+#define SETTINGS_SAVE_POLL_MS      5000
 
 /** 响度合法范围，与 buzzer 驱动保持一致 */
 #define SETTINGS_VOLUME_MIN        1
@@ -84,6 +105,25 @@ static bool s_dirty = false;
 
 /** 防抖定时器句柄 */
 static esp_timer_handle_t s_save_timer = NULL;
+
+/** 防抖落盘任务句柄与同步原语（落盘任务化，见文件头说明） */
+static TaskHandle_t s_save_task = NULL;
+
+/** 「该落盘了」通知位：防抖定时器回调 → 落盘任务
+ *
+ * FreeRTOS 事件组（Event Group）：一个 24/32 位的标志位集合，
+ * xEventGroupSetBits 置位、xEventGroupWaitBits 可"阻塞等某位"，
+ * 任务间通知用它比裸 bool + 轮询省电（等待时不占 CPU）。
+ * 用事件组而不是"定时器回调直接调 persist_cache"：回调跑在共用的
+ * esp_timer 任务里（与 LVGL tick 同任务），NVS 写入太慢会拖垮界面。 */
+static EventGroupHandle_t s_save_events = NULL;
+#define SETTINGS_EVT_DO_SAVE BIT0 /**< 事件位：防抖到点，请落盘 */
+
+/** 保护 persist_cache() 的互斥锁
+ *
+ * settings_save_now()（UI 任务调用）与防抖落盘任务都可能写 NVS，
+ * nvs_set_xxx/commit 交错会互相覆盖，用互斥锁把整段落盘串行化 */
+static SemaphoreHandle_t s_save_mutex = NULL;
 
 /**
  * 保护缓存与脏标记的自旋锁
@@ -238,15 +278,21 @@ static void load_from_nvs(void)
  * 只有 nvs_commit() 才把整批改动一次性落到 Flash。
  * 因此多个键的改动要么一起落盘，要么都不落盘，不会出现写一半的中间状态。
  *
+ * 并发保护：整段持 s_save_mutex 串行化（settings_save_now 与防抖落盘任务
+ * 都可能进入），避免两路 nvs_set_xxx/commit 交错互相覆盖。
+ *
  * @return ESP_OK 全部写入并提交成功；其他值表示失败（此时缓存仍有效，不影响当前运行）
  */
 static esp_err_t persist_cache(void)
 {
     nvs_handle_t handle;
+
+    xSemaphoreTake(s_save_mutex, portMAX_DELAY);
     /* 与读取不同，这里要用 NVS_READWRITE 打开，否则 nvs_set_xxx 会拒绝写入 */
     esp_err_t err = nvs_open(SETTINGS_NVS_NAMESPACE, NVS_READWRITE, &handle);
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "打开 NVS 失败: %s", esp_err_to_name(err));
+        xSemaphoreGive(s_save_mutex);
         return err;
     }
 
@@ -275,6 +321,7 @@ static esp_err_t persist_cache(void)
     }
 
     nvs_close(handle);
+    xSemaphoreGive(s_save_mutex);
 
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "写入 NVS 失败: %s", esp_err_to_name(err));
@@ -283,10 +330,55 @@ static esp_err_t persist_cache(void)
 }
 
 /**
- * @brief 防抖定时器回调：静默期结束，执行落盘
+ * @brief 防抖落盘任务：接收定时器通知，执行真正的 NVS 落盘
  *
- * 这是 esp_timer 的单次回调，运行在 esp_timer 任务的上下文里（不是中断），
- * 因此里面可以做写 NVS 这类较长的操作。
+ * 【并发修复 P2】落盘过去在 esp_timer 回调里做，会阻塞共用 esp_timer
+ * 任务的 LVGL tick（界面卡顿）。现在回调只置位通知，写 Flash 在这里做。
+ * 两种唤醒方式（见 xEventGroupWaitBits 的超时参数）：
+ *   · 防抖定时器到点 → 事件位被置 → 立刻醒来落盘；
+ *   · 一直没有通知 → 每 SETTINGS_SAVE_POLL_MS 醒一次，
+ *     检查"落盘失败残留的脏标记"并重试（失败不丢数据）。
+ */
+static void save_task(void *arg)
+{
+    (void)arg;
+
+    for (;;) {
+        /* xEventGroupWaitBits(事件组, 关注位, 清除位, 等任意位?, 超时)：
+         * 阻塞等 SETTINGS_EVT_DO_SAVE 置位（pdTRUE = 等到后自动清掉该位）；
+         * 等不到就超时返回，做一轮兜底检查。等待期间不占 CPU。 */
+        (void)xEventGroupWaitBits(s_save_events, SETTINGS_EVT_DO_SAVE, pdTRUE, pdFALSE,
+                                  pdMS_TO_TICKS(SETTINGS_SAVE_POLL_MS));
+
+        /* 进临界区看脏标记：与 mark_dirty_and_schedule() / settings_save_now() 竞争 */
+        portENTER_CRITICAL(&s_lock);
+        bool need_save = s_dirty;
+        portEXIT_CRITICAL(&s_lock);
+
+        /* 静默期内可能已被 settings_save_now() 提前落盘并清掉脏标记，
+         * 这里就无事可做——不重复写 Flash，也不多耗一次擦写寿命 */
+        if (!need_save) {
+            continue;
+        }
+
+        if (persist_cache() == ESP_OK) {
+            portENTER_CRITICAL(&s_lock);
+            s_dirty = false;
+            portEXIT_CRITICAL(&s_lock);
+            ESP_LOGI(TAG, "配置已保存（防抖 %d ms 后落盘）", SETTINGS_SAVE_DELAY_MS);
+        }
+        /* persist_cache() 失败时故意保留脏标记：下一轮周期检查
+         * （或下一次改动/ settings_save_now()）还会再次尝试落盘 */
+    }
+}
+
+/**
+ * @brief 防抖定时器回调：静默期结束，通知落盘任务执行落盘
+ *
+ * 【并发修复 P2】esp_timer 的回调运行在共用的 esp_timer 任务上下文里
+ * （与 LVGL 的心跳 tick 同任务）。因此这里**绝不做 NVS 写入**
+ * （nvs_commit 可达几十~几百 ms，会拖住 LVGL tick 造成界面卡顿），
+ * 只做"通知"这一条轻量动作：置事件位唤醒 save_task，回调随即返回。
  *
  * @param arg 创建定时器时传入的用户参数（本模块未使用）
  */
@@ -294,25 +386,9 @@ static void save_timer_callback(void *arg)
 {
     (void)arg;
 
-    /* 进临界区读脏标记：防止与任务侧的 mark_dirty_and_schedule() 竞争 */
-    portENTER_CRITICAL(&s_lock);
-    bool need_save = s_dirty;
-    portEXIT_CRITICAL(&s_lock);
-
-    /* 静默期内若已被 settings_save_now() 提前落盘并清掉脏标记，
-     * 这里就无事可做——不重复写 Flash，也不多耗一次擦写寿命 */
-    if (!need_save) {
-        return;
-    }
-
-    if (persist_cache() == ESP_OK) {
-        portENTER_CRITICAL(&s_lock);
-        s_dirty = false;
-        portEXIT_CRITICAL(&s_lock);
-        ESP_LOGI(TAG, "配置已保存（防抖 %d ms 后落盘）", SETTINGS_SAVE_DELAY_MS);
-    }
-    /* persist_cache() 失败时故意保留脏标记：下次任意一次改动或
-     * settings_save_now() 还会再次尝试落盘 */
+    /* xEventGroupSetBits：置位并唤醒正在 xEventGroupWaitBits 等待的
+     * save_task。该函数在任务/回调上下文里均可调用（不是 ISR 专用版） */
+    xEventGroupSetBits(s_save_events, SETTINGS_EVT_DO_SAVE);
 }
 
 /**
@@ -343,10 +419,11 @@ static void mark_dirty_and_schedule(void)
 /**
  * @brief 初始化配置服务：初始化 NVS 并把配置载入内存缓存
  *
- * 完整的初始化顺序与容错策略见函数体内的 ①②③ 注释。
+ * 完整的初始化顺序与容错策略见函数体内的 ①②③④ 注释。
  *
- * @return ESP_OK 成功（含"NVS 不可用但已用默认值"的降级情况）
- *         ESP_ERR_NO_MEM 创建定时器失败
+ * @return ESP_OK 成功（含"NVS 不可用但已用默认值"的降级情况，
+ *         此时会额外上报 SYSTEM_FAULT_STORAGE 让故障可见）
+ *         ESP_ERR_NO_MEM 创建定时器/同步原语/落盘任务失败
  */
 esp_err_t settings_init(void)
 {
@@ -375,14 +452,37 @@ esp_err_t settings_init(void)
         return err;
     }
 
+    /* ③ 创建落盘任务的同步原语与任务本身（落盘任务化，见文件头说明）。
+     *    xEventGroupCreate：创建事件组；xSemaphoreCreateMutex：创建互斥锁；
+     *    xTaskCreatePinnedToCore(入口, 名称, 栈字节, 参数, 优先级, 句柄出参, 核心号)。
+     *    绑 Core0（交互核）：落盘不紧急，别去测量核（Core1）抢采样时间片。
+     *    任一步失败直接返回错误码（此时 s_ready 尚未置位，可修复后重试） */
+    s_save_events = xEventGroupCreate();
+    s_save_mutex = xSemaphoreCreateMutex();
+    if (s_save_events == NULL || s_save_mutex == NULL) {
+        ESP_LOGE(TAG, "创建落盘同步原语失败（内存不足）");
+        return ESP_ERR_NO_MEM;
+    }
+    BaseType_t ok = xTaskCreatePinnedToCore(save_task, "cfg_save_task", SETTINGS_SAVE_TASK_STACK,
+                                            NULL, SETTINGS_SAVE_TASK_PRIO, &s_save_task, 0);
+    if (ok != pdPASS) {
+        ESP_LOGE(TAG, "创建防抖落盘任务失败（内存不足）");
+        return ESP_ERR_NO_MEM;
+    }
+
     s_ready = true;
 
-    /* ③ 尝试初始化 NVS 并载入已保存的配置。
-     *    失败不回滚 s_ready —— 允许"只能读默认值、无法保存"的降级运行。 */
+    /* ④ 尝试初始化 NVS 并载入已保存的配置。
+     *    失败不回滚 s_ready —— 允许"只能读默认值、无法保存"的降级运行。
+     *    【修复 P2】但要把故障上报出去：存储坏了若无声无息，
+     *    排查时会以为配置真的"没保存住"。上报 SYSTEM_FAULT_STORAGE
+     *    （非致命位）后状态机进入 DEGRADED、指示灯可见。
+     *    仍返回 ESP_OK 保证设备可继续用（测量/显示都不依赖 NVS）。 */
     err = nvs_init_with_recovery();
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "NVS 初始化失败: %s，本次运行将使用出厂默认值（设置无法保存）",
                  esp_err_to_name(err));
+        (void)system_state_report_fault(SYSTEM_FAULT_STORAGE);
         return ESP_OK;
     }
 

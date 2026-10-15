@@ -35,7 +35,12 @@
  * 3. 电能清零在「块边界」执行：清零请求（UI 核发起）只置原子标志，
  *    由采样任务在块边界消费。电能值因此永远只有一个写者，
  *    也不会在累加过程中被另一核改写造成撕裂。
- * 4. 一切时间统计以「墙钟」（esp_timer）为准，不用「样本数/标称率」：
+ *    落盘（NVS 写入）与清零解耦：采样任务只改内存并置「待落盘」标志，
+ *    真正的 flash 写入统一由 task_aux（Core0）执行。nvs_commit 可达
+ *    数百 ms，若放在采样任务里同步做，期间 DRDY 帧全部被丢。
+ * 4. NVS 只有一个写者（task_aux）：电能/运行时间的周期落盘、清零落盘、
+ *    标定更新落盘全部收敛到 task_aux 串行执行（见 save_persist 的取舍说明）。
+ * 5. 一切时间统计以「墙钟」（esp_timer）为准，不用「样本数/标称率」：
  *    2026-10 实测本板 ADC 实际帧率远低于标称（MCLK 异常），按样本数
  *    折算会把电能/运行时间算错数倍，墙钟对任何实际帧率都正确。
  *
@@ -64,7 +69,7 @@
  * ─────────────────────────────────────────────────────────────
  *   ① 文末公共 API（power_measure_init/start）建立整体印象
  *   ② task_sample 主循环——采样→校验→换算→缓冲→块统计
- *   ③ wave_push_sample / ring_fill_slots_locked——波形数据的写与读
+ *   ③ wave_push_sample / ring_fill_slots——波形数据的写与读
  *   ④ load_persist_and_calib / save_persist——NVS 掉电保存
  */
 #include "power_measure.h"
@@ -155,7 +160,7 @@ static const window_map_t s_window_map[PM_WAVE_WINDOW_MAX] = {
 /** 掉电保存的数据布局（整体作为一个 blob 存 NVS） */
 typedef struct {
     uint32_t magic;      /**< 版本魔数，校验数据布局是否是本版本写入的 */
-    float energy_wh;     /**< 累计电能（Wh） */
+    float energy_wh;     /**< 累计电能（Wh，NVS 存储格式仍是 float，写入时从 double 降精度） */
     uint32_t runtime_s;  /**< 累计运行时间（秒） */
 } pm_persist_t;
 
@@ -171,7 +176,38 @@ static TaskHandle_t s_task_aux = NULL;
 static power_measure_calib_t s_calib;        /**< 当前生效的标定参数 */
 static SemaphoreHandle_t s_calib_mutex = NULL; /**< 互斥锁：保护 s_calib 跨核读改写 */
 
-static pm_persist_t s_persist; /**< 电能/运行时间（测量核单写者，见文件头取舍 2/3） */
+/** 累计电能（Wh）：内部用 double 累计。
+ *  float 只有 24 位尾数，累计值超过约 1024 Wh 后相邻可表示间隔大于
+ *  典型的每块增量（50W×0.2s≈0.0028Wh），增量会被"舍入吞掉"，电能不再走动；
+ *  double 有 53 位尾数，按 1W·h 分辨率算可累计约 900 万 Wh，永不丢增量。
+ *  对外接口仍是 float（见 power_measure.h），取值时再转换。 */
+static double s_energy_wh = 0.0;
+/** 累计运行时间（秒）。
+ *  单写者约定：上面两个值只由 task_sample 写（清零/积分都在块边界），
+ *  task_aux 落盘时只读。 */
+static uint32_t s_runtime_s = 0;
+
+/** 保护 s_energy_wh / s_runtime_s 的互斥锁
+ *
+ * 写者虽只有 task_sample，但 task_aux 落盘时要读它们组包：double 在
+ * 32 位核上是两条 32 位写，落盘读到一半会被插进来的写者撕裂。
+ * 读写两侧都持锁即可保证一致。注意 task_aux 绝不能持锁做 NVS 写入
+ * （数百 ms），只在"拷贝进 blob"的几行代码里持锁。 */
+static SemaphoreHandle_t s_persist_mutex = NULL;
+
+/** 保护「NVS 落盘」动作的互斥锁（save_persist 内使用）
+ *
+ * s_persist_mutex/s_calib_mutex 只保护数据本身；这把锁保护"落盘过程"：
+ * task_aux 周期落盘与 set_calibration 触发的落盘可能并发，
+ * nvs_set_blob/commit 交错会互相覆盖（见 save_persist 的取舍说明）。
+ * 只有落盘方竞争它，因此 NVS 写入的数百 ms 耗时不会波及采样任务。 */
+static SemaphoreHandle_t s_save_mutex = NULL;
+
+/** 有待落盘的改动（电能/运行时间/标定任一被改过，NVS 尚未写入）
+ *
+ * 用 atomic 而不是 bool：置位方跨核（task_sample / UI 核）、
+ * 清除方是 task_aux，atomic_exchange 天然不会丢/重置竞态。 */
+static atomic_bool s_persist_dirty = false;
 
 /** 电能清零请求（UI 核 → 测量核）：由采样任务在块边界消费，保持电能值单写者 */
 static atomic_bool s_reset_energy_req = false;
@@ -260,18 +296,27 @@ static void ring_push(ring_t *r, const wave_point_t *p)
  * @param has_b     是否输出副序列
  * @param a         主序列输出缓冲（长度 ≥ slots），空槽写 NaN
  * @param b         副序列输出缓冲（可为 NULL）
- * @note 调用方持有 s_ring_lock
+ * @note 本函数自行管理短临界区：区内只做 memcpy 快照，聚合/插值都在锁外
  */
 #define PM_WAVE_SLOT_MAX 480 /* 与 screen_wave 的 CHART_MAX_POINTS 对齐 */
 
-/* 桶聚合暂存（仅 ring_fill_slots_locked 内使用，受 s_ring_lock 串行保护） */
+/* 桶聚合暂存（仅 ring_fill_slots 内使用；pm_wave_copy 由 UI 任务串行调用，
+ * 聚合全程在锁外，靠"单线程调用约定"保证不被并发覆盖） */
 static float s_bsum_a[PM_WAVE_SLOT_MAX]; /**< 各槽主序列样本和 */
 static float s_bsum_b[PM_WAVE_SLOT_MAX]; /**< 各槽副序列样本和 */
 static uint16_t s_bcnt[PM_WAVE_SLOT_MAX]; /**< 各槽样本计数 */
 
-static void ring_fill_slots_locked(const ring_t *r, uint32_t now_ms, uint32_t window_ms,
-                                   int slots, int field_a, int field_b, bool has_b,
-                                   float *a, float *b)
+/** 分块快照的块大小（点数）与暂存区
+ * 【并发修复】临界区内绝不能做 O(万点) 的聚合/插值：portENTER_CRITICAL 是
+ * 自旋锁，Core1 采样任务会被卡住数 ms，DRDY 帧全部作废。现在临界区内
+ * **只 memcpy 出一小块原始点**（512 点 × 20B = 10KB，约 0.2~0.5ms），
+ * 桶聚合/插值/填充全部移到锁外做。 */
+#define PM_WAVE_CHUNK 512u
+static wave_point_t s_snap[PM_WAVE_CHUNK]; /**< 分块快照暂存（同上，UI 任务串行使用） */
+
+static void ring_fill_slots(const ring_t *r, uint32_t now_ms, uint32_t window_ms,
+                            int slots, int field_a, int field_b, bool has_b,
+                            float *a, float *b)
 {
     /* 防御：槽位数超过暂存区容量时截断，避免数组越界写 */
     if (slots > PM_WAVE_SLOT_MAX) {
@@ -287,45 +332,93 @@ static void ring_fill_slots_locked(const ring_t *r, uint32_t now_ms, uint32_t wi
         s_bsum_b[j] = 0.0f;
         s_bcnt[j] = 0;
     }
-    if (r->buf == NULL || r->count == 0 || slots <= 0 || window_ms == 0) {
+    if (r->buf == NULL || slots <= 0 || window_ms == 0) {
         return;
     }
 
-    /* ① 桶聚合：按样本年龄归桶求均值（一趟 O(count)） */
-    const uint32_t start = (r->head + r->cap - r->count) % r->cap;
-    for (uint32_t k = 0; k < r->count; k++) {
-        const wave_point_t *p = &r->buf[(start + k) % r->cap];
-        const uint32_t age = now_ms - p->t_ms; /* 无符号回绕安全 */
-        if (age > window_ms) {
-            continue; /* 窗口之外 */
+    /* 先在短临界区里快照"有效区间"的边界（3 个整数，几条指令）：
+     * start = 最旧点的物理下标，n = 有效点数，cap = 环容量 */
+    uint32_t start, n, cap;
+    portENTER_CRITICAL(&s_ring_lock);
+    cap = r->cap;
+    n = r->count;
+    start = (r->head + cap - n) % r->cap;
+    portEXIT_CRITICAL(&s_ring_lock);
+    if (n == 0 || cap == 0) {
+        return;
+    }
+
+    /* ① 桶聚合：按样本年龄归桶求均值。
+     * 从**最新一端**开始分块拷贝：环满时写者只覆盖最旧端，
+     * 就算拷贝期间环被推进，也只可能把还没读到的最旧几个点换成新点
+     * （新点 t_ms 靠近"现在"，会多算进最新桶，观感无碍）；
+     * 而每次拷贝都在临界区内，读到的永远是完整点，不会撕裂。 */
+    for (uint32_t done = 0; done < n;) {
+        /* 本块覆盖逻辑区间 [k0, k0+chunk)：从最新端往旧处切 */
+        uint32_t chunk = n - done;
+        if (chunk > PM_WAVE_CHUNK) {
+            chunk = PM_WAVE_CHUNK;
         }
-        /* 年龄 0 → 最右槽（现在）；年龄越大越靠左 */
-        int j = slots - 1 - (int)((double)age * (double)slots / (double)window_ms);
-        if (j < 0) {
-            j = 0;
-        } else if (j >= slots) {
-            j = slots - 1;
+        const uint32_t k0 = n - done - chunk;
+
+        /* 拷出本块（物理上绕环时拆成两段 memcpy） */
+        uint32_t phys = (start + k0) % cap;
+        uint32_t copied = 0;
+        portENTER_CRITICAL(&s_ring_lock);
+        while (copied < chunk) {
+            uint32_t seg = cap - phys;
+            if (seg > chunk - copied) {
+                seg = chunk - copied;
+            }
+            memcpy(&s_snap[copied], &r->buf[phys], seg * sizeof(wave_point_t));
+            copied += seg;
+            phys = 0;
         }
-        float va, vb = NAN;
-        switch (field_a) {
-        case 0: va = p->v; break;
-        case 1: va = p->i; break;
-        case 2: va = p->p; break;
-        default: va = p->e; break;
-        }
-        if (has_b && b != NULL) {
-            switch (field_b) {
-            case 0: vb = p->v; break;
-            case 1: vb = p->i; break;
-            case 2: vb = p->p; break;
-            default: vb = p->e; break;
+        portEXIT_CRITICAL(&s_ring_lock);
+
+        /* 锁外聚合本块（年龄归桶逻辑与旧实现一致） */
+        bool any_in_window = false;
+        for (uint32_t k = 0; k < chunk; k++) {
+            const wave_point_t *p = &s_snap[k];
+            const uint32_t age = now_ms - p->t_ms; /* 无符号回绕安全 */
+            if (age > window_ms) {
+                continue; /* 窗口之外 */
+            }
+            any_in_window = true;
+            /* 年龄 0 → 最右槽（现在）；年龄越大越靠左 */
+            int j = slots - 1 - (int)((double)age * (double)slots / (double)window_ms);
+            if (j < 0) {
+                j = 0;
+            } else if (j >= slots) {
+                j = slots - 1;
+            }
+            float va, vb = NAN;
+            switch (field_a) {
+            case 0: va = p->v; break;
+            case 1: va = p->i; break;
+            case 2: va = p->p; break;
+            default: va = p->e; break;
+            }
+            if (has_b && b != NULL) {
+                switch (field_b) {
+                case 0: vb = p->v; break;
+                case 1: vb = p->i; break;
+                case 2: vb = p->p; break;
+                default: vb = p->e; break;
+                }
+            }
+            s_bsum_a[j] += va;
+            s_bcnt[j]++;
+            if (has_b && b != NULL) {
+                s_bsum_b[j] += vb;
             }
         }
-        s_bsum_a[j] += va;
-        s_bcnt[j]++;
-        if (has_b && b != NULL) {
-            s_bsum_b[j] += vb;
+        /* 提前结束：本块整块都超出窗口，而越往旧处越超窗，
+         * 后面的块不必再拷（短窗口时省掉绝大部分遍历） */
+        if (!any_in_window) {
+            break;
         }
+        done += chunk;
     }
 
     /* ② 桶均值 → 输出 */
@@ -415,12 +508,17 @@ static void wave_push_sample(float v, float i)
      * 槽位换算用无符号减法求"年龄"，回绕也正确。 */
     const uint32_t now_ms = (uint32_t)(esp_timer_get_time() / 1000);
 
+    /* 电能显示值快照：内部累计是 double，波形点里存 float 即可
+     * （显示精度要求低，且 wave_point_t 结构紧凑省 PSRAM）。
+     * 本任务是 s_energy_wh 的唯一写者，读自己写的值无需加锁 */
+    const float e_now = (float)s_energy_wh;
+
     /* portENTER/EXIT_CRITICAL：FreeRTOS 临界区（多核版是自旋锁），
      * 进入后本核关中断、另一核进不来，保证下面的环形缓冲写与降采样
      * 累计不被读者 pm_wave_copy 打断。临界区要短，只包内存操作。 */
     portENTER_CRITICAL(&s_ring_lock);
 
-    wave_point_t pt = { .v = fv, .i = fi, .p = fv * fi, .e = s_persist.energy_wh, .t_ms = now_ms };
+    wave_point_t pt = { .v = fv, .i = fi, .p = fv * fi, .e = e_now, .t_ms = now_ms };
     ring_push(&s_tier[0], &pt);
 
     /* tier0→tier1：每 10 个 tier0 样本求均值压成 1 点（400Hz） */
@@ -433,7 +531,7 @@ static void wave_push_sample(float v, float i)
             .v = s_tier1_acc.v / (float)s_tier1_acc_n,
             .i = s_tier1_acc.i / (float)s_tier1_acc_n,
             .p = s_tier1_acc.p / (float)s_tier1_acc_n,
-            .e = s_persist.energy_wh,
+            .e = e_now,
             .t_ms = now_ms,
         };
         ring_push(&s_tier[1], &d);
@@ -450,7 +548,7 @@ static void wave_push_sample(float v, float i)
                 .v = s_tier2_acc.v / (float)s_tier2_acc_n,
                 .i = s_tier2_acc.i / (float)s_tier2_acc_n,
                 .p = s_tier2_acc.p / (float)s_tier2_acc_n,
-                .e = s_persist.energy_wh,
+                .e = e_now,
                 .t_ms = now_ms,
             };
             ring_push(&s_tier[2], &d2);
@@ -475,9 +573,8 @@ static void wave_push_sample(float v, float i)
 static void load_persist_and_calib(void)
 {
     /* 先装默认值，NVS 失败时直接沿用（单出口，避免到处写 fallback） */
-    s_persist.magic = PM_NVS_MAGIC;
-    s_persist.energy_wh = 0.0f;
-    s_persist.runtime_s = 0;
+    s_energy_wh = 0.0;
+    s_runtime_s = 0;
 
     s_calib.voltage_gain = PM_DEFAULT_V_GAIN;
     s_calib.voltage_offset = 0.0f;
@@ -498,9 +595,10 @@ static void load_persist_and_calib(void)
     size_t len = sizeof(blob);
     if (nvs_get_blob(h, PM_NVS_KEY_DATA, &blob, &len) == ESP_OK && len == sizeof(blob) &&
         blob.magic == PM_NVS_MAGIC) {
-        s_persist.energy_wh = blob.energy_wh;
-        s_persist.runtime_s = blob.runtime_s;
-        ESP_LOGI(TAG, "已恢复电能 %.6f Wh / 运行时间 %u s", blob.energy_wh,
+        /* NVS 里存的是 float（兼容旧布局），载入到 double 继续累计 */
+        s_energy_wh = (double)blob.energy_wh;
+        s_runtime_s = blob.runtime_s;
+        ESP_LOGI(TAG, "已恢复电能 %.6f Wh / 运行时间 %u s", (double)blob.energy_wh,
                  (unsigned)blob.runtime_s);
     }
 
@@ -518,26 +616,63 @@ static void load_persist_and_calib(void)
 /**
  * @brief 把电能/运行时间与标定写入 NVS
  *
- * 调用点：标定更新后、电能清零后、task_aux 每 30s 周期落盘。
+ * 【并发修复 P1】本函数过去被三个上下文并发调用（task_sample 清零、
+ * task_aux 周期落盘、UI 核 set_calibration），nvs_set_blob/commit 交错会
+ * 互相覆盖，还直接裸读共享数据。两种修法的取舍：
+ *   方案 A（选用）——模块级互斥锁把"快照 + 落盘"整段串行化；
+ *   方案 B ——全部改成"待落盘"标志，只由 task_aux 一个任务落盘。
+ * 选 A 的原因：电能清零已按 P1 要求改为"待落盘标志 + task_aux 落盘"
+ * （采样任务绝不碰 NVS），剩余调用方只有 task_aux 与 set_calibration；
+ * 保持 set_calibration"调用即持久化"的语义（标定值珍贵，掉电不该丢），
+ * 再用 s_save_mutex 串行化两个调用方，改动最小且无语义回退。
+ *
+ * 锁纪律（重要）：共享数据只在**拷贝进栈上局部变量的瞬间**持
+ * s_persist_mutex / s_calib_mutex；NVS 写入（可达数百 ms）期间只持
+ * s_save_mutex（只有落盘方竞争它），绝不把数据锁带进 flash 操作——
+ * 否则采样任务会在块边界被卡住几百 ms。
+ *
+ * 调用点：set_calibration（UI 核）、task_aux（清零待落盘 / 30s 周期）。
  * NVS 写入是对 flash 的真实擦写，不能每个样本都调（寿命与耗时都不允许）。
  */
 static void save_persist(void)
 {
+    /* 落盘互斥：把并发的 NVS set/commit 整段串行化 */
+    xSemaphoreTake(s_save_mutex, portMAX_DELAY);
+
+    /* 先把共享数据快照到栈上局部变量，随即放锁——
+     * 后面的 NVS 写入用的都是这份快照，与生产者互不干扰 */
+    pm_persist_t blob = { .magic = PM_NVS_MAGIC };
+    power_measure_calib_t calib_snap;
+    xSemaphoreTake(s_persist_mutex, portMAX_DELAY);
+    blob.energy_wh = (float)s_energy_wh; /* double→float：NVS 布局保持兼容 */
+    blob.runtime_s = s_runtime_s;
+    xSemaphoreGive(s_persist_mutex);
+    xSemaphoreTake(s_calib_mutex, portMAX_DELAY);
+    calib_snap = s_calib;
+    xSemaphoreGive(s_calib_mutex);
+
     nvs_handle_t h;
     /* NVS_READWRITE：以读写方式打开命名空间，随后才允许 set */
     if (nvs_open(PM_NVS_NS, NVS_READWRITE, &h) != ESP_OK) {
         ESP_LOGW(TAG, "NVS 打开失败，本次电能/运行时间未落盘");
+        /* 失败保留脏标记：task_aux 下个周期会自动重试 */
+        atomic_store(&s_persist_dirty, true);
+        xSemaphoreGive(s_save_mutex);
         return;
     }
     /* nvs_set_blob：把整块数据写入键（先入缓存）；两个键任一失败都不 commit，
      * 避免"只写了一半"的不一致状态 */
-    esp_err_t e1 = nvs_set_blob(h, PM_NVS_KEY_DATA, &s_persist, sizeof(s_persist));
-    esp_err_t e2 = nvs_set_blob(h, "calib", &s_calib, sizeof(s_calib));
+    esp_err_t e1 = nvs_set_blob(h, PM_NVS_KEY_DATA, &blob, sizeof(blob));
+    esp_err_t e2 = nvs_set_blob(h, "calib", &calib_snap, sizeof(calib_snap));
     if (e1 == ESP_OK && e2 == ESP_OK) {
         /* nvs_commit：提交后数据才真正落到 flash；不调它等于白写 */
         nvs_commit(h);
+    } else {
+        /* 任一键写失败同样留给下个周期重试 */
+        atomic_store(&s_persist_dirty, true);
     }
     nvs_close(h);
+    xSemaphoreGive(s_save_mutex);
 }
 
 /* ============================================================
@@ -597,10 +732,10 @@ static void task_sample(void *arg)
     /* 快速显示子窗口累加（仅用于 40Hz 即时显示帧） */
     double qsum_v = 0.0, qsum_i = 0.0, qsum_p = 0.0;
     uint32_t qcnt = 0;
-    float qmin_v = 0, qmax_v = 0, qmin_i = 0, qmax_i = 0; /**< 掐头去尾：窗口内极值 */
+    float qmin_v = 0, qmax_v = 0, qmin_i = 0, qmax_i = 0, qmin_p = 0, qmax_p = 0; /**< 掐头去尾：窗口内极值 */
     int64_t sub_start_us = esp_timer_get_time(); /**< 本子窗口起点墙钟（µs） */
     /* 块内电能逐步积分（让 40Hz 帧的电能读数也能连续走动；块末以权威值覆写） */
-    float block_energy_wh = 0.0f;
+    double block_energy_wh = 0.0;
     /* 块起点墙钟：dt 用真实时间而非「样本数/标称率」——
      * 2026-10 实测：ADC 实际帧率 ~310Hz（标称 4000Hz），按样本数折算 dt 会把
      * 电能/运行时间算错约 13 倍。真实墙钟对任何实际帧率都正确。 */
@@ -703,43 +838,58 @@ static void task_sample(void *arg)
         qcnt++;
         /* 掐头去尾：窗口内最大最小值各去一个再取均值，抵御 ADC 坏帧尖峰
          * （实测：稳定 10V 下电压码值偶发近零尖峰，单帧即可拉偏显示值 12%，
-         * 导致"几秒跳一次"的观感）。只对显示快照生效，统计/电能不受影响。 */
+         * 导致"几秒跳一次"的观感）。只对显示快照生效，统计/电能不受影响。
+         * V/I/P 三个通道做**同一套**处理（含 P）：若只对 V/I 掐头去尾，
+         * 显示的 V×I 与 P 会对不上（P 里还含着被 V/I 剔掉的坏帧尖峰），
+         * 观感自洽性被破坏。 */
         if (qcnt == 1) {
             qmin_v = qmax_v = v;
             qmin_i = qmax_i = i;
+            qmin_p = qmax_p = p;
         } else {
             if (v < qmin_v) qmin_v = v;
             if (v > qmax_v) qmax_v = v;
             if (i < qmin_i) qmin_i = i;
             if (i > qmax_i) qmax_i = i;
+            if (p < qmin_p) qmin_p = p;
+            if (p > qmax_p) qmax_p = p;
         }
         const int64_t sub_now_us = esp_timer_get_time();
         if (qcnt > 0 && (uint64_t)(sub_now_us - sub_start_us) >= PM_DISPLAY_SUBWINDOW_US) {
             /* 掐头去尾均值：样本数 ≥3 时去最大最小各一个，抵御单个坏帧尖峰；
              * 样本不足 3 时退化为普通均值。 */
-            float qv, qi;
+            float qv, qi, qp;
             if (qcnt >= 3) {
                 qv = (float)((qsum_v - qmax_v - qmin_v) / (double)(qcnt - 2));
                 qi = (float)((qsum_i - qmax_i - qmin_i) / (double)(qcnt - 2));
+                qp = (float)((qsum_p - qmax_p - qmin_p) / (double)(qcnt - 2));
             } else {
                 qv = (float)(qsum_v / qcnt);
                 qi = (float)(qsum_i / qcnt);
+                qp = (float)(qsum_p / qcnt);
             }
-            float qp = (float)(qsum_p / qcnt);
             /* 子窗口真实时长（墙钟）：帧率非标称值时按样本数折算会错 */
             const float sub_dt_s = (float)(sub_now_us - sub_start_us) / 1e6f;
             sub_start_us = sub_now_us;
-            /* 本子窗口对块内电能的贡献（Wh）；块末权威积分以墙钟为准 */
-            block_energy_wh = power_calc_energy_wh(block_energy_wh, qp, sub_dt_s);
+            /* 本子窗口对块内电能的贡献（Wh）；块末权威积分以墙钟为准。
+             * 直接用 double 矩形积分（W·s → Wh 除 3600，与 power_calc 同公式）：
+             * power_calc_energy_wh 是 float 接口，用它会把电能精度又拉回 float */
+            block_energy_wh += (double)qp * (double)sub_dt_s / 3600.0;
 
             /* 拼一帧快照：显示值 + 电能（块内连续积分）+ task_aux 的环境量。
-             * 电能 = 已落盘的块级权威值 + 本块内临时积分，
-             * 这样 40Hz 刷新的电能读数也平滑走动，不等 200ms 跳一次。 */
+             * 电能 = 块级权威累计值 + 本块内临时积分，
+             * 这样 40Hz 刷新的电能读数也平滑走动，不等 200ms 跳一次。
+             * 持 s_persist_mutex 快照权威值（写者是本任务块边界，
+             * double 需两拍写，锁保证读到完整值，代价仅几条指令） */
+            xSemaphoreTake(s_persist_mutex, portMAX_DELAY);
+            const double energy_base = s_energy_wh;
+            const uint32_t runtime_base = s_runtime_s;
+            xSemaphoreGive(s_persist_mutex);
             data_store_snapshot_t qsnap = {
                 .voltage_v = qv,
                 .current_a = qi,
                 .power_w = qp,
-                .energy_wh = s_persist.energy_wh + block_energy_wh,
+                .energy_wh = (float)(energy_base + block_energy_wh),
             };
             /* 借辅助数据的互斥锁读温湿度/电池（task_aux 是写者） */
             xSemaphoreTake(s_aux_data.mutex, portMAX_DELAY);
@@ -747,14 +897,14 @@ static void task_sample(void *arg)
             qsnap.humidity_pct = s_aux_data.humidity_pct;
             qsnap.battery_mv = s_aux_data.battery_mv;
             xSemaphoreGive(s_aux_data.mutex);
-            qsnap.runtime_s = s_persist.runtime_s;
+            qsnap.runtime_s = runtime_base;
             /* data_store_update：写 UI 读取的显示快照（本任务是唯一写者） */
             data_store_update(&qsnap);
 
             /* 清空子窗口累加，开下一窗 */
             qsum_v = qsum_i = qsum_p = 0.0;
             qcnt = 0;
-            qmin_v = qmax_v = qmin_i = qmax_i = 0.0f;
+            qmin_v = qmax_v = qmin_i = qmax_i = qmin_p = qmax_p = 0.0f;
         }
 
         /* 原始码值统计（诊断用） */
@@ -803,28 +953,39 @@ static void task_sample(void *arg)
             /* 清零请求（UI 核发起）：在块边界消费——本任务始终是电能值的唯一写者。
              * atomic_exchange：原子地读出旧值并写入 false，多核下无撕裂、
              * 不会漏掉或重复消费请求（stdatomic.h，C11 原子操作）。
-             * 同时重置秒累加器，避免清零后立刻又进 1 秒 */
+             * 【并发修复 P1】这里**只改内存并置「待落盘」标志，绝不做 NVS 落盘**：
+             * nvs_commit 可达数百 ms，若在采样任务里同步做，这期间 DRDY 帧
+             * 全部被丢（本任务是 Core1 高优先级，没人能替它收帧）。
+             * 真正落盘由 task_aux（Core0）在其节拍消费 s_persist_dirty 完成
+             * （≤2s 内，无须等满 30s 周期），最坏掉电多丢这几秒，是换实时性的折中。 */
             if (atomic_exchange(&s_reset_energy_req, false)) {
-                s_persist.energy_wh = 0.0f;
-                s_persist.runtime_s = 0;
+                xSemaphoreTake(s_persist_mutex, portMAX_DELAY);
+                s_energy_wh = 0.0;
+                s_runtime_s = 0;
+                xSemaphoreGive(s_persist_mutex);
                 sec_acc_ms = 0;
-                save_persist();
-                ESP_LOGI(TAG, "电能与运行时间已清零（本次统计重新开始）");
+                block_energy_wh = 0.0;
+                atomic_store(&s_persist_dirty, true);
+                ESP_LOGI(TAG, "电能与运行时间已清零（落盘交由辅助任务）");
             }
 
             /* 电能矩形积分：dt 用本块**真实墙钟时长**
              * （实际帧率 ≠ 标称 4kHz 时，按样本数折算会系统性算错；
-             *   帧过滤丢帧也不影响——墙钟自动覆盖） */
+             *   帧过滤丢帧也不影响——墙钟自动覆盖）。
+             * 【数值修复 P2】内部用 double 累计：float 超约 1024 Wh 后
+             * 增量被舍入吞掉、电能不再走动（见 s_energy_wh 的注释） */
             const float dt_s = (float)(block_now_us - block_start_us) / 1e6f;
             block_start_us = block_now_us;
-            s_persist.energy_wh = power_calc_energy_wh(s_persist.energy_wh, p_mean, dt_s);
+            xSemaphoreTake(s_persist_mutex, portMAX_DELAY);
+            s_energy_wh += (double)p_mean * (double)dt_s / 3600.0;
 
             /* 运行时间：按实际采样时间累加（每满 1s 进 1） */
             sec_acc_ms += (uint32_t)(dt_s * 1000.0f + 0.5f);
             if (sec_acc_ms >= 1000u) {
-                s_persist.runtime_s += sec_acc_ms / 1000u;
+                s_runtime_s += sec_acc_ms / 1000u;
                 sec_acc_ms %= 1000u;
             }
+            xSemaphoreGive(s_persist_mutex);
 
             /* 注意：块末**不再**向 data_store 写 EMA 帧。显示快照唯一来源是
              * 上方 40Hz 子窗口的即时均值帧（电能在其中已用 block_energy_wh
@@ -861,7 +1022,7 @@ static void task_sample(void *arg)
             /* 块统计归零，开下一块 */
             sum_v = sum_i = sum_p = 0;
             block_cnt = 0;
-            block_energy_wh = 0.0f; /* 块末权威电能已写入，子窗口积分归零 */
+            block_energy_wh = 0.0; /* 块末权威电能已写入，子窗口积分归零 */
         }
     }
 }
@@ -917,10 +1078,22 @@ static void task_aux(void *arg)
             xSemaphoreGive(s_aux_data.mutex);
         }
 
-        /* 每 30s（15 周期）把电能/运行时间落一次盘：写 flash 有寿命与耗时
-         * 成本，掉电最多丢 30s 数据，是刻意的折中 */
+        /* 落盘节拍：每 30s（15 周期）**或**有「待落盘」改动时写一次 NVS。
+         * 写 flash 有寿命与耗时成本（nvs_commit 可达数百 ms），所以：
+         *   · 周期落盘——电能/运行时间持续在涨，需要定期持久化，
+         *     掉电最多丢 30s 数据，是刻意的折中；
+         *   · 待落盘标志——电能清零这类"用户动作"必须尽快持久化，
+         *     否则掉电后清零失效、旧值复活。采样任务清零时只改内存并置
+         *     s_persist_dirty（见 task_sample 块边界注释），电能/运行时间的
+         *     落盘统一在本任务执行（标定落盘由 set_calibration 直接触发，
+         *     但经 s_save_mutex 与本任务串行，NVS 不会交错写坏）。 */
         if (++ticks >= PM_SAVE_PERIOD_TICKS) {
             ticks = 0;
+            /* 周期落盘写的就是最新快照，顺手消费掉待落盘标志
+             * （save_persist 失败时会把标志重新置位，重试不丢） */
+            (void)atomic_exchange(&s_persist_dirty, false);
+            save_persist();
+        } else if (atomic_exchange(&s_persist_dirty, false)) {
             save_persist();
         }
     }
@@ -949,7 +1122,10 @@ esp_err_t power_measure_init(void)
      * 多核 ESP32 上两个任务分属两个核，共享数据必须互斥访问。 */
     s_calib_mutex = xSemaphoreCreateMutex();
     s_aux_data.mutex = xSemaphoreCreateMutex();
-    if (s_calib_mutex == NULL || s_aux_data.mutex == NULL) {
+    s_persist_mutex = xSemaphoreCreateMutex();
+    s_save_mutex = xSemaphoreCreateMutex();
+    if (s_calib_mutex == NULL || s_aux_data.mutex == NULL || s_persist_mutex == NULL ||
+        s_save_mutex == NULL) {
         return ESP_ERR_NO_MEM;
     }
 
@@ -1031,7 +1207,7 @@ esp_err_t power_measure_set_calibration(const power_measure_calib_t *calib)
     xSemaphoreTake(s_calib_mutex, portMAX_DELAY);
     s_calib = *calib;
     xSemaphoreGive(s_calib_mutex);
-    save_persist();
+    save_persist(); /* save_persist 内部快照共享数据 + s_save_mutex 串行落盘 */
     ESP_LOGI(TAG, "标定已更新并持久化（V gain=%.6e off=%.6f / I gain=%.6e off=%.6f）",
              (double)calib->voltage_gain, (double)calib->voltage_offset,
              (double)calib->current_gain, (double)calib->current_offset);
@@ -1086,7 +1262,7 @@ uint32_t power_measure_sample_rate_hz(void)
  * @brief 把显示模式映射为波形点内字段号（0=v 1=i 2=p 3=e）
  *
  * 双序列模式的 fa/fb 分别是主/副序列字段；单序列模式 has_b=false。
- * 用整数字段号而非函数指针，让 ring_fill_slots_locked 的热循环保持简单。
+ * 用整数字段号而非函数指针，让 ring_fill_slots 的热循环保持简单。
  *
  * @param mode  显示模式
  * @param fa    出参：主序列字段号
@@ -1131,11 +1307,10 @@ int pm_wave_copy(pm_wave_window_t win, pm_wave_mode_t mode, float *a, float *b, 
     /* 填满 max_points 个固定时间槽：索引 j 即屏幕第 j 列，
      * 右端（j=max_points-1）是"现在"，无数据的槽为 NaN。
      * UI 因此可以「一比一」映射，不再需要右对齐/填充点数计算。
-     * 临界区保护：与 wave_push_sample 的写入互斥。 */
+     * 并发保护：ring_fill_slots 内部只在短临界区里 memcpy 快照，
+     * 聚合/插值都在锁外做（见其注释，临界区长会卡住 Core1 采样）。 */
     const uint32_t now_ms = (uint32_t)(esp_timer_get_time() / 1000);
-    portENTER_CRITICAL(&s_ring_lock);
-    ring_fill_slots_locked(&s_tier[m->tier], now_ms, m->win_ms, max_points, fa, fb, has_b, a, b);
-    portEXIT_CRITICAL(&s_ring_lock);
+    ring_fill_slots(&s_tier[m->tier], now_ms, m->win_ms, max_points, fa, fb, has_b, a, b);
 
     /* 统计有效槽位数返回，UI 据此判断有没有画出来的东西 */
     int valid = 0;
