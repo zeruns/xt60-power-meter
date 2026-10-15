@@ -27,11 +27,11 @@
 ├─────────────────────────────────────────────────────┤
 │ bsp/             板级支持层（引脚唯一真相源）          │
 ├─────────────────────────────────────────────────────┤
-│ 外部依赖：                                        │
-│   vendor 入库   components/middleware/lvgl（LVGL 源码）│
-│   组件管理器     managed_components/（esp_lcd_spd2010）│
+│ 外部依赖（全部由组件管理器托管于 managed_components/）│
+│   lvgl/lvgl · espressif/esp_lvgl_port                │
+│   espressif/esp_lcd_spd2010                          │
 ├─────────────────────────────────────────────────────┤
-│ ESP-IDF v5.5 · FreeRTOS · ESP32-S3                   │
+│ ESP-IDF v5.5+（开发基线 v6.1）· FreeRTOS · ESP32-S3   │
 └─────────────────────────────────────────────────────┘
 ```
 
@@ -418,7 +418,7 @@ opcode 封装与约 200 条分页式初始化序列都由组件负责，**驱动
 
 ### LVGL 与显示子系统的引入方式
 
-分工（详见 §1「外部依赖的两种归属」）：
+分工（详见 §1「外部依赖：统一由组件管理器托管」）：
 
 | 组件 | 职责 |
 |---|---|
@@ -463,21 +463,21 @@ opcode 封装与约 200 条分页式初始化序列都由组件负责，**驱动
 依赖，随 `test/host/run_host_tests.ps1` 在 PC 上做单元测试。esp_timer 回调只
 向 UI 任务的消息队列投递事件，**回调内禁止碰 LVGL**。
 
-**升级 LVGL 的步骤**（vendor 方式，不能只改版本号）：
+**升级 LVGL 的步骤**（组件管理器托管方式）：
 
-1. 临时在某个组件的 `idf_component.yml` 里声明目标版本（如 `lvgl/lvgl: "9.6.0~1"`）；
-2. `idf.py reconfigure`，让组件管理器把它下载到 `managed_components/lvgl__lvgl/`；
-3. 把该目录整树复制到 `components/middleware/lvgl/`，**再删掉临时依赖**与 `managed_components/` 下的副本
-   （不删会重名冲突）；
-4. 打开新版本自带的 `components/middleware/lvgl/Kconfig`，**逐项核对配置符号名是否变化**，
-   同步改 `sdkconfig.defaults`。已有前车之鉴：9.6 把内存池从 `LV_MEM_SIZE_KILOBYTES`（KB）
-   改成了 `LV_MEM_SIZE`（字节），沿用旧名会得到「DEPRECATED」且**不生效**；
-5. 核对代码用到的 API 未变（`lv_display_*` / `lv_indev_*` / `lv_demo_widgets` 等）；
-6. 删掉 `sdkconfig` 让它按 `sdkconfig.defaults` 重新生成，再全量编译。
+1. 改 `components/middleware/lvgl_port/idf_component.yml` 里的版本号（如 `lvgl/lvgl: "^9"`）；
+2. `idf.py reconfigure`，组件管理器把新版本下载到 `managed_components/lvgl__lvgl/`
+   并更新 `dependencies.lock`（lock 需入库）；
+3. 打开新版本的 Kconfig，**逐项核对配置符号名是否变化**，同步改 `sdkconfig.defaults`；
+   已有前车之鉴：9.6 把内存池从 `LV_MEM_SIZE_KILOBYTES`（KB）改成了 `LV_MEM_SIZE`（字节），
+   沿用旧名会得到「DEPRECATED」且**不生效**；
+4. 核对代码用到的 API 未变（`lv_display_*` / `lv_indev_*` 等）；
+5. 删掉 `sdkconfig` 让它按 `sdkconfig.defaults` 重新生成，再全量编译。
 
 **界面构建必须在 UI 任务里做**（`services/ui`），不能放在 `app_main` 的任务上：
 `CONFIG_ESP_MAIN_TASK_STACK_SIZE` 只有 3584 字节，而 tileview 三页 + chart 等
-界面构建会递归创建大量对象，很容易把主任务栈吃满导致溢出复位（UI 任务栈 12KB）。
+界面构建会递归创建大量对象，很容易把主任务栈吃满导致溢出复位（LVGL 任务栈 16384 字节，
+见 `lvgl_port.c` 的 `LVGL_PORT_TASK_STACK` 注释）。
 
 ---
 
@@ -489,7 +489,6 @@ components/
 ├── bsp/                  引脚定义（board_pins.h）与板级初始化
 ├── drivers/<外设>/       每外设一组件：CMakeLists.txt + include/ + src/
 ├── middleware/           事件总线、数据仓库、LVGL 适配、WiFi、网页
-│   └── lvgl/             LVGL 9.6 源码（vendor 入库，组件名 lvgl）
 └── services/             状态机、测量、设备控制、配置、UI
 managed_components/       组件管理器托管的外部依赖（不入库、由 lock 复现）
 test/
@@ -520,12 +519,10 @@ version.txt               固件版本号
 
 ## 12. 后续里程碑（当前已知缺口）
 
-按优先级排列，均**尚未实现**，接口骨架已留好：
+测量链路、三页正式 UI、自动转屏均已实现；以下为**尚未实现**的缺口：
 
 | 缺口 | 现状 | 影响 |
 |---|---|---|
-| `services/power_measure` | 只有 `include/power_measure.h`，无实现 | **测量链路尚不完整**：`data_store` 目前没有写入者，界面/网页拿不到电压电流功率。启动自检只能验证 `ads131m02_read()` 能读到原始码值，还不构成完整测量 |
 | `middleware/wifi_manager` | 只有头文件 | 尚无联网与 OTA 通道（故障救回依赖它） |
 | `middleware/web_console` | 只有头文件 | 尚无网页控制台 |
-| 正式 UI | `services/ui` 当前跑 LVGL 官方 widgets demo | `src/screens/` 下的真实界面待建 |
-| IMU 自动转屏 | `imu_sc7a20h` 已能读朝向，`lcd_nv3030b_set_orientation()` 已就绪 | 两者的联动逻辑待接
+| 波形 120s 窗稀疏度 | 120s 窗沿用 tier1 降采样 | 采样率问题修复后可重评估 tier1 稀疏度 |
