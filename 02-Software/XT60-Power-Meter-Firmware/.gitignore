@@ -81,3 +81,6 @@ Desktop.ini
 tools/fonts/.cache/
 # UI 预览脚本生成的截图输出
 tools/ui_preview/out/
+
+# AI 辅助开发的调试/编排产物（工具运行时生成，结论沉淀于代码注释与 docs/）
+.claude/
