@@ -460,6 +460,7 @@ static void task_sample(void *arg)
     uint32_t diag_blocks = 0;
     uint32_t frame_total = 0, frame_reject = 0;
     bool reject_check_ok = true; /* 判据是否可用（丢弃率过高则关闭） */
+    bool crc_check_enabled = true; /* CRC 帧校验（自校准：失败率过高回退 STATUS 位判据） */
     int32_t raw_v_min = 0, raw_v_max = 0, raw_i_min = 0, raw_i_max = 0;
     double raw_v_sum = 0, raw_i_sum = 0;
     uint32_t raw_n = 0;
@@ -507,15 +508,36 @@ static void task_sample(void *arg)
 
         /* ---- 帧有效性校验（见文件头）---- */
         frame_total++;
-        bool frame_ok = ((raw.status & 0x0003u) == 0x0003u);
-        if (!frame_ok) {
-            frame_reject++;
+        /* 【2026-10 毛刺根因修复】CRC 校验为首要判据：帧错位/损坏时 CRC
+         * 必不匹配（误判率 1/65536），而 STATUS 的 DRDY 位判据错位帧有 1/4
+         * 概率误判为真（实测 STATUS 字出现在数据槽位造成尖峰）。
+         * 自校准：CRC 失败率 >50%（如 CRC 覆盖范围理解有误）则回退旧判据。 */
+        bool frame_ok;
+        if (crc_check_enabled) {
+            frame_ok = raw.crc_ok;
+            if (!frame_ok) {
+                frame_reject++;
+            }
+        } else {
+            frame_ok = ((raw.status & 0x0003u) == 0x0003u);
+            if (!frame_ok) {
+                frame_reject++;
+            }
         }
         if (reject_check_ok && frame_total >= 400u && frame_reject * 2u > frame_total) {
-            reject_check_ok = false;
-            ESP_LOGW(TAG, "STATUS 的 DRDY 位判据不可用（丢弃率 %u/%u），已关闭帧过滤，"
-                          "请检查 STATUS 字读取是否与帧同步",
-                     (unsigned)frame_reject, (unsigned)frame_total);
+            if (crc_check_enabled) {
+                /* CRC 判据失效（超过半数帧校验失败）：回退 STATUS 位判据并告警 */
+                crc_check_enabled = false;
+                frame_total = 0;
+                frame_reject = 0;
+                ESP_LOGW(TAG, "CRC 判据失效（丢弃率 >50%），回退 STATUS 位判据；"
+                              "请核对 CRC 覆盖范围/多项式是否与芯片一致");
+            } else {
+                reject_check_ok = false;
+                ESP_LOGW(TAG, "STATUS 的 DRDY 位判据不可用（丢弃率 %u/%u），已关闭帧过滤，"
+                              "请检查 STATUS 字读取是否与帧同步",
+                         (unsigned)frame_reject, (unsigned)frame_total);
+            }
         }
         if (reject_check_ok && !frame_ok) {
             continue; /* 丢弃不可信帧，不参与统计 */

@@ -102,8 +102,17 @@ static const char *TAG = "ads131m02";
 
 /** 24bit 字长（字节） */
 #define ADS_WORD_BYTES 3
-/** 一帧数据 = STATUS + CH0 + CH1，共 3 个 24bit 字；也是本驱动的最大事务字数 */
-#define ADS_FRAME_WORDS 3
+/**
+ * 一帧 = STATUS + CH0 + CH1 + 输出CRC，共 4 个 24bit 字（12 字节）。
+ * ⚠ 手册 §8.5.1.7：输出 CRC **不可关闭、恒在帧尾**（16bit CRC 占第 4 字
+ * 高 2 字节，末字节补 0）。此前驱动只读 3 字（漏掉 CRC 字）——无 CS 接法
+ * 下一次 DRDY 假边沿/时钟抖动就会让字计数错位，读到 [CH1][STATUS][CH0]
+ * 这类错位帧，毛刺值恰为 STATUS 字本身（实测 I 尖峰=0x050300=STATUS<<8），
+ * 且错位持续数秒不自愈。整帧 4 字读取 + CRC-16 校验可根治。
+ */
+#define ADS_FRAME_WORDS 4
+/** 输出 CRC 字节覆盖范围：帧前 3 字（STATUS+CH0+CH1）共 9 字节 */
+#define ADS_CRC_COVER_BYTES (3 * ADS_WORD_BYTES)
 
 /**
  * 帧同步模型（本驱动所有 SPI 访问都遵守，出问题先看这里）
@@ -232,6 +241,24 @@ static atomic_uint s_drdy_count;
 static inline int32_t ads_sign_extend24(uint32_t word24)
 {
     return (int32_t)((word24 & 0x800000u) ? (word24 | 0xFF000000u) : word24);
+}
+
+/**
+ * @brief CRC-16/CCITT（手册 §8.3.12 表 8-7 默认多项式）
+ *
+ * 多项式 x¹⁶+x¹²+x⁵+1（0x1021），初值 0xFFFF，MSB 先入、不反转。
+ * 覆盖帧内前 3 字（STATUS+CH0+CH1）共 9 字节；结果与第 4 字高 2 字节比对。
+ */
+static uint16_t ads_crc16_ccitt(const uint8_t *data, size_t len)
+{
+    uint16_t crc = 0xFFFFu;
+    for (size_t i = 0; i < len; i++) {
+        crc ^= (uint16_t)data[i] << 8;
+        for (int b = 0; b < 8; b++) {
+            crc = (crc & 0x8000u) ? (uint16_t)((crc << 1) ^ 0x1021u) : (uint16_t)(crc << 1);
+        }
+    }
+    return crc;
 }
 
 /**
@@ -771,20 +798,35 @@ esp_err_t ads131m02_read(ads131m02_sample_t *out)
         return ESP_ERR_TIMEOUT;
     }
 
-    /* 交换 3 个 NULL 字，一口气取回 [STATUS][CH0][CH1]（无 CS，必须同事务） */
+    /* 交换 4 个 NULL 字，一口气取回 [STATUS][CH0][CH1][CRC]（无 CS，必须同事务）。
+     * ⚠ 必须整帧 4 字（96 SCLK）：ADC 输出 CRC 恒在帧尾，少读一字会让
+     * 字计数错位，读到 [CH1][STATUS][CH0] 等错位帧（毛刺根因，见帧定义注释）。 */
     const uint32_t tx[ADS_FRAME_WORDS] = { ADS_W(ADS_CMD_NULL), ADS_W(ADS_CMD_NULL),
-                                           ADS_W(ADS_CMD_NULL) };
+                                           ADS_W(ADS_CMD_NULL), ADS_W(ADS_CMD_NULL) };
     uint32_t rx[ADS_FRAME_WORDS] = { 0 };
     esp_err_t err = ads_xfer_raw(tx, rx, ADS_FRAME_WORDS);
 
     if (err == ESP_OK) {
-        /* rx[0] 是 STATUS，rx[1]/rx[2] 为 24bit 补码。
+        /* rx[0] 是 STATUS，rx[1]/rx[2] 为 24bit 补码，rx[3] 高 16bit 为帧 CRC。
          * ⚠ 通道接法与直觉相反（见原理图 V2）：
          *   rx[1] = CH0 = AIN0 = ISENSE± = **电流**
          *   rx[2] = CH1 = AIN1 = 分压/跟随器 = **电压** */
         out->status = (uint32_t)(rx[0] >> 8);
         out->current_raw = ads_sign_extend24(rx[1]); /* CH0 = AIN0 = 电流 */
         out->voltage_raw = ads_sign_extend24(rx[2]); /* CH1 = AIN1 = 电压 */
+
+        /* CRC-16 校验（覆盖帧前 3 字的 9 字节）：错位/损坏帧必须剔除——
+         * 毛刺帧的 STATUS 位判据（DRDY0/DRDY1=11b）有 1/4 概率误判为真，
+         * 而 CRC 是 16bit，误判率 1/65536，是唯一可靠的帧完整性判据。 */
+        uint8_t raw9[ADS_CRC_COVER_BYTES];
+        for (int i = 0; i < 3; i++) {
+            raw9[i * 3 + 0] = (uint8_t)(rx[i] >> 16);
+            raw9[i * 3 + 1] = (uint8_t)(rx[i] >> 8);
+            raw9[i * 3 + 2] = (uint8_t)(rx[i]);
+        }
+        const uint16_t crc_calc = ads_crc16_ccitt(raw9, sizeof(raw9));
+        const uint16_t crc_rx = (uint16_t)(rx[3] >> 8); /* 第 4 字高 16bit */
+        out->crc_ok = (crc_calc == crc_rx);
     }
 
     xSemaphoreGive(s_bus_mutex);

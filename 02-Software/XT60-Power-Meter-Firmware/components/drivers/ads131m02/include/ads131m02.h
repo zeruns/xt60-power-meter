@@ -14,6 +14,8 @@
  */
 #pragma once
 
+#include <stdbool.h>
+
 #include "esp_err.h"
 
 /** 一次同步采样结果（ADC 原始码值） */
@@ -21,6 +23,8 @@ typedef struct {
     int32_t voltage_raw; /**< 电压通道 CH1/AIN1 原始码值（24bit 符号扩展，PGA 1x） */
     int32_t current_raw; /**< 电流通道 CH0/AIN0 原始码值（24bit 符号扩展，PGA 16x） */
     uint32_t status;     /**< 本帧 STATUS 字（高 16bit 有效，见手册 §8.6.2） */
+    bool crc_ok;         /**< 帧输出 CRC-16 校验结果（覆盖 STATUS+CH0+CH1）；
+                          *  false = 帧错位/损坏，数据不可用（毛刺剔除判据） */
 } ads131m02_sample_t;
 
 /**
