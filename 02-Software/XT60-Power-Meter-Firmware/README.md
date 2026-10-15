@@ -13,7 +13,7 @@
 - **测量**：电压 / 电流真有效值（RMS）、瞬时功率、平均功率、积分电能（Wh）、运行时间
   - 24bit ΔΣ ADC（ADS131M02）双通道同步采样，4 kSPS，CRC 帧校验剔除损坏数据
   - 标定换算（增益 + 零偏），支持 UI 校准向导与**空载一键清零**
-  - 电能 / 运行时间定时写 NVS，掉电恢复
+  - 电能 / 运行时间每 30s 定时写 NVS，掉电恢复
 - **波形页**（示波器风格）：
   - 双轴折线 + 自动量程（1-2-5 标准格值序列，刻度锚定整格值，可直接心算读数）
   - 时间窗 1s / 10s / 30s / 60s / 120s / 10min，三级降采样环形缓冲
@@ -24,7 +24,8 @@
   - 启动页进度条 + 外设自检，故障弹窗提示
 - **其他外设**：温湿度（AHT20）、电池电压监测、加速度计自动转屏（SC7A20H）、
   蜂鸣器（按键音 / 提示音）、状态指示灯（分级故障指示）
-- **工程化**：双 OTA 分区（A/B 升级回滚）、崩溃转储（coredump）取证、
+- **工程化**：双 OTA 分区已就绪（A/B 升级回滚通道**规划中**，wifi_manager / web_console
+  目前为接口骨架）、崩溃转储（coredump）取证、
   PC 端 LVGL UI 模拟器（烧录前走查 / 回归截图）、主机端纯逻辑单元测试
 
 ## 硬件概要
@@ -75,6 +76,7 @@ idf.py build
 
 ```powershell
 .\flash_fw.bat          # 默认 COM3，内部使用 idf.py -p COM3 flash
+.\flash_fw.bat COM5     # 串口从第一个参数取
 ```
 
 非 COM3 时手动指定串口：
@@ -98,7 +100,7 @@ components/
 │   ├── touch_cst816d/    电容触摸（I2C）
 │   ├── aht20/ imu_sc7a20h/ battery_adc/ buzzer/ status_led/ key_button/
 ├── middleware/           中间件：event_bus、data_store（seqlock）、lvgl_port、
-│                         fs_storage（SPIFFS 字体）、wifi_manager、web_console
+│                         fs_storage（SPIFFS 字体）、wifi_manager / web_console（接口骨架，规划中）
 └── services/             业务服务：power_measure（4kSPS 测量链路）、system_state、
                           settings（NVS 持久化）、orientation（自动转屏）、ui（三页界面）
 managed_components/       组件管理器托管依赖（不入库，由 lock 复现）
@@ -119,6 +121,7 @@ sdkconfig.defaults        配置基线（sdkconfig 不入库，克隆后自动�
 | [docs/architecture.md](docs/architecture.md) | **固件架构**：分层结构、状态机、启动容错、双核分工、seqlock、QSPI 踩坑记录、测量链路 |
 | [docs/hardware_pinout.md](docs/hardware_pinout.md) | **引脚分配表**：GPIO 映射、总线分配、Strapping 约束、中断与内存约束 |
 | [tools/ui_sim/README.md](tools/ui_sim/README.md) | **UI 模拟器**：PC 上运行真机同源界面，烧录前走查与回归 |
+| [CONTRIBUTING.md](CONTRIBUTING.md) | **贡献指南**：开发环境、构建烧录、UI 回归、代码规范与提交规范 |
 
 **第一次接手本工程？** 建议阅读顺序：本文档 → `docs/hardware_pinout.md`（知道硬件长什么样）→
 `docs/architecture.md`（知道代码为什么这样组织）→ `main/main.c`（入口）→
@@ -131,6 +134,8 @@ sdkconfig.defaults        配置基线（sdkconfig 不入库，克隆后自动�
 - **引脚编号只允许出现在 `components/bsp/include/board_pins.h`**，其他文件引用 `BOARD_PIN_*` 宏。
 - 命名规范与代码风格见 [docs/architecture.md §10-11](docs/architecture.md)（`.clang-format` 统一格式）。
 - 提交信息遵循 **中文 Conventional Commits**：`type(scope): 中文标题` + 中文正文。
+- **版本号唯一来源 `version.txt`**（编译进 app_desc），发版时打 git tag 与之对应。
+- CI 本地入口 `tools/ci/run_ci.ps1`：一键跑构建 + 主机单测 + UI 回归并汇总结果。
 - UI 改动请先跑 `tools/ui_sim` 模拟器验证再烧录实机：
 
 ```powershell
@@ -150,7 +155,7 @@ powershell -ExecutionPolicy Bypass -File tools/ui_sim/build.ps1
 
 ## 参与贡献
 
-欢迎 Issue 与 Pull Request！提交前请：
+欢迎 Issue 与 Pull Request！完整流程见 [CONTRIBUTING.md](CONTRIBUTING.md)，提交前请：
 
 1. 遵循上述开发约定（分层、引脚、命名、中文 Conventional Commits）；
 2. UI 改动附上 `tools/ui_sim` 截图验证结果；
@@ -158,5 +163,5 @@ powershell -ExecutionPolicy Bypass -File tools/ui_sim/build.ps1
 
 ## 许可证
 
-待定（拟采用 MIT / Apache-2.0，欢迎在 Issue 中给出建议）。
-字体 Noto Sans SC 采用 [SIL Open Font License 1.1](https://openfontlicense.org/)。
+本固件采用 [MIT 许可证](LICENSE)。第三方组件及其许可见 [THIRD_PARTY.md](THIRD_PARTY.md)
+（含 LVGL、esp_lvgl_port 等）。字体 Noto Sans SC 采用 [SIL Open Font License 1.1](https://openfontlicense.org/)。
