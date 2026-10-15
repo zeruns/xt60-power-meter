@@ -272,6 +272,21 @@ static void task_ui(void *arg)
      * 有了队列就能削峰：UI 任务忙时消息先排队，忙完一次性 drain。 */
     s_key_queue = xQueueCreate(UI_INPUT_QUEUE_LEN, sizeof(ui_key_msg_t));
 
+    /* 按键事件回调：此时按键驱动已在启动表中初始化。
+     * button_register_callback：注册按键事件回调（回调运行在 esp_timer 任务，
+     * 内部只往 s_key_queue 投消息，真正的处理在主循环里做）。
+     * ⚠ 必须在"启动故障弹窗"之前注册：弹窗等待期间也要能收按键（P0-1 修复——
+     * 之前注册在弹窗之后，触摸故障时弹窗"确定"只能靠触摸点击，按键根本不被
+     * 消费，设备永久卡死在启动流程）。 */
+    esp_err_t err = button_register_callback(BUTTON_ID_BOOT, button_cb, NULL);
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "K1 回调注册失败: %s", esp_err_to_name(err));
+    }
+    err = button_register_callback(BUTTON_ID_USER, button_cb, NULL);
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "K2 回调注册失败: %s", esp_err_to_name(err));
+    }
+
     /* 载入用户设置的刷新率（失败则保持默认 5Hz）。
      * settings_get：从 NVS 读配置；display_rate_hz 为 0 表示未设置过。 */
     settings_t cfg0;
@@ -392,10 +407,40 @@ static void task_ui(void *arg)
             lvgl_port_unlock();
         }
 
-        /* 等待用户点"确定"：UI 任务挂起，LVGL 任务（taskLVGL）继续跑渲染
-         * 与处理按钮事件。20ms 轮询，对功耗/响应无感知影响。 */
+        /* 等待用户确认：UI 任务挂起轮询，LVGL 任务（taskLVGL）继续跑渲染
+         * 与处理按钮事件。
+         * 【P0-1 修复】三通道确认 + 超时兜底，任一满足即放行：
+         *   ① 触摸点"确定"按钮（LVGL 回调置 s_error_ack）；
+         *   ② 实体按键（K1/K2 任意事件）——触摸排线故障时唯一的确认手段；
+         *   ③ 30 秒超时自动放行——彻底无人操作也不至于永久卡死在启动流程
+         *      （触摸故障 + 用户不在场时设备仍能进入主界面保持可用）。 */
+        const int64_t ack_deadline = esp_timer_get_time() + 30 * 1000000LL;
         while (!s_error_ack) {
+            /* 消费按键队列：任意按键 = 确认（启动阶段无其他按键语义） */
+            ui_key_msg_t kmsg;
+            if (xQueueReceive(s_key_queue, &kmsg, 0) == pdTRUE) {
+                ESP_LOGI(TAG, "启动提示：用户按键确认（id=%d ev=%d）", (int)kmsg.id,
+                         (int)kmsg.event);
+                s_error_ack = true;
+                break;
+            }
+            if (esp_timer_get_time() >= ack_deadline) {
+                ESP_LOGW(TAG, "启动提示等待超时（30s），自动进入主界面");
+                break;
+            }
             vTaskDelay(pdMS_TO_TICKS(20));
+        }
+        /* 收尾：超时/按键放行时弹窗还在屏上，主动关闭（触摸确认路径已由回调关闭） */
+        if (lvgl_port_lock(UI_HANDLER_WAIT_MAX_MS)) {
+            lv_obj_t *scr = lv_screen_active();
+            for (uint32_t i = 0; i < lv_obj_get_child_count(scr); i++) {
+                lv_obj_t *o = lv_obj_get_child(scr, i);
+                if (lv_obj_check_type(o, &lv_msgbox_class)) {
+                    lv_msgbox_close(o);
+                    break;
+                }
+            }
+            lvgl_port_unlock();
         }
     }
 
@@ -410,18 +455,6 @@ static void task_ui(void *arg)
         ESP_LOGE(TAG, "构建主界面时获取 LVGL 锁失败");
         vTaskDelete(NULL); /* 删除当前任务（参数 NULL = 删自己），不留下失控任务 */
         return;
-    }
-
-    /* 按键事件回调：此时按键驱动已在启动表中初始化。
-     * button_register_callback：注册按键事件回调（回调运行在 esp_timer 任务，
-     * 内部只往 s_key_queue 投消息，真正的处理在主循环里做）。 */
-    esp_err_t err = button_register_callback(BUTTON_ID_BOOT, button_cb, NULL);
-    if (err != ESP_OK) {
-        ESP_LOGW(TAG, "K1 回调注册失败: %s", esp_err_to_name(err));
-    }
-    err = button_register_callback(BUTTON_ID_USER, button_cb, NULL);
-    if (err != ESP_OK) {
-        ESP_LOGW(TAG, "K2 回调注册失败: %s", esp_err_to_name(err));
     }
 
     /* ---- ③ 主循环：三个页面的刷新节奏**相互独立** ----

@@ -273,8 +273,32 @@ static void update_dots(void)
  * 造成"轻滑跳第三页、甩动跳回第一页"误环回）。 */
 #define SWIPE_MIN_DIST 30   /**< 垂直判定最小位移（px） */
 #define WRAP_MIN_DIST 60    /**< 水平环回最小位移（px，≈20% 页宽） */
+/* ---- 断触续接吞没（防"一次长滑被拆成两段 → 连翻两页"）----
+ * 实机问题：长距离快速滑动时电容触摸偶发断触（触点丢失又立即重现），
+ * LVGL 把它切成 PRESSED-RELEASED-PRESSED-RELEASED 两段独立手势；
+ * 两段各滑过半页宽 → tileview 吸附动画各翻一页 → 一次滑动连翻两页。
+ *
+ * 判据（三条同时满足才认定"断触续接"，避免误伤"快速连翻两次"）：
+ *   ① 两次触摸间隔 < SWIPE_MERGE_MS——断触的物理间隔通常只有几十毫秒，
+ *      而"抬手→移动→再按"完成第二次独立滑动很难压进 250ms；
+ *   ② 续接按下点距上段抬起点 < SWIPE_MERGE_DIST——断触时手指停在原地
+ *      附近，独立滑动的第二次起手点通常明显不同；
+ *   ③ 上一段是显著水平滑动（抬手位移过阈值），点击/微抖不触发吞没。
+ *
+ * 处理：吞掉续接段的水平拖动——冻结 tileview（scrollable off）让上段的
+ * 吸附动画跑完、停在目标页，续接段拖不动就不会再翻页；抬手恢复滚动。
+ * 垂直菜单判定在续接段仍保留（吞的只是水平拖动/翻页）。 */
+#define SWIPE_MERGE_MS   250 /**< 断触续接判定：两段触摸最大间隔（ms） */
+#define SWIPE_MERGE_DIST 35  /**< 断触续接判定：两段起止点最大距离（px） */
 static lv_point_t s_swipe_start; /**< 本次手势的按下起点（PRESSED 时记录） */
 static bool s_swipe_valid = false; /**< 起点有效标志（防 RELEASED 无对应 PRESSED 时误判） */
+/** 上段手势抬手时刻（lv_tick 毫秒，0=无上段）。
+ *  lv_tick_get() 在真机 = 物理时间（FreeRTOS tick）；在模拟器 = 虚拟时钟
+ *  （按场景步骤推进），但两次独立手势的间隔都 >250ms，不影响判定正确性。 */
+static uint32_t s_last_release_ms = 0;
+static lv_point_t s_last_release_pt;   /**< 上段手势抬手坐标（续接距离判定用） */
+static bool s_last_release_hscroll = false; /**< 上段是否有显著水平位移（③） */
+static bool s_swallow = false; /**< 本次手势为断触续接段，水平拖动被吞 */
 
 static void goto_page(ui_page_t page); /* 前向声明 */
 
@@ -336,13 +360,48 @@ static void indev_swipe_event_cb(lv_event_t *e)
         /* lv_indev_get_point：读当前触点坐标（按下瞬间记为起点） */
         lv_indev_get_point(indev, &s_swipe_start);
         s_swipe_valid = true;
+
+        /* ---- 断触续接判定（见上方 SWIPE_MERGE_* 注释）----
+         * 三条判据同时满足才吞掉本段的水平拖动。 */
+        s_swallow = false;
+        if (s_last_release_ms != 0 && s_tileview != NULL) {
+            uint32_t gap = lv_tick_get() - s_last_release_ms; /* 与上段抬手间隔（ms） */
+            int32_t ddx = s_swipe_start.x - s_last_release_pt.x;
+            int32_t ddy = s_swipe_start.y - s_last_release_pt.y;
+            if (gap < SWIPE_MERGE_MS && LV_ABS(ddx) < SWIPE_MERGE_DIST &&
+                LV_ABS(ddy) < SWIPE_MERGE_DIST && s_last_release_hscroll) {
+                s_swallow = true;
+                /* 冻结 tileview：本段拖不动它，上段的吸附动画得以跑完停在目标页。
+                 * lv_obj_set_scrollable：关闭对象滚动能力（触摸拖动不再移动内容）。 */
+                lv_obj_set_scrollable(s_tileview, false);
+            }
+        }
     } else if (code == LV_EVENT_RELEASED && s_swipe_valid) {
         s_swipe_valid = false;
+        if (s_swallow) {
+            /* 断触续接段：吞掉水平拖动/翻页，恢复滚动供后续正常手势使用 */
+            s_swallow = false;
+            if (s_tileview != NULL) {
+                lv_obj_set_scrollable(s_tileview, true);
+            }
+            /* 本段抬手点仍记入"上段"链——手指可能断触多次，链式续接都要吞 */
+            lv_indev_get_point(indev, &s_last_release_pt);
+            s_last_release_ms = lv_tick_get();
+            s_last_release_hscroll = true; /* 延续上段判定，保持吞没链 */
+            return;
+        }
         lv_point_t p;
         lv_indev_get_point(indev, &p); /* 抬起点坐标 */
         /* 总位移 = 抬起点 − 起点：不受松手后弹性回弹影响（回弹不改这两个点） */
         int32_t dx = p.x - s_swipe_start.x;
         int32_t dy = p.y - s_swipe_start.y;
+
+        /* 记录本段抬手信息，供下一次按下做"断触续接"判定。
+         * s_last_release_hscroll 要求水平位移过阈值：点击/微抖不算，不吞后段。 */
+        s_last_release_ms = lv_tick_get();
+        s_last_release_pt = p;
+        s_last_release_hscroll =
+            (LV_ABS(dx) >= WRAP_MIN_DIST && LV_ABS(dx) > LV_ABS(dy));
 
         /* 垂直为主：上下滑 → 快速菜单（测量页/波形页都支持）。
          * 菜单开/关走各自的动画，不需要延迟（不涉及 tileview 滚动冲突）。
@@ -359,8 +418,12 @@ static void indev_swipe_event_cb(lv_event_t *e)
 
         /* 水平为主且越阈值：仅端页朝外滑时环形翻页（中间页交给 tileview）。
          * 延迟到下一帧执行，避免与 tileview 弹性回弹冲突（见 wrap_goto_async）。
-         * lv_async_call：把函数挂到 LVGL 下一轮 timer 处理时执行（事件派发结束后）。 */
-        if (LV_ABS(dx) >= WRAP_MIN_DIST && LV_ABS(dx) > LV_ABS(dy)) {
+         * lv_async_call：把函数挂到 LVGL 下一轮 timer 处理时执行（事件派发结束后）。
+         * 【模态抑制】设置页有二级页/弹窗打开时禁用环形翻页：浮层挂在设置 tile
+         * 上，环回会把 tile 整个翻走而浮层悬空，连带按键路由错乱
+         * （screen_settings_modal_is_open，见 screen_settings.c 说明）。 */
+        if (LV_ABS(dx) >= WRAP_MIN_DIST && LV_ABS(dx) > LV_ABS(dy) &&
+            !screen_settings_modal_is_open()) {
             if (s_current == UI_PAGE_MEASURE && dx > 0) {
                 /* 测量页右滑（dx>0）→ 环到设置页（尾页） */
                 lv_async_call(wrap_goto_async, (void *)(intptr_t)UI_PAGE_SETTINGS);
@@ -464,6 +527,12 @@ static void build_pages(ui_page_t keep)
 
     s_current = keep;
     update_dots();
+    /* 【防御】断触吞没状态与"上段手势"记录是跨手势/跨重建的 static，重建后
+     * 必须归零：否则残留的 s_swallow/s_last_release_hscroll 会让下一个正常
+     * 手势被误判成"断触续接"而冻结 tileview、吞掉翻页（连翻/卡死的隐患源）。 */
+    s_swallow = false;
+    s_last_release_hscroll = false;
+    s_last_release_ms = 0;
     /* 无动画滚到目标页：旋转后直接呈现该页，不让用户看到甩动过程。
      * lv_obj_update_layout：强制立即重算布局（否则刚建好的 tile 位置可能
      * 还没排好，scroll_to_view 会滚到错误位置）。 */
@@ -630,8 +699,13 @@ void ui_nav_handle_key(button_id_t id, button_event_t ev)
     /* 被接受的按键都给一声短鸣（操作反馈） */
     bool handled = false;
 
-    /* 菜单优先：菜单开着时按键全归菜单（返回 true 表示已被菜单消费） */
-    if (screen_measure_menu_is_open() && screen_measure_menu_key(id, ev)) {
+    /* 菜单优先：菜单/子页开着时按键全归它们（返回 true 表示已被消费）。
+     * 顺序：设置页二级页/弹窗 → 测量页菜单 → 波形页菜单 → 三页导航。
+     * 【P0-2 修复】设置页二级页与弹窗此前完全没有按键路径（只能触屏），
+     * 现在按键优先交给 screen_settings_key() 的焦点体系处理。 */
+    if (screen_settings_subpage_is_open() && screen_settings_key(id, ev)) {
+        handled = true;
+    } else if (screen_measure_menu_is_open() && screen_measure_menu_key(id, ev)) {
         handled = true;
     } else if (screen_wave_menu_is_open() && screen_wave_menu_key(id, ev)) {
         handled = true;

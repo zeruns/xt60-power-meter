@@ -48,6 +48,11 @@
  * ────────────────────────────────────────────────────────────
  *   · **纯按键可达**：二级页全部操作都做成按钮/开关/滑条等可聚焦控件，
  *     不依赖触屏手势；"返回"固定在标题栏左上，任何子页都不会把用户困住。
+ *     按键操作体系（详见文件尾 screen_settings_key 与"焦点链机制"一节）：
+ *     设置首页长按 K2 进入网格焦点模式（单击移焦点、长按 K2 打开焦点格），
+ *     任意二级页内单击 K1/K2 移焦点、长按 K2 激活（按钮=点击、开关=切换、
+ *     滑条=进/出"调节模式"，调节时 K1/K2 变减/加步进）、长按 K1 返回；
+ *     弹窗一律 K1=取消 / K2=确定。全程只需 K1/K2 两个键。
  *   · **写入/清除类操作不把用户留在中间态**：清零等破坏性操作先弹确认框、
  *     完成后弹结果提示（见 show_confirm / show_notice）；校准完成后 1.4s
  *     自动返回首页（见 close_timer_cb），无须用户再点一次"返回"。
@@ -76,11 +81,15 @@
 #include "lvgl.h"
 #include "lvgl_port.h"
 
+#include "button.h"
 #include "buzzer.h"
 #include "lcd_nv3030b.h"
 #include "orientation.h"
 #include "power_measure.h"
 #include "settings.h"
+/* ui_nav：取当前页码（ui_nav_current_page）——设置首页的网格焦点模式需要
+ * 知道"用户此刻真的在设置页"，否则按键接管会波及测量/波形页的翻页键位 */
+#include "ui_nav.h"
 
 /* ---- 色板（与测量页/波形页同一语义色） ----
  * lv_color_hex(0xRRGGBB)：把网页风格的十六进制色值转换成 LVGL 内部的
@@ -132,6 +141,7 @@ static lv_obj_t *s_sub_content = NULL; /**< 二级页内容容器 */
 static sub_kind_t s_sub_kind = SUB_NONE; /**< 当前二级页类型（刷新分发的依据） */
 static bool s_layer_hooked = false;  /**< 对话框样式与关闭处理是否已安装 */
 static lv_obj_t *s_msgbox_scrim = NULL; /**< 当前对话框的压暗遮罩（随框删除） */
+static lv_obj_t *s_active_msgbox = NULL; /**< 当前打开的对话框（NULL=无；按键路由据此判模态） */
 
 static data_store_snapshot_t s_last_snap; /**< 最近快照（校准向导/电能统计使用） */
 
@@ -157,12 +167,27 @@ static lv_obj_t *s_angle_btns[4] = { 0 }; /**< 0/90/180/270 度按钮 */
 static lv_obj_t *s_auto_switch = NULL;    /**< 重力自动旋转开关 */
 static const uint16_t s_angle_vals[4] = { 0, 90, 180, 270 };
 
+#define GRID_CELL_COUNT 6 /**< 设置首页网格功能格数 */
+
+/* ---- 设置首页网格焦点（二级页全关时由长按 K2 进入） ---- */
+static lv_obj_t *s_grid_cells[GRID_CELL_COUNT] = { 0 }; /**< 六格按钮（登记顺序＝焦点顺序） */
+static bool s_grid_focus_on = false; /**< true = 网格焦点模式（单击移焦点/长按 K2 打开焦点格） */
+static int s_grid_idx = 0;           /**< 网格焦点格下标（跨子页往返保持，返回后接着来） */
+
+/** 校准完成 1.4s 自动关页定时器（句柄管理：关页/切页时显式删除，防误关新页面） */
+static lv_timer_t *s_close_timer = NULL;
+
 /* ============================================================
  * 对话框（lv_msgbox + 顶层图层可点击技巧，沿用原实现）
  * ============================================================ */
 
 /**
  * @brief 点击顶层图层空白处 → 关闭当前对话框（点遮罩关闭）
+ *
+ * 用**同步** lv_msgbox_close 而非 close_async：按键路径（screen_settings_key
+ * → msgbox_key_action）也是同步关闭，两条路径若一同步一异步，异步排队的
+ * 回调可能在对象已被另一路径删除后才执行（悬空指针）。统一同步关闭后
+ * 无论点遮罩、点按钮还是按 K1/K2，都走同一个立即关闭出口。
  *
  * @param e LVGL 点击事件（目标是顶层图层 lv_layer_top()）
  */
@@ -173,9 +198,8 @@ static void layer_clicked_cb(lv_event_t *e)
      * "还有没有对话框开着"（对话框就是顶层图层的最后一个子对象）。 */
     uint32_t n = lv_obj_get_child_count(layer);
     if (n > 0) {
-        /* lv_obj_get_child(layer, n-1) 取最后创建的子对象 = 当前对话框；
-         * lv_msgbox_close_async() 异步关闭（等本帧渲染完再删，避免边画边删）。 */
-        lv_msgbox_close_async(lv_obj_get_child(layer, n - 1));
+        /* lv_obj_get_child(layer, n-1) 取最后创建的子对象 = 当前对话框 */
+        lv_msgbox_close(lv_obj_get_child(layer, n - 1));
     }
 }
 
@@ -202,11 +226,18 @@ static void layer_restore_check_cb(void *layer_ptr)
 /**
  * @brief 对话框被删除 → 删除压暗遮罩 + 安排一次延迟复查（恢复图层不可点击）
  *
+ * 同时清 s_active_msgbox：弹窗句柄随对象一起失效，按键路由（screen_settings_key）
+ * 靠它判断"此刻有没有弹窗要接管按键"，不清理会一直误判为模态。
+ *
  * @param e LVGL 删除事件；user_data 携带顶层图层指针
  */
 static void box_deleted_cb(lv_event_t *e)
 {
+    lv_obj_t *box = lv_event_get_target(e); /* 被删的对话框本体 */
     lv_obj_t *layer = (lv_obj_t *)lv_event_get_user_data(e);
+    if (s_active_msgbox == box) {
+        s_active_msgbox = NULL;
+    }
     if (s_msgbox_scrim != NULL) {
         /* lv_obj_delete()：立即删除遮罩对象（连同其样式一起释放） */
         lv_obj_delete(s_msgbox_scrim);
@@ -298,6 +329,7 @@ static lv_obj_t *msgbox_begin(const char *title, const char *text)
 
     /* 对话框删除后恢复图层可点击性 */
     lv_obj_add_event_cb(box, box_deleted_cb, LV_EVENT_DELETE, layer);
+    s_active_msgbox = box; /* 记录当前弹窗：按键路由据此把 K1/K2 让给弹窗 */
     return box;
 }
 
@@ -378,7 +410,11 @@ static void confirm_ok_cb(lv_event_t *e)
 static void show_confirm(const char *title, const char *text, confirm_cb_t ok_cb)
 {
     lv_obj_t *box = msgbox_begin(title, text);
-    lv_msgbox_add_footer_button(box, "取消"); /* "取消"不挂回调：LVGL footer 按钮自带关闭行为 */
+    /* ⚠ LVGL 9.6 的 footer 按钮**没有**内建关闭行为（只有 add_close_button 才挂
+     * 关闭回调），"取消"必须显式挂关闭回调，否则点它/按 K1 都关不掉框。
+     * notice_ok_cb 的语义就是"关框不动作"，与"取消"一致，直接复用。 */
+    lv_obj_t *cancel = lv_msgbox_add_footer_button(box, "取消");
+    lv_obj_add_event_cb(cancel, notice_ok_cb, LV_EVENT_CLICKED, NULL);
     lv_obj_t *ok = lv_msgbox_add_footer_button(box, "确定");
     lv_obj_add_event_cb(ok, confirm_ok_cb, LV_EVENT_CLICKED, (void *)ok_cb); /* 业务回调经 user_data 传入 */
     style_msgbox(box);
@@ -455,6 +491,217 @@ static lv_obj_t *plain_button(lv_obj_t *parent, const char *text, int32_t w, int
 }
 
 /* ============================================================
+ * 纯按键焦点链机制（P0-2：设置页全部操作脱离触屏）
+ * ────────────────────────────────────────────────────────────
+ * 设计取舍：不引入 LVGL 的 lv_group + KEYPAD 焦点体系——那要求给每个控件
+ * 建 group、配 indev 焦点遍历，且与本项目"按键事件经 ui_nav 按页路由"
+ * （ui_nav_handle_key）的架构冲突。这里用一张**焦点链**（数组登记本页
+ * 可操作控件 + 当前下标）实现同等能力：新子页只需 focus_begin/focus_add
+ * 登记，按键逻辑全页复用，不必每个子页手写一套。
+ *
+ * 键位（与测量/波形页快速菜单同一心智，见 screen_settings.h 契约）：
+ *   单击 K1/K2  = 焦点上/下移动（环形）；
+ *   长按 K2     = 激活焦点（按钮=点击；开关=切换；滑条=进"调节模式"）；
+ *   长按 K1     = 返回/关闭当前子页（等效触屏"返回"按钮）；
+ *   滑条调节模式：单击 K1/K2=减/加步进、长按 K2=退出并落盘、长按 K1=落盘并返回。
+ * 弹窗另有固定键位（K1=取消、K2=确定），优先级高于焦点链（见 screen_settings_key）。
+ * 按键反馈鸣叫由 ui_nav_handle_key 统一播放，本文件不重复响。
+ * ============================================================ */
+
+#define FOCUS_MAX 8   /**< 焦点链容量（最长子页 6 控件，留余量） */
+#define SLIDER_STEP 5 /**< 滑条按键步进（百分点：10~100 档 20 步走完） */
+
+static lv_obj_t *s_focus_widgets[FOCUS_MAX]; /**< 焦点链：当前子页可操作控件 */
+static int s_focus_cnt = 0;                  /**< 焦点链有效长度 */
+static int s_focus_idx = 0;                  /**< 当前焦点下标 */
+static lv_obj_t *s_focus_back = NULL;        /**< 本页"返回"按钮（长按 K1 等效点击它） */
+static bool s_slider_edit = false; /**< true=滑条调节模式（K1/K2 变减/加步进） */
+
+/**
+ * @brief 重绘焦点高亮（当前控件 2px 蓝框；滑条调节中改绿框示意）
+ *
+ * 用 **outline（轮廓）** 而非 border：outline 画在对象边框外侧、不参与布局
+ * 计算，加/去焦点框不会挤动周围控件（border_width 变化会改变布局尺寸）。
+ * 调节模式下焦点框变绿加粗：用户一眼看出"K1/K2 此刻是加减而非移焦点"。
+ */
+static void focus_paint(void)
+{
+    bool edit = s_slider_edit && s_focus_cnt > 0 &&
+                lv_obj_check_type(s_focus_widgets[s_focus_idx], &lv_slider_class);
+    for (int i = 0; i < s_focus_cnt; i++) {
+        lv_obj_t *w = s_focus_widgets[i];
+        if (w == NULL) {
+            continue;
+        }
+        bool on = (i == s_focus_idx);
+        lv_obj_set_style_outline_width(w, on ? (edit ? 3 : 2) : 0, 0);
+        lv_obj_set_style_outline_color(w, (edit && on) ? COL_OK : COL_PRIMARY, 0);
+        lv_obj_set_style_outline_pad(w, 2, 0);
+    }
+}
+
+/**
+ * @brief 重绘首页网格焦点高亮（焦点格 2px 蓝框，其余无框）
+ *
+ * 与 focus_paint 同款 outline 方案：不参与布局，加框不挤动网格。
+ */
+static void grid_paint(void)
+{
+    for (int i = 0; i < GRID_CELL_COUNT; i++) {
+        lv_obj_t *w = s_grid_cells[i];
+        if (w == NULL) {
+            continue;
+        }
+        bool on = s_grid_focus_on && (i == s_grid_idx);
+        lv_obj_set_style_outline_width(w, on ? 2 : 0, 0);
+        lv_obj_set_style_outline_color(w, COL_PRIMARY, 0);
+        lv_obj_set_style_outline_pad(w, 2, 0);
+    }
+}
+
+/**
+ * @brief 焦点链清空（子页关闭/重建时调用，防悬空指针）
+ *
+ * 只降计数不擦数组：焦点链里的对象指针随子页 lv_obj_delete 一起失效，
+ * 留着旧值无害（paint/移动只遍历 0..s_focus_cnt-1）。
+ */
+static void focus_end(void)
+{
+    s_focus_cnt = 0;
+    s_focus_idx = 0;
+    s_focus_back = NULL;
+    s_slider_edit = false;
+}
+
+/**
+ * @brief 焦点链初始化：记录"返回"按钮，链从空开始
+ * @param back 本页标题栏"返回"按钮（长按 K1 等效点击它；可为 NULL）
+ */
+static void focus_begin(lv_obj_t *back)
+{
+    focus_end();
+    s_focus_back = back;
+}
+
+/**
+ * @brief 登记一个可操作控件到焦点链（按用户操作顺序调用）
+ * @param w 控件对象（NULL 或链满时忽略）
+ */
+static void focus_add(lv_obj_t *w)
+{
+    if (w == NULL || s_focus_cnt >= FOCUS_MAX) {
+        return;
+    }
+    s_focus_widgets[s_focus_cnt++] = w;
+    /* 每登记一项立即重画焦点框：子页建完的最后一项登记后，焦点框已就位
+     * （焦点默认停在第 0 项），纯按键用户一进页面就看得见"操作对象是谁"。
+     * 建页是一次性动作，6 项以内的样式重设开销可忽略。 */
+    focus_paint();
+}
+
+/**
+ * @brief 焦点环形移动
+ * @param dir +1=下一项 / -1=上一项（负数取模先加长度防溢出）
+ */
+static void focus_move(int dir)
+{
+    if (s_focus_cnt <= 0) {
+        return;
+    }
+    s_focus_idx = (s_focus_idx + dir + s_focus_cnt) % s_focus_cnt;
+    focus_paint();
+    /* lv_obj_scroll_to_view：焦点控件若被内容区滚动裁掉，自动滚到可见
+     * （LV_ANIM_ON 平滑滚动）；已可见时无动作。 */
+    lv_obj_scroll_to_view(s_focus_widgets[s_focus_idx], LV_ANIM_ON);
+}
+
+/**
+ * @brief 滑条调节模式：按方向步进一个 SLIDER_STEP
+ *
+ * ⚠ LVGL 的 lv_bar_set_value/lv_slider_set_value **不会**派发 VALUE_CHANGED
+ * （那是触摸拖动路径才发的事件），因此步进后必须手动 lv_obj_send_event
+ * 补发一次，否则亮度/响度回调不执行——滑条看起来动了但背光/音量没变。
+ *
+ * @param dir -1=减 / +1=加（自动夹到 [min,max]）
+ */
+static void slider_step(int dir)
+{
+    if (s_focus_cnt <= 0) {
+        return;
+    }
+    lv_obj_t *w = s_focus_widgets[s_focus_idx];
+    if (!lv_obj_check_type(w, &lv_slider_class)) {
+        return;
+    }
+    int32_t v = lv_slider_get_value(w) + (int32_t)dir * SLIDER_STEP;
+    /* lv_slider_get_min_value/get_max_value：读滑动条合法范围（建页时 set_range 设定） */
+    int32_t lo = lv_slider_get_min_value(w);
+    int32_t hi = lv_slider_get_max_value(w);
+    if (v < lo) {
+        v = lo;
+    }
+    if (v > hi) {
+        v = hi;
+    }
+    lv_slider_set_value(w, v, LV_ANIM_ON);
+    lv_obj_send_event(w, LV_EVENT_VALUE_CHANGED, NULL); /* 手动补发：立即生效 + 刷数值标签 */
+}
+
+/**
+ * @brief 退出滑条调节模式：补发 RELEASED 让回调落盘
+ *
+ * 亮度/响度回调的策略是"拖动中只改内存缓存、松手才 settings_save_now()"
+ * （省 NVS 擦写寿命）。按键路径没有真实"松手"，退出调节时合成一次
+ * RELEASED 事件即可复用同一落盘逻辑（lv_event_get_user_data 在合成事件里
+ * 会取到注册回调时的 user_data，回调行为与触摸路径完全一致）。
+ */
+static void slider_edit_exit(void)
+{
+    if (s_focus_cnt <= 0) {
+        return;
+    }
+    lv_obj_t *w = s_focus_widgets[s_focus_idx];
+    s_slider_edit = false;
+    lv_obj_send_event(w, LV_EVENT_RELEASED, NULL); /* 触发 settings_save_now() 落盘 */
+    focus_paint();
+}
+
+/**
+ * @brief 激活当前焦点控件（长按 K2）
+ *
+ * 按控件类型分派（lv_obj_check_type 比对 LVGL 控件类对象）：
+ *   · 滑条  → 进入调节模式（后续单击=减/加，长按 K2=退出）；
+ *   · 开关  → 翻转 CHECKED 状态并补发 VALUE_CHANGED（回调读状态执行业务）；
+ *   · 其余（按钮/msgbox footer 按钮）→ 合成一次 LV_EVENT_CLICKED。
+ * 合成 CLICKED 是可靠的：lv_event_send 会把注册回调时的 user_data 注入事件，
+ * 业务回调拿到的参数与触摸点击完全一致（如通道按钮的通道标志、确认框的 ok_cb）。
+ */
+static void focus_activate(void)
+{
+    if (s_focus_cnt <= 0) {
+        return;
+    }
+    lv_obj_t *w = s_focus_widgets[s_focus_idx];
+    if (lv_obj_check_type(w, &lv_slider_class)) {
+        s_slider_edit = true;
+        focus_paint();
+        return;
+    }
+    if (lv_obj_check_type(w, &lv_switch_class)) {
+        /* lv_obj_has_state/add_state/remove_state：读/置对象状态位。
+         * 开关的 VALUE_CHANGED 只在状态翻转时由业务回调关心，故手动补发。 */
+        if (lv_obj_has_state(w, LV_STATE_CHECKED)) {
+            lv_obj_remove_state(w, LV_STATE_CHECKED);
+        } else {
+            lv_obj_add_state(w, LV_STATE_CHECKED);
+        }
+        lv_obj_send_event(w, LV_EVENT_VALUE_CHANGED, NULL);
+        return;
+    }
+    lv_obj_send_event(w, LV_EVENT_CLICKED, NULL);
+}
+
+/* ============================================================
  * 二级页框架
  * ============================================================ */
 
@@ -464,9 +711,16 @@ static lv_obj_t *plain_button(lv_obj_t *parent, const char *text, int32_t w, int
  * 除了删除浮层，还要把"随页而生"的刷新标签指针全部清 NULL——这些指针
  * 指向的对象已随浮层被 lv_obj_delete() 连带删除，若不置空，下一帧
  * screen_settings_refresh() 还会去写它们，形成野指针崩溃。
+ * 焦点链与"自动关页定时器"同理：对象没了/页没了，登记的状态必须一并失效。
  */
 static void subpage_close(void)
 {
+    /* 自动关页定时器：页都关了必须删掉，否则 1.4s 后回调会去关一个
+     * 不存在（或已被新页面占用）的浮层（任务 2 的根因之一）。 */
+    if (s_close_timer != NULL) {
+        lv_timer_delete(s_close_timer); /* lv_timer_delete：从 LVGL 定时器链表摘除并释放 */
+        s_close_timer = NULL;           /* 置 NULL 防悬空：删完的句柄绝不能再 delete */
+    }
     if (s_subpage != NULL) {
         /* lv_obj_delete()：删除对象并连带删除其所有子对象（标题栏/内容区在内） */
         lv_obj_delete(s_subpage);
@@ -474,6 +728,7 @@ static void subpage_close(void)
     s_subpage = NULL;
     s_sub_content = NULL;
     s_sub_kind = SUB_NONE;
+    focus_end(); /* 焦点链指针随浮层失效，清空下标/调节模式 */
     s_cal_read_label = NULL;
     s_cal_target_label = NULL;
     s_energy_wh_label = NULL;
@@ -508,6 +763,12 @@ static lv_obj_t *subpage_open(sub_kind_t kind, const char *title)
 {
     subpage_close();
     s_sub_kind = kind;
+    /* 首页网格焦点模式与二级页互斥：一旦进子页就退出网格模式并去掉格子高亮，
+     * 否则子页返回后单击仍会"无感地"挪网格焦点，用户困惑。 */
+    if (s_grid_focus_on) {
+        s_grid_focus_on = false;
+        grid_paint();
+    }
 
     s_subpage = lv_obj_create(s_tile);
     lv_obj_remove_style_all(s_subpage);
@@ -551,6 +812,9 @@ static lv_obj_t *subpage_open(sub_kind_t kind, const char *title)
         lv_obj_t *bl = plain_label(back, "< 返回", LVGL_PORT_FONT_14, COL_INK, false);
         lv_obj_center(bl);
     }
+    /* 焦点链：每个二级页的"返回"按钮都是长按 K1 的落点（见焦点链机制一节）。
+     * 可操作控件由各子页建好后自行 focus_add 登记，顺序即遍历顺序。 */
+    focus_begin(back);
 
     lv_obj_t *tl = plain_label(bar, title, LVGL_PORT_FONT_16, COL_INK, true);
     lv_obj_align(tl, LV_ALIGN_CENTER, 0, 0);
@@ -640,6 +904,10 @@ static void calib_ui_menu(void)
     lv_obj_add_event_cb(bv, calib_channel_clicked_cb, LV_EVENT_CLICKED, (void *)(intptr_t)1);
     lv_obj_t *bi = plain_button(row, "电流校准", LV_PCT(50), 44);
     lv_obj_add_event_cb(bi, calib_channel_clicked_cb, LV_EVENT_CLICKED, (void *)(intptr_t)0);
+
+    /* 焦点链：电压 → 电流（用户操作顺序；纯按键走这两格即可进校准） */
+    focus_add(bv);
+    focus_add(bi);
 }
 
 /** @brief 校准页数值/步长变化时刷新目标值显示
@@ -708,11 +976,24 @@ static void calib_plus_cb(lv_event_t *e)
  * 对应项目约定"完成后自动关闭子菜单"：校准成功已无待办操作，
  * 自动返回首页，用户无须再点一次"返回"。
  *
+ * 【任务 2 修复】原实现在 1.4s 后无条件 subpage_close()：若这 1.4s 内用户
+ * 手动切去了别的子页（或已回到首页再开了新页），到点会把**无辜的新页面**
+ * 关掉。现在定时器经 user_data 携带"启动时的目标子页类型"，回调先比对
+ * 当前 s_sub_kind，不匹配说明页面已换，直接作废定时器不动任何页面。
+ *
  * @param t 触发的定时器（用完即删，一次性）
  */
 static void close_timer_cb(lv_timer_t *t)
 {
+    /* lv_timer_get_user_data()：取出创建定时器时存入的用户上下文
+     * （这里用 (sub_kind_t)(intptr_t) 编码目标子页类型） */
+    sub_kind_t want = (sub_kind_t)(intptr_t)lv_timer_get_user_data(t);
     lv_timer_delete(t); /* 一次性定时器：触发后自删，防止重复触发 */
+    s_close_timer = NULL; /* 句柄已失效，置 NULL 防 subpage_close 二次删除 */
+    if (s_sub_kind != want) {
+        /* 目标页面早已不在（用户已手动切页/返回）：什么都不关 */
+        return;
+    }
     subpage_close();
 }
 
@@ -767,7 +1048,13 @@ static void calib_apply_cb(lv_event_t *e)
     lv_obj_t *done = plain_label(c, buf, LVGL_PORT_FONT_16, COL_OK, true);
     lv_obj_set_style_text_align(done, LV_TEXT_ALIGN_CENTER, 0);
     lv_obj_set_style_margin_top(done, 24, 0); /* margin_top：外边距（与内边距 pad 不同，撑开与上文距离） */
-    lv_timer_create(close_timer_cb, 1400, NULL); /* lv_timer_create：1400ms 后触发一次自动关页 */
+
+    /* lv_timer_create：1400ms 后触发一次自动关页。
+     * ① 句柄存 s_close_timer：subpage_close() 会在用户提前切页/返回时显式删掉它
+     *    （防"新页面被旧定时器误关"，见 close_timer_cb 注释）；
+     * ② user_data 携带目标子页类型 SUB_CALIB_DONE：回调据此校验"要关的还是
+     *    当初那一页"，不匹配直接作废（任务 2 的双重保险）。 */
+    s_close_timer = lv_timer_create(close_timer_cb, 1400, (void *)(intptr_t)SUB_CALIB_DONE);
 }
 
 /**
@@ -854,8 +1141,9 @@ static void calib_ui_enter(void)
     lv_obj_add_event_cb(step, calib_step_cycle_cb, LV_EVENT_CLICKED, NULL);
 
     /* 电流通道：一键清零（空载校零，输出空载时抵消当前读数） */
+    lv_obj_t *zero = NULL;
     if (!s_cal_is_voltage) {
-        lv_obj_t *zero = plain_button(c, "一键清零（空载）", LV_PCT(100), 36);
+        zero = plain_button(c, "一键清零（空载）", LV_PCT(100), 36);
         lv_obj_add_event_cb(zero, calib_zero_cb, LV_EVENT_CLICKED, NULL);
     }
 
@@ -870,6 +1158,14 @@ static void calib_ui_enter(void)
         lv_obj_set_style_text_font(apply_lbl, lvgl_port_get_font_bold(LVGL_PORT_FONT_16), 0);
     }
     lv_obj_add_event_cb(apply, calib_apply_cb, LV_EVENT_CLICKED, NULL);
+
+    /* 焦点链：－ → ＋ → 步长 →（电流通道多一格清零）→ 应用。
+     * 顺序即"调标准值 → 选步长 → 应用"的自然操作流，纯按键不绕路。 */
+    focus_add(minus);
+    focus_add(plus);
+    focus_add(step);
+    focus_add(zero); /* 电压通道时为 NULL，focus_add 自动忽略 */
+    focus_add(apply);
 }
 
 /* ============================================================
@@ -1025,6 +1321,7 @@ static void display_open_cb(void)
     /* 同一回调挂两个事件：拖动中实时生效（VALUE_CHANGED）、松手落盘（RELEASED） */
     lv_obj_add_event_cb(slider, bright_slider_cb, LV_EVENT_VALUE_CHANGED, NULL);
     lv_obj_add_event_cb(slider, bright_slider_cb, LV_EVENT_RELEASED, NULL);
+    focus_add(slider); /* 焦点链第 1 项：亮度滑条（长按 K2 进调节模式） */
 
     /* ---- 屏幕方向：自动开关 + 角度按钮（0°=默认横屏，顺时针）---- */
     lv_obj_t *auto_row = plain_container(c);
@@ -1057,6 +1354,7 @@ static void display_open_cb(void)
         lv_obj_add_state(s_auto_switch, LV_STATE_CHECKED);
     }
     lv_obj_add_event_cb(s_auto_switch, auto_switch_cb, LV_EVENT_VALUE_CHANGED, NULL);
+    focus_add(s_auto_switch); /* 焦点链第 2 项：自动旋转开关（长按 K2 切换） */
 
     lv_obj_t *cap2 = plain_label(c, "屏幕方向", LVGL_PORT_FONT_16, COL_INK, false);
     lv_obj_set_width(cap2, LV_PCT(100));
@@ -1075,6 +1373,7 @@ static void display_open_cb(void)
         lv_obj_add_event_cb(b, angle_clicked_cb, LV_EVENT_CLICKED,
                             (void *)(intptr_t)s_angle_vals[i]);
         s_angle_btns[i] = b; /* 记下按钮指针，供 angle_buttons_refresh 改高亮 */
+        focus_add(b);        /* 焦点链第 3~6 项：0/90/180/270° 角度按钮 */
     }
     angle_buttons_refresh(); /* 打开页时按实际角度点亮对应按钮 */
 
@@ -1166,11 +1465,13 @@ static void buzzer_open_cb(void)
     /* 拖动实时生效 / 松手落盘（同 bright_slider_cb 的双事件策略） */
     lv_obj_add_event_cb(slider, volume_slider_cb, LV_EVENT_VALUE_CHANGED, NULL);
     lv_obj_add_event_cb(slider, volume_slider_cb, LV_EVENT_RELEASED, NULL);
+    focus_add(slider); /* 焦点链第 1 项：响度滑条（长按 K2 进调节模式） */
 
     /* "试听"按钮：调完滑条立刻播放提示音，让用户当场确认响度是否合适，
      * 而不是退出设置页后才发现音量没调对 */
     lv_obj_t *test = plain_button(c, "试听", LV_PCT(60), 40);
     lv_obj_add_event_cb(test, buzzer_test_cb, LV_EVENT_CLICKED, NULL);
+    focus_add(test); /* 焦点链第 2 项：试听按钮 */
 
     lv_obj_t *note = plain_label(c, "提示音用于按键反馈与启动完成提示；\n调到 0 以上才有声音。",
                                  LVGL_PORT_FONT_12, COL_GRAY, false);
@@ -1282,6 +1583,7 @@ static void energy_open_cb(void)
         lv_obj_set_style_text_font(lbl, lvgl_port_get_font_bold(LVGL_PORT_FONT_16), 0);
     }
     lv_obj_add_event_cb(btn, energy_reset_clicked_cb, LV_EVENT_CLICKED, NULL);
+    focus_add(btn); /* 焦点链第 1 项：清零统计（长按 K2 弹确认框） */
 
     /* 单行短提示（原长句会折行把本页撑到需滚动；按钮降到 40px + 短句
      * 后整页一屏放下，底部不贴边）。
@@ -1384,6 +1686,14 @@ static lv_obj_t *make_cell_dispatch(lv_obj_t *row, const char *icon, const char 
 void screen_settings_create(lv_obj_t *tile)
 {
     s_tile = tile;
+    /* 旋转重建：旧浮层已随 tileview 被 lv_obj_delete 连带删除，这里只能置空
+     * 指针（不能再调 subpage_close，它会二次删除已释放对象）；但定时器与
+     * 焦点链是独立于对象树的悬空状态，必须手动作废。 */
+    if (s_close_timer != NULL) {
+        lv_timer_delete(s_close_timer);
+        s_close_timer = NULL;
+    }
+    focus_end();
     s_subpage = NULL;
     s_sub_content = NULL;
     s_sub_kind = SUB_NONE;
@@ -1428,10 +1738,15 @@ void screen_settings_create(lv_obj_t *tile)
         lv_obj_set_size(row, LV_PCT(100), CELL_HEIGHT);
         lv_obj_set_flex_flow(row, LV_FLEX_FLOW_ROW);
         lv_obj_set_style_pad_column(row, CELL_GAP_X, 0);
-        make_cell_dispatch(row, cells[r * 2].icon, cells[r * 2].name, cells[r * 2].cb);
-        make_cell_dispatch(row, cells[r * 2 + 1].icon, cells[r * 2 + 1].name,
-                           cells[r * 2 + 1].cb);
+        s_grid_cells[r * 2] =
+            make_cell_dispatch(row, cells[r * 2].icon, cells[r * 2].name, cells[r * 2].cb);
+        s_grid_cells[r * 2 + 1] =
+            make_cell_dispatch(row, cells[r * 2 + 1].icon, cells[r * 2 + 1].name,
+                               cells[r * 2 + 1].cb);
     }
+    /* 重建（旋转/首次）后网格焦点模式归零：按钮是新对象，旧高亮状态不可带过来 */
+    s_grid_focus_on = false;
+    s_grid_idx = 0;
 }
 
 /**
@@ -1484,5 +1799,167 @@ void screen_settings_refresh(const data_store_snapshot_t *snap)
         break;
     default:
         break;
+    }
+}
+
+/**
+ * @brief 弹窗按键动作：K1=取消 / K2=确定（固定键位，无需焦点记忆）
+ *
+ * footer 按钮即 msgbox 底部按钮区的子对象（"取消"在前、"确定"在后，
+ * 见 show_confirm / show_notice 的创建顺序）。激活方式与 focus_activate
+ * 同款：合成一次 LV_EVENT_CLICKED，注册回调（含 user_data）照常执行，
+ * 与手指点击完全等价。确定动作可能再弹结果提示框（如"已清零"），
+ * s_active_msgbox 会随之更新，调用方拿它当"当前弹窗"用是安全的。
+ *
+ * @param id K1=BUTTON_ID_BOOT → 取消；K2=BUTTON_ID_USER → 确定
+ */
+static void msgbox_key_action(button_id_t id)
+{
+    lv_obj_t *box = s_active_msgbox;
+    if (box == NULL) {
+        return;
+    }
+    lv_obj_t *footer = lv_msgbox_get_footer(box); /* 底部按钮区（可能为 NULL） */
+    uint32_t n = (footer != NULL) ? lv_obj_get_child_count(footer) : 0;
+    if (n == 0) {
+        /* 无按钮的异常框：任一键直接关闭，绝不把用户困在弹窗里 */
+        lv_msgbox_close(box);
+        return;
+    }
+    if (id == BUTTON_ID_USER) {
+        /* K2 = 确定 = footer 最后一个按钮 */
+        lv_obj_send_event(lv_obj_get_child(footer, n - 1), LV_EVENT_CLICKED, NULL);
+    } else {
+        /* K1 = 取消 = footer 第一个按钮（单按钮提示框时它就是"确定"，
+         * 点了同样关闭——提示框只求"看完能走"，两个键都认） */
+        lv_obj_send_event(lv_obj_get_child(footer, 0), LV_EVENT_CLICKED, NULL);
+    }
+}
+
+/**
+ * @brief 查询设置页是否有模态浮层（二级页/弹窗）正在打开——不管当前在哪一页
+ *
+ * 供 ui_nav 的滑动识别使用：模态浮层打开时必须抑制"环形翻页手势"，否则
+ * 一次横滑就把承载浮层的设置 tile 整个翻走，浮层还留在原 tile 上（视觉上
+ * 像"页面被抽走、菜单悬空"，还会连带触发按键路由错乱，见 subpage_is_open）。
+ */
+bool screen_settings_modal_is_open(void)
+{
+    return (s_subpage != NULL || s_active_msgbox != NULL);
+}
+
+/**
+ * @brief 查询设置页是否需要接管按键（ui_nav 按键路由的门，见 screen_settings.h）
+ */
+bool screen_settings_subpage_is_open(void)
+{
+    /* 只有"模态浮层存在 **且** 当前就在设置页"才算本页要接管按键。
+     * 【关键】二级页浮层是挂在设置 tile 上的，tileview 被环形翻页手势翻走后
+     * 浮层仍留在设置 tile 上（对象还活着），若不加页面限定，会在测量/波形页
+     * 也判成"模态中"，把全局按键全劫持——表现为无法翻页/无法开菜单、页面
+     * 在两页间反复震荡（2026-10 模拟器实证的根因）。 */
+    if ((s_subpage != NULL || s_active_msgbox != NULL) &&
+        ui_nav_current_page() == UI_PAGE_SETTINGS) {
+        return true; /* 二级页/弹窗且在设置页：模态，按键全归本页 */
+    }
+    /* 设置页首页也返回 true：网格入口（长按 K2 进入网格焦点模式）必须能
+     * 收到按键才可达，而 ui_nav 的路由门是"本接口 true 才调 screen_settings_key"。
+     * 未进入网格模式时 screen_settings_key 一律返回 false，事件会沿 ui_nav 的
+     * else-if 链落回三页导航（单击=翻页、长按 K1=回测量页），行为与从前一致。 */
+    return ui_nav_current_page() == UI_PAGE_SETTINGS;
+}
+
+/**
+ * @brief 设置页纯按键操作总入口（焦点链 + 网格 + 弹窗三层，见 screen_settings.h 契约）
+ *
+ * 处理优先级：弹窗（模态）＞ 二级页焦点链 ＞ 首页网格。
+ * 返回 false 表示本页不消费该事件（首页未进网格模式时的普通按键），
+ * ui_nav 会继续走测量/波形菜单与三页导航——这正是"翻页键位不受影响"的保证。
+ */
+bool screen_settings_key(button_id_t id, button_event_t ev)
+{
+    /* ---- ① 弹窗层：K1=取消 / K2=确定，其余事件一律吞掉 ---- */
+    if (s_active_msgbox != NULL) {
+        if (ev == BUTTON_EVENT_SINGLE_CLICK || ev == BUTTON_EVENT_LONG_PRESS_START) {
+            msgbox_key_action(id);
+        }
+        /* 长按松开/双击等无动作但不外漏（防止长按结束的 RELEASE 落到翻页逻辑） */
+        return true;
+    }
+
+    /* ---- ② 二级页焦点链 ---- */
+    if (s_subpage != NULL) {
+        switch (ev) {
+        case BUTTON_EVENT_SINGLE_CLICK:
+            if (s_slider_edit) {
+                /* 滑条调节模式：K1=减、K2=加（与"K1=上一项/K2=下一项"同向心智） */
+                slider_step(id == BUTTON_ID_BOOT ? -1 : +1);
+            } else {
+                focus_move(id == BUTTON_ID_BOOT ? -1 : +1);
+            }
+            return true;
+        case BUTTON_EVENT_LONG_PRESS_START:
+            if (id == BUTTON_ID_USER) {
+                if (s_slider_edit) {
+                    slider_edit_exit(); /* 长按 K2 = 退出调节模式（补发 RELEASED 落盘） */
+                } else {
+                    focus_activate(); /* 长按 K2 = 激活焦点控件 */
+                }
+            } else {
+                /* 长按 K1 = 返回/关闭本子页（等效触屏"返回"按钮） */
+                if (s_slider_edit) {
+                    slider_edit_exit(); /* 先落盘再走，防止调节中的值丢失 */
+                }
+                if (s_focus_back != NULL) {
+                    /* 合成点击"返回"：走 back_clicked_cb → subpage_close()，
+                     * 与触屏路径同一出口（含定时器删除/焦点链清理） */
+                    lv_obj_send_event(s_focus_back, LV_EVENT_CLICKED, NULL);
+                } else {
+                    subpage_close();
+                }
+            }
+            return true;
+        default:
+            /* 双击/长按松开：子页开着时全吞，防止外漏成翻页/开菜单 */
+            return true;
+        }
+    }
+
+    /* ---- ③ 设置首页网格 ---- */
+    if (ui_nav_current_page() != UI_PAGE_SETTINGS) {
+        return false; /* 不在设置页（异常场景兜底）：不碰按键 */
+    }
+    if (!s_grid_focus_on) {
+        /* 未进网格模式：仅长按 K2 进入（与"长按 K2=开本页菜单"同心智）；
+         * 其余按键交回 ui_nav 翻页（返回 false 走 else-if 链） */
+        if (ev == BUTTON_EVENT_LONG_PRESS_START && id == BUTTON_ID_USER) {
+            s_grid_focus_on = true;
+            s_grid_idx = 0;
+            grid_paint(); /* 高亮第一格，用户一眼看到"焦点在哪" */
+            return true;
+        }
+        return false;
+    }
+    switch (ev) {
+    case BUTTON_EVENT_SINGLE_CLICK:
+        /* 焦点上下移动（环形）：K1=上一格、K2=下一格 */
+        s_grid_idx = (s_grid_idx + (id == BUTTON_ID_BOOT ? -1 : 1) + GRID_CELL_COUNT) %
+                     GRID_CELL_COUNT;
+        grid_paint();
+        return true;
+    case BUTTON_EVENT_LONG_PRESS_START:
+        if (id == BUTTON_ID_USER) {
+            /* 打开焦点功能格：合成 CLICKED 复用格子的打开回调（cell_clicked_cb），
+             * 子页/弹窗随即接管按键（上面的 ①② 层） */
+            lv_obj_send_event(s_grid_cells[s_grid_idx], LV_EVENT_CLICKED, NULL);
+            return true;
+        }
+        /* 长按 K1 = 退出网格模式；返回 false 让 ui_nav 继续"设置页长按 K1=回测量页"，
+         * 即"退出焦点 + 返回"一步完成（与子页内长按 K1=返回 同语义） */
+        s_grid_focus_on = false;
+        grid_paint();
+        return false;
+    default:
+        return false;
     }
 }
