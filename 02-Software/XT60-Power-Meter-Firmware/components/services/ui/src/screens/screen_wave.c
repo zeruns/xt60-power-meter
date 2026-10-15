@@ -51,6 +51,8 @@
 
 #define CHART_MAX_POINTS 480
 #define CHART_VALUE_SCALE 100.0f
+/** 量程上下留白比例：12%（信号占图面约 3/4 高度，波峰波谷不贴边） */
+#define WAVE_RANGE_PAD_FRAC 0.12f
 /* 滑板高度：title 20 + row 88 + 平滑行 28+4 + 提示两行 32 + 行距 4×4 +
  * 内边距 20 ≈ 224。旧值 188 是加"曲线平滑"开关行之前的布局。 */
 #define PANEL_H 224
@@ -578,12 +580,12 @@ static void update_axis_range(int n)
         }
     }
 
-    /* 轴量程与刻度统一加 5% 上下留白：
-     * ⚠ 之前 chart range 用分位原值 [min,max]，但刻度显示 [min-pad,max+pad]，
-     * 导致曲线峰谷顶到 chart 框边、而刻度却说上方还有空间——视觉不一致。
-     * 修复：chart range 与刻度都用留白后的范围，峰谷落在 95% 处不顶边。 */
-    const float pad_a = (s_range_a_max - s_range_a_min) * 0.05f;
-    const float pad_b = (s_range_b_max - s_range_b_min) * 0.05f;
+    /* 轴量程与刻度统一加留白：波峰波谷不贴 chart 边框（贴边极难观测）。
+     * 2026-10 用户反馈 5% 仍偏紧，提至 12%——峰值落在图面约 88% 处，
+     * 上下各留出清晰的呼吸空间（示波器惯例：信号占中间约 3/4 高度）。
+     * chart range 与刻度始终一致，峰谷不会顶框。 */
+    const float pad_a = (s_range_a_max - s_range_a_min) * WAVE_RANGE_PAD_FRAC;
+    const float pad_b = (s_range_b_max - s_range_b_min) * WAVE_RANGE_PAD_FRAC;
     lv_chart_set_axis_range(s_chart, LV_CHART_AXIS_PRIMARY_Y,
                             (int32_t)((s_range_a_min - pad_a) * CHART_VALUE_SCALE),
                             (int32_t)((s_range_a_max + pad_a) * CHART_VALUE_SCALE));
@@ -716,7 +718,7 @@ static void trend_update(int n, const mode_desc_t *d)
      * 否则均值线位置与曲线实际位置不匹配。 */
     int32_t y_avg;
     {
-        const float pad = (s_range_a_max - s_range_a_min) * 0.05f;
+        const float pad = (s_range_a_max - s_range_a_min) * WAVE_RANGE_PAD_FRAC;
         float lo = s_range_a_min - pad, hi = s_range_a_max + pad;
         float t = (hi > lo) ? (vavg - lo) / (hi - lo) : 0.5f;
         if (t < 0.0f) {
