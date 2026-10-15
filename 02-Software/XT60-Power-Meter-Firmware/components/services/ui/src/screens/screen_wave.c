@@ -59,6 +59,32 @@
 #define WAVE_MIN_DIV_V 1.0f
 /** 电流波形每格最小分辨率（A）：防止微小信号被过放大（用户要求 ≥0.1A/格） */
 #define WAVE_MIN_DIV_A 0.1f
+
+/**
+ * @brief 1-2-5 标准格值序列：取 ≥ min_div 的最小标准格值
+ *
+ * 仪表行业惯例格值序列（万用表/示波器通用）：
+ *   电压基于 1V：1 / 2 / 5 / 10 / 20 / 50 V…；
+ *   电流基于 0.1A：0.1 / 0.2 / 0.5 / 1 / 2 / 5 A…。
+ * 格值取标准值、刻度锚定格值整数倍，读数时可直接按格数心算
+ * （用户要求"格子都是整数，如 1V、2V、0.1A、0.5A、1A、2A"）。
+ */
+static float wave_nice_div(float min_div, bool is_volt)
+{
+    const float base = is_volt ? WAVE_MIN_DIV_V : WAVE_MIN_DIV_A;
+    static const float mant[3] = { 1.0f, 2.0f, 5.0f };
+    float scale = 1.0f;
+    for (int dec = 0; dec < 5; dec++) {
+        for (int m = 0; m < 3; m++) {
+            const float cand = base * mant[m] * scale;
+            if (cand >= min_div) {
+                return cand;
+            }
+        }
+        scale *= 10.0f;
+    }
+    return base * 100000.0f; /* 兜底（不会到达） */
+}
 /* 滑板高度：title 20 + row 88 + 平滑行 28+4 + 提示两行 32 + 行距 4×4 +
  * 内边距 20 ≈ 224。旧值 188 是加"曲线平滑"开关行之前的布局。 */
 #define PANEL_H 224
@@ -593,26 +619,36 @@ static void update_axis_range(int n)
     const float pad_a = (s_range_a_max - s_range_a_min) * WAVE_RANGE_PAD_FRAC;
     const float pad_b = (s_range_b_max - s_range_b_min) * WAVE_RANGE_PAD_FRAC;
 
-    /* 量化量程：每格最小分辨率（电压 ≥1V/格、电流 ≥0.1A/格），
-     * 防止微小信号被自动量程过放大成"全屏巨浪"（用户要求）。
-     * 做法：跨度不足最小跨度时，以信号中心对称扩到最小跨度。 */
+    /* 量化量程：每格取 1-2-5 标准格值（电压 ≥1V/格、电流 ≥0.1A/格），
+     * 固定 4 格（格线数固定），下边界锚定格值整数倍、上边界 = 下边界+4×格值，
+     * 使 5 条格线全部落在整格值整数倍上——读数可直接按格数心算
+     * （如 1V、2V、5V / 0.1A、0.5A、1A）。
+     * ⚠ floorf(x/div) 有浮点误差（17.0/0.1→169.9999→16.9），加 1e-3 抵消。 */
     float range_lo_a = s_range_a_min - pad_a, range_hi_a = s_range_a_max + pad_a;
     float range_lo_b = s_range_b_min - pad_b, range_hi_b = s_range_b_max + pad_b;
-    const float min_div_a = (d->ch_a == 0) ? WAVE_MIN_DIV_V : WAVE_MIN_DIV_A;
-    const float min_span_a = WAVE_Y_DIVS * min_div_a;
-    if (range_hi_a - range_lo_a < min_span_a) {
+
+    const bool a_is_volt = (d->ch_a == 0);
+    const float min_div_a = a_is_volt ? WAVE_MIN_DIV_V : WAVE_MIN_DIV_A;
+    const float span_a = range_hi_a - range_lo_a;
+    const float div_a = wave_nice_div(fmaxf(span_a, WAVE_Y_DIVS * min_div_a) / (float)WAVE_Y_DIVS,
+                                      a_is_volt);
+    {
         const float mid = (range_lo_a + range_hi_a) * 0.5f;
-        range_lo_a = mid - min_span_a * 0.5f;
-        range_hi_a = mid + min_span_a * 0.5f;
+        const float lo_units = floorf((mid - 0.5f * (float)WAVE_Y_DIVS * div_a) / div_a + 1e-3f);
+        range_lo_a = lo_units * div_a;
+        range_hi_a = range_lo_a + (float)WAVE_Y_DIVS * div_a;
     }
+
     if (d->has_b) {
-        const float min_div_b = (d->ch_b == 0) ? WAVE_MIN_DIV_V : WAVE_MIN_DIV_A;
-        const float min_span_b = WAVE_Y_DIVS * min_div_b;
-        if (range_hi_b - range_lo_b < min_span_b) {
-            const float mid = (range_lo_b + range_hi_b) * 0.5f;
-            range_lo_b = mid - min_span_b * 0.5f;
-            range_hi_b = mid + min_span_b * 0.5f;
-        }
+        const bool b_is_volt = (d->ch_b == 0);
+        const float min_div_b = b_is_volt ? WAVE_MIN_DIV_V : WAVE_MIN_DIV_A;
+        const float span_b = range_hi_b - range_lo_b;
+        const float div_b = wave_nice_div(fmaxf(span_b, WAVE_Y_DIVS * min_div_b) / (float)WAVE_Y_DIVS,
+                                          b_is_volt);
+        const float mid = (range_lo_b + range_hi_b) * 0.5f;
+        const float lo_units = floorf((mid - 0.5f * (float)WAVE_Y_DIVS * div_b) / div_b + 1e-3f);
+        range_lo_b = lo_units * div_b;
+        range_hi_b = range_lo_b + (float)WAVE_Y_DIVS * div_b;
     }
     lv_chart_set_axis_range(s_chart, LV_CHART_AXIS_PRIMARY_Y,
                             (int32_t)(range_lo_a * CHART_VALUE_SCALE),
