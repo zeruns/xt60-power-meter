@@ -153,22 +153,22 @@ static wave_geom_t wave_geom(void)
     g.w = w;
     g.h = h;
     if (w >= h) {
-        /* 横屏 284×240：数据行下移、两行间隔拉大（20px 字体行高 22px，
-         * 均行底 ≤ 240 不裁切，故 chart 微缩、两行上收 4px） */
+        /* 横屏 284×240：数值 16px 行高约 20px，两行错开 22px（间隔大于行高，
+         * 视觉分组清晰）；均行底 ≤ 236 离底边留 4px，避开圆形屏圆角裁切 */
         g.chart_y = 44;
-        g.chart_h = 130;
-        g.time_y = 177;
-        g.rt_y = 190;
-        g.av_y = 213;
+        g.chart_h = 132;
+        g.time_y = 178;
+        g.rt_y = 194;
+        g.av_y = 216;
         g.col_win_w = 116;
         g.col_mode_w = 146;
     } else {
         /* 竖屏 240×284：图表加高，时间轴/数据行整体下移 */
         g.chart_y = 44;
-        g.chart_h = 162;
-        g.time_y = 213;
-        g.rt_y = 226;
-        g.av_y = 249;
+        g.chart_h = 166;
+        g.time_y = 217;
+        g.rt_y = 233;
+        g.av_y = 255;
         g.col_win_w = 96;
         g.col_mode_w = 104;
     }
@@ -235,7 +235,7 @@ static lv_obj_t *s_lbl_time_m = NULL; /**< 时间轴中点刻度 */
  * 列右端——数值变宽时向左生长、单位与列边界纹丝不动，彻底消除位置跳动。
  * 列宽按屏宽均分，自适应横/竖屏；列数随波形模式（1~3 列）变化。 */
 #define WAVE_DATA_COLS 3      /**< 最多列数：电压+电流+功率 */
-#define WAVE_DATA_PREFIX_W 18 /**< 行首"实"/"均"字样占宽（16px 字体） */
+#define WAVE_DATA_PREFIX_W 16 /**< 行首"实"/"均"字样占宽（14px 字体） */
 #define WAVE_DATA_UNIT_W   14 /**< 单位列定宽（12px 字体，容得下 "Wh"） */
 #define WAVE_DATA_VAL_GAP  2  /**< 数值框与单位之间固定间隔 */
 static lv_obj_t *s_rt_prefix = NULL;
@@ -348,15 +348,19 @@ static void layout_data_cols(const wave_geom_t *g)
     const int32_t avail = g->w - 2 * SAFE_X - WAVE_DATA_PREFIX_W;
     const int32_t col_w = avail / ncol;
     const int32_t val_w = col_w - WAVE_DATA_UNIT_W - WAVE_DATA_VAL_GAP;
-    const lv_font_t *f = lvgl_port_get_font(LVGL_PORT_FONT_20);
-    const lv_coord_t line_h = (lv_coord_t)(f->line_height + 2);
+    /* 行高按数值字体（16px）计算；单位 12px 垂直居中于行内——
+     * 若单位与数值同 y 顶对齐，会飘在右上角像"上标"（实机照片反馈） */
+    const lv_font_t *f_val = lvgl_port_get_font(LVGL_PORT_FONT_16);
+    const lv_font_t *f_unit = lvgl_port_get_font(LVGL_PORT_FONT_12);
+    const lv_coord_t line_h = (lv_coord_t)(f_val->line_height + 2);
+    const lv_coord_t unit_dy = (lv_coord_t)((line_h - f_unit->line_height) / 2);
 
     lv_obj_t *prefix[2] = { s_rt_prefix, s_av_prefix };
     lv_obj_t **vals[2] = { s_rt_val, s_av_val };
     lv_obj_t **units[2] = { s_rt_unit, s_av_unit };
     const int32_t ys[2] = { g->rt_y, g->av_y };
     for (int row = 0; row < 2; row++) {
-        lv_obj_set_pos(prefix[row], SAFE_X, ys[row]); /* 设置对象相对父级的 x/y 位置 */
+        lv_obj_set_pos(prefix[row], SAFE_X, ys[row] + 2); /* 设置对象相对父级的 x/y 位置 */
         for (int c = 0; c < WAVE_DATA_COLS; c++) {
             const bool on = (c < ncol);
             lv_obj_set_hidden(vals[row][c], !on); /* 隐藏多余列（不参与绘制） */
@@ -368,8 +372,8 @@ static void layout_data_cols(const wave_geom_t *g)
             /* 数值右对齐 + 定宽框：数字变宽向左生长，单位位置纹丝不动 */
             lv_obj_set_pos(vals[row][c], x0, ys[row]);
             lv_obj_set_size(vals[row][c], val_w, line_h); /* 定宽框（数值右对齐在其内） */
-            /* 单位贴列右端 */
-            lv_obj_set_pos(units[row][c], x0 + val_w + WAVE_DATA_VAL_GAP, ys[row]);
+            /* 单位贴列右端、垂直居中 */
+            lv_obj_set_pos(units[row][c], x0 + val_w + WAVE_DATA_VAL_GAP, ys[row] + unit_dy);
         }
     }
 }
@@ -1036,7 +1040,8 @@ static void trend_update(int n, const mode_desc_t *d)
         i_max_dot = imax;
     }
 
-    /* 均值参考线（水平 1px 浅色，跨图面宽）：按主轴量程（含 5% 留白）换算 y。
+    /* 均值参考线（水平 1px 浅色，跨图面宽）：按主轴量程（含 12% 留白，
+     * 与 WAVE_RANGE_PAD_FRAC 一致）换算 y。
      * ⚠ 必须与 update_axis_range 中 chart_set_axis_range 的留白范围一致，
      * 否则均值线位置与曲线实际位置不匹配。 */
     int32_t y_avg;
@@ -1434,10 +1439,18 @@ void screen_wave_create(lv_obj_t *tile)
 {
     wave_geom_t g = wave_geom();
 
-    /* ---- 旋转重建清理：底部滑板挂在 screen 层（不随 tile 删除），
-     * 必须先停掉位移动画再删对象，否则动画回调会访问已释放的 panel。
-     * lv_anim_del(obj, exec_cb)：按 exec 回调删除该对象上的动画 ---- */
+    /* 【U2 修复】旋转重建必须复位 roller 两阶段触控状态 s_roller_edit：
+     * 它是 int8_t（-1=无编辑 / 0=时间窗 / 1=波形模式），重建只复位
+     * s_menu_open/s_panel_animating 会残留旧值——重建后若仍为 0/1，
+     * roller_clicked_cb 会把"首次点击选中"误判成"再点一次确认退出"，
+     * 用户点一下 roller 直接退出编辑态，滑不动选项。
+     * ⚠ 必须在删除 s_panel **之前**调用：两个 roller 是滑板的子孙对象，
+     * 先删滑板会让 roller_edit_cancel() 里的 set_scrollable 踩到悬空指针。 */
+    roller_edit_cancel();
     if (s_panel != NULL) {
+        /* ---- 旋转重建清理：底部滑板挂在 screen 层（不随 tile 删除），
+         * 必须先停掉位移动画再删对象，否则动画回调会访问已释放的 panel。
+         * lv_anim_del(obj, exec_cb)：按 exec 回调删除该对象上的动画 ---- */
         lv_anim_del(s_panel, anim_panel_y);
         lv_obj_delete(s_panel);
         s_panel = NULL;
@@ -1609,20 +1622,20 @@ void screen_wave_create(lv_obj_t *tile)
 
     /* 实时 / 平均：定宽列标签组（行首"实"/"均" + 每列 定宽数值 + 定宽单位）。
      * 数值右对齐定宽框、单位固定列右端——数字正负跳动时列间不互挤。
-     * 字体分级：数值 20px（主读数，大）、前缀 16px、单位 12px（小、不抢眼）。
-     * 行高按最大字体 20px 计算，三者底部对齐（基线约在行内居中）。
+     * 字体分级：数值 16px（主读数）、前缀 14px、单位 12px（小、不抢眼）。
+     * 行高按数值字体 16px 计算，单位垂直居中（避免飘在右上角像上标）。
      * 建标签时位置先给"默认值"，最终位置由 layout_data_cols 统一摆放。 */
-    const lv_font_t *f20 = lvgl_port_get_font(LVGL_PORT_FONT_20);
-    const lv_font_t *f16 = lvgl_port_get_font(LVGL_PORT_FONT_16);
+    const lv_font_t *f16v = lvgl_port_get_font(LVGL_PORT_FONT_16);
+    const lv_font_t *f14 = lvgl_port_get_font(LVGL_PORT_FONT_14);
     const lv_font_t *f12u = lvgl_port_get_font(LVGL_PORT_FONT_12);
-    const lv_coord_t line_h = (lv_coord_t)(f20->line_height + 2);
+    const lv_coord_t line_h = (lv_coord_t)(f16v->line_height + 2);
     static const char *const prefix_txt[2] = { "实", "均" };
     const lv_color_t prefix_col[2] = { COL_DARK, COL_GRAY };
     lv_obj_t **prefix_obj[2] = { &s_rt_prefix, &s_av_prefix };
     for (int row = 0; row < 2; row++) {
         *prefix_obj[row] = lv_label_create(tile);
         lv_label_set_text(*prefix_obj[row], prefix_txt[row]);
-        lv_obj_set_style_text_font(*prefix_obj[row], f16, 0);
+        lv_obj_set_style_text_font(*prefix_obj[row], f14, 0);
         lv_obj_set_style_text_color(*prefix_obj[row], prefix_col[row], 0);
     }
     lv_obj_t **vals[2] = { s_rt_val, s_av_val };
@@ -1631,7 +1644,7 @@ void screen_wave_create(lv_obj_t *tile)
         for (int c = 0; c < WAVE_DATA_COLS; c++) {
             vals[row][c] = lv_label_create(tile);
             lv_label_set_text(vals[row][c], "--");
-            lv_obj_set_style_text_font(vals[row][c], f20, 0);
+            lv_obj_set_style_text_font(vals[row][c], f16v, 0);
             lv_obj_set_style_text_color(vals[row][c], prefix_col[row], 0);
             lv_obj_set_width(vals[row][c], 60);
             lv_obj_set_style_text_align(vals[row][c], LV_TEXT_ALIGN_RIGHT, 0);
