@@ -159,7 +159,7 @@ sup a:hover { text-decoration: underline; }
 <!-- ===================== 1 执行摘要 ===================== -->
 <section id="summary">
   <h2><span class="no">01</span>执行摘要</h2>
-  <p>本项目已经是一台<strong>工程成熟度高于常规开源项目</strong>的显示型功率计：分层架构清晰（bsp → drivers → middleware → services → main）、启动容错设计完善（刻意不用 <code>ESP_ERROR_CHECK</code> 防变砖、故障分级指示、coredump 取证）、4kSPS 测量链路经多轮实机打磨（CRC 整帧校验根治毛刺、三级降采样、min/max 包络防混叠）、中文教学级注释密度 35%~60%。<mark class="key">核心测量与显示功能是扎实的。</mark></p>
+  <p>本项目已经是一台<strong>工程成熟度高于常规开源项目</strong>的显示型功率计：分层架构清晰（bsp → drivers → middleware → services → main）、启动容错设计完善（刻意不用 <code>ESP_ERROR_CHECK</code> 防变砖、故障分级指示、coredump 取证）、500SPS 测量链路经多轮实机打磨（CRC 整帧校验根治毛刺、三级降采样、min/max 包络防混叠）、中文教学级注释密度 35%~60%。<mark class="key">核心测量与显示功能是扎实的。</mark></p>
   <p>但审计发现的问题高度收敛于四类，其中两类直接动摇项目可信度：</p>
   <ul>
     <li><strong>交互完备性缺口（P0×2）</strong>：启动故障弹窗无超时且不消费按键，<mark class="key">触摸失效时设备卡死在启动流程</mark>；设置页全部二级功能没有任何按键路径，<mark class="key">违反"纯按键可操作"这一既定硬性要求</mark>。</li>
@@ -194,7 +194,7 @@ sup a:hover { text-decoration: underline; }
   <div class="table-wrap"><table>
     <thead><tr><th>README 宣称特性</th><th>结论</th><th>代码实证</th></tr></thead>
     <tbody>
-      <tr><td>V/I 真有效值、功率、Wh、运行时间</td><td><span class="sev sev-ok">完整</span></td><td>4kSPS 采样 → 200ms 块计算 → data_store；NVS 落盘 + 启动恢复</td></tr>
+      <tr><td>V/I 真有效值、功率、Wh、运行时间</td><td><span class="sev sev-ok">完整</span></td><td>500SPS 采样 → 200ms 块计算 → data_store；NVS 落盘 + 启动恢复</td></tr>
       <tr><td>UI 校准向导 + 空载一键清零</td><td><span class="sev sev-p1">部分</span></td><td>真校准（单点改增益），但电压零偏无 UI 入口、非线性不可修</td></tr>
       <tr><td>波形 5 种模式（P/IP/VP/VI/E）</td><td><span class="sev sev-ok">完整</span></td><td><code>s_mode_desc</code> 映射齐全均可用</td></tr>
       <tr><td>波形 6 时间窗 + 三级降采样</td><td><span class="sev sev-p1">部分</span></td><td>120s 窗误映射 tier2(10Hz) 而非 tier1，每槽仅 ≈2.5 源点，包络失效</td></tr>
@@ -370,7 +370,7 @@ sup a:hover { text-decoration: underline; }
   <div class="table-wrap"><table>
     <thead><tr><th>位置</th><th>文档说法</th><th>实际实现</th></tr></thead>
     <tbody>
-      <tr><td class="mono">ads131m02.h:64–71</td><td>OSR=1024 / ODR=4000Hz</td><td>OSR=8x / ODR=500Hz（实测采样率折中后的取值）</td></tr>
+      <tr><td class="mono">ads131m02.h:64–71</td><td>OSR=1024 / ODR=4000Hz</td><td>OSR=8192 / ODR=500Hz（实测采样率折中后的取值）</td></tr>
       <tr><td class="mono">lcd_nv3030b.c:77–83</td><td>"降到 10MHz 稳定、不要随意调高"</td><td>实际定义 23MHz，注释自相矛盾</td></tr>
       <tr><td class="mono">lcd_nv3030b.h:56–65/82–95</td><td><code>set_rotation</code> 写 MADCTL；<code>init</code> 点亮背光</td><td>实际纯记录不发总线；背光交上层首帧后开</td></tr>
       <tr><td class="mono">power_measure.h:9/14/103–115</td><td>800 样本一块 / 10s 落盘 / 等间隔抽稀</td><td>200ms 墙钟块 / 30s 落盘 / 桶聚合</td></tr>
@@ -403,7 +403,7 @@ sup a:hover { text-decoration: underline; }
     <thead><tr><th>功能</th><th>价值</th><th>涉及模块</th><th>复杂度</th></tr></thead>
     <tbody>
       <tr><td>CSV / 串口数据导出（文本流或简单帧协议）</td><td>数据出不了设备是与商业功率计的最大差距</td><td>power_measure · data_store · 新增 usb/serial 中层</td><td>中</td></tr>
-      <tr><td>峰值 / 浪涌统计（Vmax/Imax/Vpp/最大功率）</td><td>4kSPS 数据已在手，只差统计；仪器必备</td><td>power_measure · ui</td><td>小</td></tr>
+      <tr><td>峰值 / 浪涌统计（Vmax/Imax/Vpp/最大功率）</td><td>500SPS 数据已在手，只差统计；仪器必备</td><td>power_measure · ui</td><td>小</td></tr>
       <tr><td>累计 Ah</td><td>电池 / 储能用户刚需，积分同路径</td><td>power_measure · settings · ui</td><td>小</td></tr>
       <tr><td>过流 / 过压 / 过功率阈值告警（蜂鸣 + LED）</td><td>仪器安全底线</td><td>power_measure · device_ctrl</td><td>小</td></tr>
       <tr><td>LICENSE 定稿 + CONTRIBUTING</td><td>开源可信度前提（见 P0-3）</td><td>仓库根</td><td>小</td></tr>
@@ -414,7 +414,7 @@ sup a:hover { text-decoration: underline; }
   <div class="table-wrap"><table>
     <thead><tr><th>功能</th><th>价值</th><th>涉及模块</th><th>复杂度</th></tr></thead>
     <tbody>
-      <tr><td>阈值触发捕获（示波器式单次触发冻结波形）</td><td>差异化卖点，4kSPS + 三级缓冲基础已备</td><td>power_measure · screen_wave</td><td>中</td></tr>
+      <tr><td>阈值触发捕获（示波器式单次触发冻结波形）</td><td>差异化卖点，500SPS + 三级缓冲基础已备</td><td>power_measure · screen_wave</td><td>中</td></tr>
       <tr><td>统计面板（平均 / 最大 / 最小）</td><td>测量页信息密度提升</td><td>ui</td><td>小</td></tr>
       <tr><td>校准数据导出 / 导入</td><td>量产校准与用户复现</td><td>settings · fs_storage</td><td>中</td></tr>
       <tr><td>120s 窗改 tier1 桶聚合（每槽 ≈83 点）</td><td>修复 120s 窗包络失效（见 2.2）</td><td>power_measure</td><td>小</td></tr>
@@ -502,7 +502,7 @@ gantt
 <section id="conclusion">
   <h2><span class="no">10</span>结语：三句话判断</h2>
   <ol>
-    <li><strong>本体扎实</strong>：4kSPS 测量链路、三级缓冲 + 包络防混叠、真校准向导、容错与注释质量，均高于同类开源项目，值得继续投入。</li>
+    <li><strong>本体扎实</strong>：500SPS 测量链路、三级缓冲 + 包络防混叠、真校准向导、容错与注释质量，均高于同类开源项目，值得继续投入。</li>
     <li><strong>短板清晰</strong>：4 个 P0（两个交互 + 两个合规）与一组并发 P1 都定位明确、修复成本可控，<mark class="key">修完即可开放协作</mark>。</li>
     <li><strong>竞争力靠数据出口</strong>：导出协议 / 峰值统计 / Ah / 告警 / 触发捕获补齐后，才真正具备与商业 USB 功率计同台的产品力。</li>
   </ol>
@@ -513,7 +513,7 @@ gantt
     <h2>审计依据（代码与文档）</h2>
     <ol>
       <li id="cite-1"><span class="src-title">项目仓库源码全量静态审计（五路并行：驱动 / 服务中间件 / UI / 工程化 / 功能缺口）。</span><span class="src-url">e:\Electronic\80.Project\XT60-Power-Meter\02-Software\XT60-Power-Meter-Firmware\components\</span></li>
-      <li id="cite-2"><span class="src-title">power_measure.c / power_measure.h —— 4kSPS 测量链路、三级缓冲、NVS 落盘。</span><span class="src-url">components\services\power_measure\src\power_measure.c</span></li>
+      <li id="cite-2"><span class="src-title">power_measure.c / power_measure.h —— 500SPS 测量链路、三级缓冲、NVS 落盘。</span><span class="src-url">components\services\power_measure\src\power_measure.c</span></li>
       <li id="cite-3"><span class="src-title">ui.c / ui_nav.c / screen_settings.c / screen_wave.c / screen_measure.c —— UI 总装、导航与三页实现。</span><span class="src-url">components\services\ui\src\</span></li>
       <li id="cite-4"><span class="src-title">ads131m02.c / lcd_nv3030b.c / aht20.c 等 —— 驱动层实现与错误处理路径。</span><span class="src-url">components\drivers\</span></li>
       <li id="cite-5"><span class="src-title">README.md · docs/architecture.md · docs/hardware_pinout.md —— 宣称特性与设计基线对照。</span><span class="src-url">README.md</span></li>

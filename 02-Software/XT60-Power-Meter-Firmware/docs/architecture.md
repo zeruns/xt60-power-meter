@@ -146,7 +146,7 @@ static const init_step_t s_boot_steps[] = {
     { "battery_adc",   battery_adc_init,   SYSTEM_FAULT_BATTERY },
     { "aht20",         aht20_init,         SYSTEM_FAULT_ENV     },
     { "imu_sc7a20h",   imu_sc7a20h_init,   SYSTEM_FAULT_IMU     },
-    { "ads131m02",     ads131m02_init,     SYSTEM_FAULT_ADC     },  /* 关键，4kSPS */
+    { "ads131m02",     ads131m02_init,     SYSTEM_FAULT_ADC     },  /* 关键，500SPS */
     { "power_measure", power_measure_init, SYSTEM_FAULT_ADC     },  /* 测量服务：NVS/波形缓冲 */
     /* 显示与交互 */
     { "fs_storage",    fs_storage_init,    SYSTEM_FAULT_STORAGE },  /* /spiffs 挂载，字体在此 */
@@ -204,12 +204,12 @@ ESP32-S3 双核。ESP-IDF 默认把 WiFi 任务钉在 Core 0，因此按"通信�
 
 | 核 | 职责 | 任务 | 优先级 |
 |---|---|---|---|
-| **Core 0**（PRO_CPU） | 交互与通信 | `task_ui`(12)、`task_input`(10)、`task_env_sensor`(5)、`task_net`(5)、`task_sys_monitor`(3) | 中低 |
-| **Core 1**（APP_CPU） | 测量（独占） | `task_power_sample`(22)、`task_power_calc`(18) | 高 |
+| **Core 0**（PRO_CPU） | 交互与通信 | `task_ui`(12)、`lvgl_port`(10)、`event_bus`(6)、`pm_aux`(5)、`orientation`(4)、`sys_monitor`(3)、`cfg_save_task`(2) | 中低 |
+| **Core 1**（APP_CPU） | 测量（独占） | `pm_sample`(22)：采样 + 200ms 块计算 | 高 |
 
-优先级遵循**速率单调**原则：周期越短、实时性要求越高，优先级越高。
+优先级遵循**速率单调**原则：周期越短、实时性要求越高，优先级越高。观察/维护类任务（`sys_monitor`、`cfg_save_task`）刻意压低优先级，绝不能影响业务任务。
 
-**为什么不把测量放 Core 0**：WiFi 协议栈会周期性占用较多 CPU，与 1 kHz 采样抢核会造成采样抖动，直接影响测量精度。用硬件资源换时序确定性，是仪器类固件的常规做法。
+**为什么不把测量放 Core 0**：WiFi 协议栈会周期性占用较多 CPU，与 500 Hz 采样抢核会造成采样抖动，直接影响测量精度。用硬件资源换时序确定性，是仪器类固件的常规做法。
 
 ### 跨核通信规则
 
@@ -224,9 +224,9 @@ ESP32-S3 双核。ESP-IDF 默认把 WiFi 任务钉在 Core 0，因此按"通信�
 
 ## 5. data_store：为什么用 seqlock 而不是互斥锁
 
-测量核以 1 kHz 写入、交互核约 30 Hz 读取。直觉做法是加锁，但有两个问题：
+测量核以 40 Hz 写入（每 25ms 显示子窗写一次快照）、交互核约 30 Hz 读取。直觉做法是加锁，但有两个问题：
 
-- 测量核不能被阻塞（1 ms 周期很紧，等锁会破坏采样时序）；
+- 测量核不能被阻塞（2 ms 样本周期很紧，等锁会破坏采样时序）；
 - 快照是 24 字节的结构体，**多字节读写没有原子性**。
 
 第二点的危害很隐蔽：读者可能在写者刚写完电压、还没写电流时读走整份数据，得到"新电压配旧电流"的错乱组合，算出的功率瞬间跳变 —— UI 上表现为曲线毛刺，且极难复现。这称为**数据撕裂（data tearing）**。
@@ -337,7 +337,7 @@ gcc -std=c11 -Wall -Wextra -I components/services/power_measure/include \
 | CPU 主频 | **240 MHz** | S3 最高主频 |
 | 缓存 | 指令 32KB + 数据 64KB | S3 推荐配置，影响 LVGL 与 PSRAM 访问速度 |
 | 编译优化 | **-O2（PERF）** | 仪器项目性能优先；调试汇编时可临时改回 -Og |
-| 系统节拍 | 1000 Hz | 1 tick = 1ms，满足 1ms 采样定时精度 |
+| 系统节拍 | 1000 Hz | 1 tick = 1ms，满足 2ms（500Hz）采样定时精度 |
 | 分区表 | 双 4MB OTA + 64KB coredump + 8MB storage | 用满 16MB `0x830000 + 0x7D0000 = 0x1000000` |
 | 崩溃取证 | coredump 写 Flash，panic 后延时 3 秒复位 | 野外设备唯一的崩溃定位手段 |
 | 控制台 | USB-Serial/JTAG | 烧录与日志共用一根 USB 线 |
@@ -428,7 +428,7 @@ opcode 封装与约 200 条分页式初始化序列都由组件负责，**驱动
 | `components/middleware/lvgl_port/` | 应用侧适配：字体（SPIFFS→PSRAM）、触摸 indev、首帧计数、旋转；LVGL 内核/任务/心跳/锁/显示由官方 `espressif/esp_lvgl_port` 提供 |
 | `components/middleware/fs_storage/` | storage 分区挂为 `/spiffs`，字体镜像（`spiffs_create_partition_image`） |
 | `components/services/ui/` | 启动页 + 测量/波形/设置三页（tileview/chart/roller 官方组件） |
-| `components/services/power_measure/` | 4kHz 采样、RMS/功率/电能、三级波形缓冲、NVS 掉电保存 |
+| `components/services/power_measure/` | 500Hz 采样、RMS/功率/电能、三级波形缓冲、NVS 掉电保存 |
 
 ### 字体方案（OFL Noto Sans SC，文件系统存放）
 
@@ -443,16 +443,19 @@ opcode 封装与约 200 条分页式初始化序列都由组件负责，**驱动
   这样避免了渲染中 SPIFFS 读（spi_flash 读会挂起 MSPI cache）与 NVS 擦除/
   LCD DMA 交错的 cache 故障窗口。文件缺失时回退内置 montserrat14（仅 ASCII）。
 - **不要改回 `lv_tiny_ttf_create_file()` 边渲染边读**，除非重新评估 cache 安全。
-- NVS 定时擦除期间 4kHz DRDY 中断仍持续，故必须开 `CONFIG_GPIO_ISR_IRAM_SAFE`。
+- NVS 定时擦除期间 500Hz DRDY 中断仍持续，故必须开 `CONFIG_GPIO_ISR_IRAM_SAFE`。
 
-### 测量链路（4kSPS）
+### 测量链路（500SPS）
 
-- ADS131M02 CLOCK 寄存器在 init 中显式写 **0x030E**（两通道使能 / HR / OSR=1024）
-  并回读校验：f_MOD=4.096MHz，ODR=4000 SPS（寄存器位定义见 ads131m02.c 注释，
-  出自手册 §8.6.4）。
+- ADS131M02 CLOCK 寄存器在 init 中显式写 **0x031A**（两通道使能 / HR / OSR=8192，
+  非复位值 0x030E 的 OSR=1024）并回读校验：f_MOD=4.096MHz，
+  ODR=4.096MHz/8192=500 SPS（寄存器位定义见 ads131m02.c 注释，出自手册 §8.6.4）。
+  降速原因：4kHz 档下主机读帧会跨越转换完成时刻，DRDY 被抑制（手册
+  §8.5.1.5）实际塌到 ~310Hz；OSR=8192 后读取周期有充足余量避开。
 - Core1 采样任务由 DRDY 自节奏，每样本做标定换算并写 PSRAM 三级环形缓冲：
-  tier0 4000Hz×4000（1s）、tier1 400Hz×24000（60s）、tier2 10Hz×6000（10min）；
-  每 800 样本（200ms）输出一帧 V/I 真有效值、平均功率与积分电能到 data_store。
+  tier0 500Hz×4000（8s，覆盖 1s 窗）、tier1 50Hz×24000（480s，覆盖 60s 窗）、
+  tier2 1.25Hz×6000（80min，覆盖 10min 窗）；
+  每 200ms（墙钟，约 100 样本）输出一帧 V/I 真有效值、平均功率与积分电能到 data_store。
 - 温湿度/电池由 Core0 辅助任务 2s 采集一次，在块边界由采样任务合并进快照
   （维持 data_store 单写者）；电能/运行时间每 30s 落 NVS，启动恢复。
 
@@ -525,4 +528,4 @@ version.txt               固件版本号
 |---|---|---|
 | `middleware/wifi_manager` | 只有头文件 | 尚无联网与 OTA 通道（故障救回依赖它） |
 | `middleware/web_console` | 只有头文件 | 尚无网页控制台 |
-| 波形 120s 窗稀疏度 | 120s 窗沿用 tier1 降采样 | 采样率问题修复后可重评估 tier1 稀疏度 |
+| 波形 120s 窗稀疏度 | 120s 窗映射 tier2（降采样最深，桶内源点不足） | 已列入路线图：改 tier1 桶聚合，修复包络失效 |
