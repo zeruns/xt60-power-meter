@@ -41,8 +41,9 @@
  * 4. NVS 只有一个写者（task_aux）：电能/运行时间的周期落盘、清零落盘、
  *    标定更新落盘全部收敛到 task_aux 串行执行（见 save_persist 的取舍说明）。
  * 5. 一切时间统计以「墙钟」（esp_timer）为准，不用「样本数/标称率」：
- *    2026-10 实测本板 ADC 实际帧率远低于标称（MCLK 异常），按样本数
- *    折算会把电能/运行时间算错数倍，墙钟对任何实际帧率都正确。
+ *    2026-10 实测 4kHz 档下 DRDY 被抑制到 ~310Hz（SBAS853 §8.5.1.5 的
+ *    读帧阻塞机制，非 MCLK/晶振异常），按样本数折算会把电能/运行时间
+ *    算错数倍；帧过滤丢帧同样使样本数不可靠。墙钟对任何实际帧率都正确。
  *
  * ─────────────────────────────────────────────────────────────
  * 三、帧有效性校验（关键，毛刺根因）
@@ -58,9 +59,9 @@
  * ─────────────────────────────────────────────────────────────
  * 四、波形缓冲（PSRAM，三级降采样）
  * ─────────────────────────────────────────────────────────────
- *   tier0  4000Hz × 4000 点  —— 1s 窗（原始逐点，已过 4 点滑动平均轻滤）
- *   tier1   400Hz × 24000 点 —— 60s 窗（每 10 点均值）
- *   tier2    10Hz × 6000 点  —— 10min 窗（每 40 个 tier1 点均值）
+ *   tier0   500Hz × 4000 点  —— 1s 窗（原始逐点，已过 4 点滑动平均轻滤，可回看 8s）
+ *   tier1    50Hz × 24000 点 —— 60s 窗（每 10 点均值，可回看 480s）
+ *   tier2  1.25Hz × 6000 点  —— 10min 窗（每 40 个 tier1 点均值，可回看 80min）
  * 每个点含 V/I/P/E 四个 float + 时间戳；UI 用 pm_wave_copy() 按
  * 固定时间槽聚合取数（契约：每槽固定时长，与采样率无关）。
  *
@@ -100,14 +101,14 @@ static const char *TAG = "power_measure"; /**< ESP_LOG 日志标签，过滤本�
 /* ============================================================
  * 采样与计算参数
  * ============================================================ */
-#define PM_SAMPLE_RATE_HZ  500u                  /**< ADC 输出数据率（与驱动 CLOCK OSR=8x 档配置一致） */
+#define PM_SAMPLE_RATE_HZ  500u                  /**< ADC 输出数据率（与驱动 CLOCK OSR=8192 档配置一致） */
 #define PM_BLOCK_SAMPLES   100u                  /**< 标称 500Hz 下 200ms 的样本数（仅作历史参考） */
 #define PM_BLOCK_PERIOD_MS (1000u * PM_BLOCK_SAMPLES / PM_SAMPLE_RATE_HZ) /**< 块周期：墙钟 200ms */
 #define PM_BLOCK_PER_SEC   (PM_SAMPLE_RATE_HZ / PM_BLOCK_SAMPLES) /**< 每秒块数 = 5 */
 
 /** 显示平滑系数（对块均值做一阶低通）：约 0.8s 时间常数，兼顾响应与稳定 */
 #define PM_DISPLAY_EMA_ALPHA 0.25f
-/** 波形轻滤：4 点滑动平均（4kHz → 1kHz 等效带宽），抑制高频噪声 */
+/** 波形轻滤：4 点滑动平均（500Hz 采样 → 约 125Hz 等效带宽），抑制高频噪声 */
 #define PM_WAVE_MAVG_N 4u
 
 /** 前端默认标定（未实测标定时的理论值，见 power_calc.h 的量纲说明）
@@ -129,11 +130,11 @@ typedef struct {
                       *   因此实际采样率偏低/波动时时间尺度依然正确。 */
 } wave_point_t;
 
-#define PM_TIER0_CAP 4000u   /**< 4000Hz × 1s */
-#define PM_TIER1_CAP 24000u  /**< 400Hz × 60s */
-#define PM_TIER2_CAP 6000u   /**< 10Hz × 600s（10min） */
-#define PM_TIER1_DECIM 10u   /**< tier0→tier1：10 点均值（4000/10=400Hz） */
-#define PM_TIER2_DECIM 40u   /**< tier1→tier2：40 点均值（400/40=10Hz） */
+#define PM_TIER0_CAP 4000u   /**< 500Hz × 8s（远超 1s 窗所需，余量足） */
+#define PM_TIER1_CAP 24000u  /**< 50Hz × 480s（覆盖最长 60s 窗） */
+#define PM_TIER2_CAP 6000u   /**< 1.25Hz × 4800s（覆盖最长 10min 窗） */
+#define PM_TIER1_DECIM 10u   /**< tier0→tier1：10 点均值（500/10=50Hz） */
+#define PM_TIER2_DECIM 40u   /**< tier1→tier2：40 点均值（50/40=1.25Hz） */
 
 typedef struct {
     uint8_t tier;    /**< 该窗口取哪一级缓冲 */
@@ -521,7 +522,7 @@ static void wave_push_sample(float v, float i)
     wave_point_t pt = { .v = fv, .i = fi, .p = fv * fi, .e = e_now, .t_ms = now_ms };
     ring_push(&s_tier[0], &pt);
 
-    /* tier0→tier1：每 10 个 tier0 样本求均值压成 1 点（400Hz） */
+    /* tier0→tier1：每 10 个 tier0 样本求均值压成 1 点（500Hz→50Hz） */
     s_tier1_acc.v += fv;
     s_tier1_acc.i += fi;
     s_tier1_acc.p += pt.p;
@@ -538,7 +539,7 @@ static void wave_push_sample(float v, float i)
         s_tier1_acc = (wave_point_t){ 0 };
         s_tier1_acc_n = 0;
 
-        /* tier1→tier2：再每 40 个 tier1 点均值压 1 点（10Hz） */
+        /* tier1→tier2：再每 40 个 tier1 点均值压 1 点（50Hz→1.25Hz） */
         s_tier2_acc.v += d.v;
         s_tier2_acc.i += d.i;
         s_tier2_acc.p += d.p;
@@ -676,7 +677,7 @@ static void save_persist(void)
 }
 
 /* ============================================================
- * 采样任务（Core1，4kHz，DRDY 自节奏）
+ * 采样任务（Core1，500Hz，DRDY 自节奏）
  * ============================================================ */
 #define PM_SAMPLE_STACK   4096  /**< 采样任务栈（IDF 中单位是字节，不是 FreeRTOS 原生的"字"） */
 #define PM_SAMPLE_PRIO    22    /**< 采样任务优先级：高，保证不被 UI 任务抢占丢帧 */
@@ -688,11 +689,12 @@ static void save_persist(void)
 #define PM_DIAG_PERIOD_BLOCKS 25u /* 每 25 块（5s）打印一次诊断 */
 
 /* 快速显示子窗口周期（微秒）：**墙钟时间驱动**，与实际 ODR 解耦。
- * 2026-10 实测：本板 ADC 的 MCLK 异常，DRDY 实际只有 ~320Hz（标称 4kHz，
- * drdy 计数 317~326Hz 且 ±3% 抖动，晶振时基不应有此抖动——硬件时钟问题）。
- * 原方案"每 100 个有效样本开一窗"在 320Hz 下被拖到 ~2.6Hz（即用户所见
- * "首页刷新率低/数据不动"的根源）。改为每 25ms 强制输出一帧即时均值：
- * 4kHz 时约 100 样本/帧、320Hz 时约 8 样本/帧，UI 恒定 40Hz 有数据。 */
+ * 2026-10 排查记录：当时 CLOCK 还是 OSR=1024 档（标称 4kHz），DRDY 实际
+ * 只有 ~310-320Hz 且抖动——根因是 DRDY 抑制机制（SBAS853 §8.5.1.5：读帧
+ * 期间完成的转换其 DRDY 被吞），并非 MCLK/晶振异常。原方案"每 100 个
+ * 有效样本开一窗"在 310Hz 下被拖到 ~2.6Hz（即用户所见"首页刷新率低/
+ * 数据不动"的根源）。改为每 25ms 强制输出一帧即时均值：500Hz 时约
+ * 12 样本/帧，UI 恒定 40Hz 有数据；且样本数波动/丢帧不影响刷新节奏。 */
 #define PM_DISPLAY_SUBWINDOW_US 25000ull
 
 /**
@@ -737,7 +739,8 @@ static void task_sample(void *arg)
     /* 块内电能逐步积分（让 40Hz 帧的电能读数也能连续走动；块末以权威值覆写） */
     double block_energy_wh = 0.0;
     /* 块起点墙钟：dt 用真实时间而非「样本数/标称率」——
-     * 2026-10 实测：ADC 实际帧率 ~310Hz（标称 4000Hz），按样本数折算 dt 会把
+     * 2026-10 实测：4kHz 档下 DRDY 被抑制到 ~310Hz（SBAS853 §8.5.1.5，
+     * 见 ads131m02.c 的 ADS_CLOCK_VALUE 注释），按样本数折算 dt 会把
      * 电能/运行时间算错约 13 倍。真实墙钟对任何实际帧率都正确。 */
     int64_t block_start_us = esp_timer_get_time();
     /* 诊断：上一条诊断打印的墙钟与 DRDY 计数 */
@@ -970,8 +973,8 @@ static void task_sample(void *arg)
             }
 
             /* 电能矩形积分：dt 用本块**真实墙钟时长**
-             * （实际帧率 ≠ 标称 4kHz 时，按样本数折算会系统性算错；
-             *   帧过滤丢帧也不影响——墙钟自动覆盖）。
+             * （实际帧率 ≠ 标称值时（如 DRDY 被抑制、丢帧），按样本数
+             *   折算会系统性算错；墙钟自动覆盖任何实际帧率）。
              * 【数值修复 P2】内部用 double 累计：float 超约 1024 Wh 后
              * 增量被舍入吞掉、电能不再走动（见 s_energy_wh 的注释） */
             const float dt_s = (float)(block_now_us - block_start_us) / 1e6f;
