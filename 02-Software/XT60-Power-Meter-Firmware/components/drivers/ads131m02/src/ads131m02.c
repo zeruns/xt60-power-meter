@@ -209,26 +209,27 @@ static const char *TAG = "ads131m02";
  * CLOCK 寄存器位定义（手册 §8.6.4 Table 8-17，复位值 0x030E）
  *   bit9    CH1_EN / bit8 CH0_EN：两通道均使能；
  *   bit5    TBM：0 = OSR 由 bit[4:2] 决定（1 = Turbo，OSR 固定 64）；
- *   bit[4:2] OSR[2:0]：011 = 1024（复位档）；
- *   bit[1:0] PWR[1:0]：10 = HR（高分辨率，11 同为 HR，保持复位值 10）。
+ *   bit[4:2] OSR[2:0]：000=128 / 001=256 / 010=512 / 011=1024（复位档）
+ *                      / 100=2048 / 101=4096 / 110=8192（本工程）/ 111=16384；
+ *   bit[1:0] PWR[1:0]：10 = HR（高分辨率，保持复位值 10）。
  *
  * HR 模式 f_MOD = f_CLKIN/2 = 4.096MHz，ODR = f_MOD/OSR = 4000 Hz（复位档）。
  *
- * ⚠ 2026-10 实机排查（SBAS839 §8.5.1.5 原文）：
+ * ⚠ 2026-10 实机排查（SBAS853 §8.5.1.5 原文）：
  *   "The DRDY pulse is blocked when new conversions complete while conversion
  *    data are read."——主机读取窗口跨越转换完成时刻时 DRDY 被抑制。
  *   4kHz 档（250µs/帧）下主机"等DRDY+读帧"周期 ~3ms 必然跨越多个转换完成，
- *   DRDY 塌到 ~310Hz。故 OSR 由 011(1024) 提到 110(8×)：
+ *   DRDY 塌到 ~310Hz。故 OSR 由 011(1024) 提到 110(8192)：
  *   · ODR 降为 500Hz（2ms/帧），读取周期有充足余量避开转换完成时刻；
- *   · 每样本过采样 8×，单样本噪声降 ~2.8 倍（√8），显示更稳。
+ *   · 过采样比由 1024× 提到 8192×（8 倍），单样本噪声较复位档降 √8≈2.8 倍。
  *   （若实测 ODR 需调整，改 OSR 档位即可：每 +1 档 ODR 减半。）
  * ============================================================ */
 #define ADS_CLOCK_CH_EN_MASK  0x0300u /**< CH1_EN | CH0_EN */
 #define ADS_CLOCK_OSR_SHIFT   2
-#define ADS_CLOCK_OSR_8X      (0x06u << ADS_CLOCK_OSR_SHIFT) /**< OSR[2:0]=110（复位档 011 的 8 倍过采样） */
+#define ADS_CLOCK_OSR_8192    (0x06u << ADS_CLOCK_OSR_SHIFT) /**< OSR[2:0]=110 → 过采样 8192×（复位档 011=1024× 的 8 倍） */
 #define ADS_CLOCK_PWR_HR      (0x02u)                         /**< PWR[1:0]=10 HR */
-#define ADS_CLOCK_VALUE       (ADS_CLOCK_CH_EN_MASK | ADS_CLOCK_OSR_8X | ADS_CLOCK_PWR_HR)
-/** 配置后的输出数据率（Hz）：复位档 4000Hz ÷ 8 = 500Hz */
+#define ADS_CLOCK_VALUE       (ADS_CLOCK_CH_EN_MASK | ADS_CLOCK_OSR_8192 | ADS_CLOCK_PWR_HR) /**< 0x031A */
+/** 配置后的输出数据率（Hz）：4.096MHz ÷ 8192 = 500Hz（即复位档 4000Hz ÷ 8） */
 #define ADS_ODR_HZ            500u
 
 /* ============================================================
@@ -719,9 +720,9 @@ esp_err_t ads131m02_init(void)
     }
     vTaskDelay(pdMS_TO_TICKS(ADS_CMD_GAP_MS));
 
-    /* ---- ⑩.1 写 CLOCK：HR 模式 + OSR=8x 档 -> 输出数据率 500SPS ----
+    /* ---- ⑩.1 写 CLOCK：HR 模式 + OSR=8192 档 -> 输出数据率 500SPS ----
      * 与芯片复位默认（OSR=1024 档 4kSPS）不同：提高过采样降噪声，
-     * 并给主机读取留出避开"转换完成时刻"的窗口（SBAS839 §8.5.1.5，
+     * 并给主机读取留出避开"转换完成时刻"的窗口（SBAS853 §8.5.1.5，
      * 详见 ADS_CLOCK_VALUE 注释）。仍显式写入并回读，保证采样率确定。 */
     err = ads_write_reg(ADS_REG_CLOCK, ADS_CLOCK_VALUE);
     if (err != ESP_OK) {
@@ -733,7 +734,7 @@ esp_err_t ads131m02_init(void)
     err = ads_read_reg(ADS_REG_CLOCK, &clock_readback);
     if (err == ESP_OK) {
         if (clock_readback == ADS_CLOCK_VALUE) {
-            ESP_LOGI(TAG, "CLOCK 回读 0x%04X：HR 模式 OSR=8x 档，ODR=%u SPS", clock_readback,
+            ESP_LOGI(TAG, "CLOCK 回读 0x%04X：HR 模式 OSR=8192 档，ODR=%u SPS", clock_readback,
                      ADS_ODR_HZ);
         } else {
             ESP_LOGW(TAG, "CLOCK 回读 0x%04X 与目标 0x%04X 不符（实际 ODR 可能不是 %u SPS）",
