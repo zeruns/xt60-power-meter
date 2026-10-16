@@ -78,11 +78,13 @@
 #include <string.h>
 
 #include "esp_app_desc.h"
+#include "esp_timer.h"
 #include "lvgl.h"
 #include "lvgl_port.h"
 
 #include "button.h"
 #include "buzzer.h"
+#include "data_store.h"
 #include "lcd_nv3030b.h"
 #include "orientation.h"
 #include "power_measure.h"
@@ -99,7 +101,7 @@
 #define COL_GRAY     lv_color_hex(0x6B7280)
 #define COL_BORDER   lv_color_hex(0xB4BEC9) /* 控件边框：边界清晰（原 #E3E7EC 过浅） */
 #define COL_CARD_BG  lv_color_hex(0xF1F4F8) /* 卡片底：与白底拉开可辨差异 */
-#define COL_PRESSED  lv_color_hex(0xE8F0FE)
+#define COL_PRESSED  lv_color_hex(0xCFE0F7) /* 按下底色：与白底一眼可辨（Bug2 按压反馈修复） */
 #define COL_OK       lv_color_hex(0x1E9E4F)
 #define COL_DANGER   lv_color_hex(0xD0392B)
 
@@ -142,6 +144,8 @@ static sub_kind_t s_sub_kind = SUB_NONE; /**< 当前二级页类型（刷新分�
 static bool s_layer_hooked = false;  /**< 对话框样式与关闭处理是否已安装 */
 static lv_obj_t *s_msgbox_scrim = NULL; /**< 当前对话框的压暗遮罩（随框删除） */
 static lv_obj_t *s_active_msgbox = NULL; /**< 当前打开的对话框（NULL=无；按键路由据此判模态） */
+
+static void close_active_msgbox(void);   /* 前向声明（定义见下方；弹新框前关旧框，防叠窗） */
 
 static data_store_snapshot_t s_last_snap; /**< 最近快照（校准向导/电能统计使用） */
 
@@ -294,6 +298,10 @@ static void style_msgbox(lv_obj_t *box)
  */
 static lv_obj_t *msgbox_begin(const char *title, const char *text)
 {
+    /* 叠窗防御（一键清零卡死修复）：已有活动弹窗先同步关闭，保证任意时刻
+     * 至多一个弹窗——否则单例 scrim/active 指针被新框覆盖，旧框成孤儿。 */
+    close_active_msgbox();
+
     /* lv_layer_top()：LVGL 的"顶层图层"，永远画在所有页面之上。
      * 对话框挂在这里，翻页/滚动都不会把它带走，天然呈现模态效果。 */
     lv_obj_t *layer = lv_layer_top();
@@ -385,6 +393,22 @@ static void notice_ok_cb(lv_event_t *e)
 }
 
 /**
+ * @brief 关闭当前活动弹窗（无则空操作）
+ *
+ * 同步关闭：box_deleted_cb 随之清理压暗遮罩与 s_active_msgbox。
+ * 【一键清零卡死修复 2026-10】清零流程先弹"正在清零"，1 秒后再弹"已清零"
+ * ——两框叠放时 s_active_msgbox/s_msgbox_scrim（单例指针）被新框覆盖，
+ * 旧框与其遮罩成孤儿永远关不掉（点确定后仍压暗、界面卡死）。
+ * 弹新框前先经本函数关旧框，叠窗问题从入口根治。
+ */
+static void close_active_msgbox(void)
+{
+    if (s_active_msgbox != NULL) {
+        lv_msgbox_close(s_active_msgbox); /* 同步删除，回调自动清 scrim/句柄 */
+    }
+}
+
+/**
  * @brief 确认框"确定"点击 → 先关本框，再执行业务动作
  *
  * @param e LVGL 点击事件；user_data 携带业务回调 confirm_cb_t
@@ -462,6 +486,35 @@ static lv_obj_t *plain_label(lv_obj_t *parent, const char *text, lvgl_port_font_
 }
 
 /**
+ * @brief 触屏按下反馈样式（Bug2 修复：按下动效不可感知）
+ *
+ * 根因（2026-10 排查 + git 对比）：按下态只把底色从 #FFFFFF 换成 #E8F0FE
+ * （亮度差约 4%），肉眼几乎不可感知；物理按键焦点框（2px 蓝 outline）引入后，
+ * 触屏"按下没反馈"的感知落差被放大成"隔离感"。样式本身从未变过——是反馈
+ * 强度长期不足，被按键体系的强反馈衬托出来。
+ * 修复：按下态加深底色、描边换主色，并加 2px 主色轮廓——与按键焦点框同一
+ * 视觉语言（"可操作反馈 = 蓝框"），按下瞬间获得清晰、一致的确认感。
+ *
+ * @param btn 目标按钮（lv_button）
+ */
+static void press_feedback_styles(lv_obj_t *btn)
+{
+    /* LV_STATE_PRESSED 是"状态选择器"：同一属性可按状态分别设值——
+     * 第 4 参传 0 是默认态，传 LV_STATE_PRESSED 是"被按下时"才生效的样式 */
+    lv_obj_set_style_bg_color(btn, lv_color_white(), 0);
+    lv_obj_set_style_bg_color(btn, COL_PRESSED, LV_STATE_PRESSED);
+    lv_obj_set_style_bg_opa(btn, LV_OPA_COVER, 0); /* COVER=完全不透明（默认透明会导致看不到底色） */
+    lv_obj_set_style_border_color(btn, COL_BORDER, 0);
+    lv_obj_set_style_border_color(btn, COL_PRIMARY, LV_STATE_PRESSED);
+    lv_obj_set_style_border_width(btn, 1, 0); /* 1px 边框让按钮在白底上可辨 */
+    lv_obj_set_style_outline_width(btn, 2, LV_STATE_PRESSED);
+    lv_obj_set_style_outline_color(btn, COL_PRIMARY, LV_STATE_PRESSED);
+    lv_obj_set_style_outline_pad(btn, 1, LV_STATE_PRESSED);
+    lv_obj_set_style_radius(btn, 8, 0);       /* 8px 圆角 */
+    lv_obj_set_style_shadow_width(btn, 0, 0); /* 去掉主题自带阴影，保持扁平风格 */
+}
+
+/**
  * @brief 通用主按钮（白底描边，按下态浅蓝）
  *
  * 尺寸 ≥36px 高是触摸目标下限（手指约 7~10mm），刻意不用更小的按钮。
@@ -475,15 +528,7 @@ static lv_obj_t *plain_button(lv_obj_t *parent, const char *text, int32_t w, int
     /* lv_button_create：LVGL 9 按钮部件（自带按压反馈，样式可覆盖） */
     lv_obj_t *btn = lv_button_create(parent);
     lv_obj_set_size(btn, w, h);
-    /* LV_STATE_PRESSED 是"状态选择器"：同一属性可按状态分别设值——
-     * 第 4 参传 0 是默认态，传 LV_STATE_PRESSED 是"被按下时"才生效的样式 */
-    lv_obj_set_style_bg_color(btn, lv_color_white(), 0);
-    lv_obj_set_style_bg_color(btn, COL_PRESSED, LV_STATE_PRESSED);
-    lv_obj_set_style_bg_opa(btn, LV_OPA_COVER, 0); /* COVER=完全不透明（默认透明会导致看不到底色） */
-    lv_obj_set_style_border_color(btn, COL_BORDER, 0);
-    lv_obj_set_style_border_width(btn, 1, 0);   /* 1px 边框让按钮在白底上可辨 */
-    lv_obj_set_style_radius(btn, 8, 0);         /* 8px 圆角 */
-    lv_obj_set_style_shadow_width(btn, 0, 0);   /* 去掉主题自带阴影，保持扁平风格 */
+    press_feedback_styles(btn);
 
     lv_obj_t *lbl = plain_label(btn, text, LVGL_PORT_FONT_16, COL_INK, false);
     lv_obj_center(lbl); /* 文字相对按钮居中 */
@@ -801,11 +846,7 @@ static lv_obj_t *subpage_open(sub_kind_t kind, const char *title)
     lv_obj_t *back = lv_button_create(bar);
     lv_obj_set_size(back, 72, 28);                  /* 72×28：容得下"< 返回"且可点中 */
     lv_obj_align(back, LV_ALIGN_LEFT_MID, 2, 0);    /* lv_obj_align：相对父对象（标题栏）左端垂直居中 */
-    lv_obj_set_style_bg_color(back, lv_color_white(), 0);
-    lv_obj_set_style_bg_color(back, COL_PRESSED, LV_STATE_PRESSED);
-    lv_obj_set_style_shadow_width(back, 0, 0);
-    lv_obj_set_style_border_color(back, COL_BORDER, 0);
-    lv_obj_set_style_border_width(back, 1, 0);
+    press_feedback_styles(back); /* 按下反馈与普通按钮一致（Bug2） */
     lv_obj_set_style_radius(back, 6, 0);
     lv_obj_add_event_cb(back, back_clicked_cb, LV_EVENT_CLICKED, NULL);
     {
@@ -1058,27 +1099,79 @@ static void calib_apply_cb(lv_event_t *e)
 }
 
 /**
- * @brief 电流零点一键清零（空载校零）
+ * @brief 电流零点一键清零（空载校零，采样按下后 1 秒内的平均值）
  *
- * 输出空载时点击：把电流零偏 offset 调到「抵消当前读数」的位置，
- * 使显示立即归零。物理量 = raw×gain + offset，故
- *   offset_new = offset_old − 当前读数
- * 之后再施加负载，读数即从 0 起算（消除前端零点漂移）。
+ * 输出空载时点击：把电流零偏 offset 调到「抵消采样平均值」的位置，使显示
+ * 立即归零。物理量 = raw×gain + offset，故
+ *   offset_new = offset_old − 采样平均值
+ *
+ * 【2026-10 需求更新】原先用点击瞬间的单帧快照当清零值——单帧含噪声，
+ * 偶发的坏帧/毛刺会被永久烧进零偏。改为「按下后 1 秒内的平均值」：
+ *   · 异步实现（lv_timer 轮询 data_store），不阻塞 UI 任务/LVGL 锁；
+ *   · 采样期间显示"正在采样"提示，结束弹结果（触摸/按键共用本回调）；
+ *   · 均值约 40 帧（40Hz 快照），配合快照本身的掐头去尾，鲁棒性远高于单帧。
  *
  * @param e LVGL 点击事件（未使用）
  */
-static void calib_zero_cb(lv_event_t *e)
+static lv_timer_t *s_zero_timer = NULL;  /**< 清零采样定时器（40ms 轮询） */
+static float s_zero_sum = 0.0f;          /**< 清零采样电流累计（A） */
+static uint32_t s_zero_n = 0;            /**< 清零采样帧数 */
+static int64_t s_zero_start_us = 0;      /**< 清零采样起点（µs） */
+
+static void zero_sample_timer_cb(lv_timer_t *t)
 {
-    (void)e;
-    /* power_measure_get/set_calibration：读/写测量核的标定参数（增益 + 零偏） */
+    (void)t;
+    const int64_t now_us = esp_timer_get_time();
+
+    /* 采样窗口内：累计每帧电流快照（seqlock 读，非阻塞） */
+    data_store_snapshot_t snap;
+    if (data_store_get(&snap) == ESP_OK) {
+        s_zero_sum += snap.current_a;
+        s_zero_n++;
+    }
+
+    if (now_us - s_zero_start_us < 1000000) {
+        return; /* 1 秒窗口未满，继续 */
+    }
+
+    /* 窗口结束：自删定时器（lv_timer 删除自身在回调内是合法的） */
+    lv_timer_del(s_zero_timer);
+    s_zero_timer = NULL;
+
+    if (s_zero_n == 0) {
+        show_notice("清零失败", "采样期间无数据，请重试。");
+        return;
+    }
+    const float avg = s_zero_sum / (float)s_zero_n;
+
+    /* offset 调整：抵消采样平均值 */
     power_measure_calib_t cal;
     power_measure_get_calibration(&cal);
-    cal.current_offset -= s_last_snap.current_a;
+    cal.current_offset -= avg;
     if (power_measure_set_calibration(&cal) != ESP_OK) {
         show_notice("清零失败", "参数保存失败，请重试。");
         return;
     }
-    show_notice("已清零", "电流零点已校准。\n（空载读数归零）");
+    char text[96];
+    snprintf(text, sizeof(text), "电流零点已校准。\n（采样 %.1fs / %u 帧均值\n %.4f A → 0）",
+             (double)((now_us - s_zero_start_us) / 1000) / 1000.0, (unsigned)s_zero_n,
+             (double)avg);
+    show_notice("已清零", text);
+}
+
+static void calib_zero_cb(lv_event_t *e)
+{
+    (void)e;
+    /* 重复点击保护：上一轮采样未结束时忽略 */
+    if (s_zero_timer != NULL) {
+        return;
+    }
+    s_zero_sum = 0.0f;
+    s_zero_n = 0;
+    s_zero_start_us = esp_timer_get_time();
+    /* 40ms 轮询（≈40Hz 快照节奏，1 秒约 25 帧） */
+    s_zero_timer = lv_timer_create(zero_sample_timer_cb, 40, NULL);
+    show_notice("正在清零", "采样空载电流中…\n请保持空载约 1 秒。");
 }
 
 /**
@@ -1652,13 +1745,7 @@ static lv_obj_t *make_cell_dispatch(lv_obj_t *row, const char *icon, const char 
     lv_obj_t *btn = lv_button_create(row);
     lv_obj_set_height(btn, CELL_HEIGHT);
     lv_obj_set_flex_grow(btn, 1);
-    lv_obj_set_style_bg_color(btn, lv_color_white(), 0);
-    lv_obj_set_style_bg_color(btn, COL_PRESSED, LV_STATE_PRESSED);
-    lv_obj_set_style_bg_opa(btn, LV_OPA_COVER, 0);
-    lv_obj_set_style_border_color(btn, COL_BORDER, 0);
-    lv_obj_set_style_border_width(btn, 1, 0);
-    lv_obj_set_style_radius(btn, 8, 0);
-    lv_obj_set_style_shadow_width(btn, 0, 0);
+    press_feedback_styles(btn); /* 按下反馈与普通按钮一致（Bug2） */
 
     lv_obj_set_flex_flow(btn, LV_FLEX_FLOW_ROW);
     lv_obj_set_flex_align(btn, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
