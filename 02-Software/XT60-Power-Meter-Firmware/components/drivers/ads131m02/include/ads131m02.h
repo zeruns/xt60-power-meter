@@ -60,20 +60,45 @@ esp_err_t ads131m02_selftest(void);
  */
 uint32_t ads131m02_drdy_count(void);
 
+/** 驱动运行统计（M1 基线验收与长期健康监控；自开机累计，不复位） */
+typedef struct {
+    uint32_t drdy_count;   /**< DRDY# 下降沿累计 */
+    uint32_t edge_ok;      /**< 引擎成功 kick 的帧数 */
+    uint32_t edge_busy;    /**< 槽满丢弃的流式帧数（消费者落后时的丢帧） */
+    uint32_t read_ok;      /**< 成功读取帧数 */
+    uint32_t crc_fail;     /**< CRC 校验失败帧数（已剔除，不可用数据） */
+    uint32_t read_timeout; /**< 等 DRDY 超时次数 */
+    uint32_t lat_min_us;   /**< DRDY 边沿 → SPI 事务启动延迟 δ（µs）最小值 */
+    uint32_t lat_avg_us;   /**< δ（µs）均值 */
+    uint32_t lat_max_us;   /**< δ（µs）最大值 */
+} ads131m02_stats_t;
+
+/**
+ * @brief 获取驱动运行统计（诊断/验收用）
+ *
+ * M1 基线验收判据（docs/ads131-4khz-implementation-plan.md §1）：
+ *   DRDY ≈ 4000/s 持续成立；δ p99≤20µs（看 min/avg/max 分布）；
+ *   crc_fail = 0、read_timeout = 0。
+ *
+ * @param out 输出统计快照，不可为 NULL
+ */
+void ads131m02_get_stats(ads131m02_stats_t *out);
+
 /**
  * @brief 查询配置的输出数据率（ODR）
  *
- * init() 会把 CLOCK 寄存器显式配置为 HR 模式 + **OSR=8192 档**（与 .c 里
- * ADS_CLOCK_VALUE=0x031A 一致，非芯片复位档 OSR=1024）：
+ * init() 会把 CLOCK 寄存器显式配置为 HR 模式 + **OSR=1024 档**
+ * （ADS_CLOCK_VALUE=0x030E，恰为芯片复位值）：
  *   f_MOD = f_CLKIN / 2 = 8.192MHz / 2 = 4.096MHz
- *   ODR   = f_MOD / OSR = 4.096MHz / 8192 = 500 Hz（本工程默认采样率）
+ *   ODR   = f_MOD / OSR = 4.096MHz / 1024 = 4000 Hz（本工程采样率）
  *
- * 为什么不用复位档 OSR=1024（4000Hz）：手册 §8.5.1.5 明确 DRDY 会在
- * 「读取窗口跨越转换完成时刻」时被抑制，4kHz 档下主机"等 DRDY+读帧"周期
- * 必然跨越转换完成，DRDY 实际塌到 ~310Hz；提高到 OSR=8192（ODR=500Hz）后
- * 读取周期有充足余量避开转换完成时刻，且过采样比由 1024× 提到 8192×
- * （8 倍），单样本噪声较复位档降 √8≈2.8 倍。
- * （详见 src/ads131m02.c 的 ADS_CLOCK_* 注释与实测排查记录。）
+ * ⚠ 4kHz 曾不达标的原因与恢复依据：手册 §8.5.1.5 明确 DRDY 会在
+ * 「读取窗口跨越转换完成时刻」时被抑制。旧版 4MHz SPI + 任务调度路径下
+ * "等 DRDY+读帧"周期约 3ms，在 250µs 转换周期内必然跨越，DRDY 实际塌到
+ * ~310Hz（当时以 OSR=8192/ODR=500Hz 加余量绕过）。现以 20MHz SPI + DMA
+ * 把读窗压到 µs 级，读窗固定在 DRDY 之后启动、远离转换完成时刻，机制上
+ * 避开抑制条件；DRDY→SPI 启动延迟 δ 由 ads131m02_get_stats() 实测监控。
+ * （详见 src/ads131m02.c 的 ADS_CLOCK_* / ADS_SPI_CLK_HZ 注释。）
  *
  * @return 采样率（Hz）；驱动未初始化时返回 0
  */

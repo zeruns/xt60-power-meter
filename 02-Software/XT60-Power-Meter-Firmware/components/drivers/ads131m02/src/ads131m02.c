@@ -1,6 +1,6 @@
 /**
  * @file ads131m02.c
- * @brief ADS131M02 双通道 24bit 同步采样 ΔΣ ADC 驱动实现（SPI + DRDY 中断）
+ * @brief ADS131M02 双通道 24bit 同步采样 ΔΣ ADC 驱动（SPI3+GDMA 引擎，DRDY ISR 直启）
  *
  * 器件：TI ADS131M02，2 通道同步采样 24bit ΔΣ ADC。
  *   AIN0 —— **电流**，PGA 增益 16x（1mΩ 四端开尔文分流器 ISENSE±）
@@ -10,9 +10,10 @@
  *
  * 阅读顺序建议：
  *   ① 命令编码宏（下方 ADS_CMD_* / ADS_CMD_RREG / ADS_CMD_WREG）；
- *   ② ads_xfer_raw()    —— 本驱动唯一的 SPI 原语：一次事务交换 N 个 24bit 字；
- *   ③ ads131m02_init()  —— 建 SPI、硬复位、RESET 验证、UNLOCK、写 GAIN1、装 DRDY 中断；
- *   ④ ads131m02_read()  —— 等 DRDY# 下降沿 -> 交换 3 个 NULL 字 -> 取 CH0 / CH1。
+ *   ② ads131m02_engine（ads131m02_engine.c）—— SPI3+GDMA 帧引擎：
+ *      DRDY ISR 内直接启动一帧 96bit DMA 传输（M2，见该文件头注释）；
+ *   ③ ads131m02_init()  —— 建引擎、硬复位、UNLOCK、写 GAIN1/CLOCK、装 DRDY 中断；
+ *   ④ ads131m02_read()  —— 从引擎消费一帧 -> CRC 校验 -> 取 CH0 / CH1。
  *
  * ============================================================
  * SPI 时序要点（TI 数据手册）
@@ -22,10 +23,9 @@
  *   · 命令与数据都是 24bit 字、MSB 先出；16bit 命令码 MSB 对齐（cmd << 8）。
  *   · 命令响应出现在「命令帧之后的那一帧」的首字（TI 手册原文：the device outputs
  *     the register contents in the command response word of the following frame）。
- *     由于一帧 = STATUS + CH0 + CH1 = 3 个字，读寄存器必须时钟**两整帧**，
- *     响应在 rx[3]。见 ADS_XFER_MAX_WORDS / ads_read_reg() 的说明。
- *   · 转换数据帧 = [STATUS 24bit][CH0 24bit][CH1 24bit] = 9 字节（本例未启用 CRC；
- *     若后续在 MODE 寄存器里启用 CRC，必须同步修改 ADS_FRAME_WORDS）。
+ *     因此读寄存器分两次事务、各时钟一整帧，响应在第二帧首字。见 ads_read_reg()。
+ *   · 转换数据帧 = [STATUS][CH0][CH1][输出CRC] = 4 个 24bit 字 = 12 字节。
+ *     输出 CRC 恒在帧尾（不可关闭），必须整帧 4 字读取（见 ADS_FRAME_WORDS 注释）。
  *
  * ============================================================
  * 为什么用 SPI3_HOST，而不是文档里写的「独占 SPI2」
@@ -59,10 +59,10 @@
  *     （LEDC 无法精确产生该频率，建议用 MCPWM 或 RMT 分频）。
  *   · 【通信锚点】复位后读 ID 寄存器，其高字节固定为 0x22（手册复位值 22xxh，
  *     低 8 位“可能变化”）。ID 读不到/高字节不对，说明 SPI 通路或字序有问题。
- *   · 【响应槽位】寄存器访问的响应在「命令帧之后那一帧」的首字（rx[3]）。
+ *   · 【响应槽位】寄存器访问的响应在「命令帧之后那一帧」的首字（rx[0]）。
  *     若读回值随每次上电变化（像转换数据），说明时钟的字数没凑够整帧、
- *     没走到响应帧——这是本驱动曾踩过的坑，见 ADS_XFER_MAX_WORDS 注释。
- *     需要看原始字时把本文件日志级别开到 DEBUG，ads_read_reg() 会打印 6 个字。
+ *     没走到响应帧——这是本驱动曾踩过的坑，见 ADS_FRAME_WORDS 注释。
+ *     需要看原始字时把本文件日志级别开到 DEBUG，ads_read_reg() 会打印帧内原始字。
  *   · 【帧错位】没有 CS 时若帧错位，读出的电压/电流会呈现规律的错位关系。
  *     排查点：MODE 寄存器里的字长设置、是否启用了 CRC。
  *   · 【中断与内存】DRDY ISR 只做 xSemaphoreGiveFromISR，且 ISR 与
@@ -70,6 +70,7 @@
  * ============================================================
  */
 #include "ads131m02.h"
+#include "ads131m02_engine.h"
 
 #include <stdbool.h>
 #include <stdint.h>
@@ -78,7 +79,6 @@
 #include "board_pins.h"
 
 #include "driver/gpio.h"
-#include "driver/spi_master.h"
 #include "esp_attr.h"
 #include "esp_log.h"
 #include "freertos/FreeRTOS.h"
@@ -89,16 +89,12 @@
 static const char *TAG = "ads131m02";
 
 /* ============================================================
- * SPI 参数
+ * SPI 参数（引擎 init 的输入）
  * ============================================================ */
-/** 独占 SPI3（SPI2 已被 LCD QSPI 占用，理由见文件头） */
-#define ADS_SPI_HOST   SPI3_HOST
-/** 供日志打印用：枚举值 SPI3_HOST=2 直接打印会显示成 "SPI2"，容易误导 */
-#define ADS_SPI_HOST_NAME "SPI3"
-/** 保守时钟：先保证无 CS 长线通信可靠，稳定后可上调 */
-#define ADS_SPI_CLK_HZ (4 * 1000 * 1000)
-/** SPI mode 1（CPOL = 0 / CPHA = 1） */
-#define ADS_SPI_MODE   1
+/** 目标 SCLK = 20MHz（M2 正式档；4MHz 为二分实验档已排除 burst 因素）。 */
+#define ADS_SPI_CLK_HZ (20 * 1000 * 1000)
+/** 从机数据有效延迟（SCLK 沿→MISO 数据有效）：t_p(SCDO) 最大 20ns，供引擎时序补偿 */
+#define ADS_SPI_INPUT_DELAY_NS 20
 
 /** 24bit 字长（字节） */
 #define ADS_WORD_BYTES 3
@@ -118,12 +114,14 @@ static const char *TAG = "ads131m02";
  * 帧同步模型（本驱动所有 SPI 访问都遵守，出问题先看这里）
  *
  * 本器件的**帧边界由 DRDY# 界定**：主机在每个 DRDY 下降沿之后时钟**恰好一帧**
- * （3 个字 = 9 字节）。命令字放在帧的首字，其**响应出现在下一帧的首字**
+ * （4 个字 = 12 字节）。命令字放在帧的首字，其**响应出现在下一帧的首字**
  * （TI 手册：the device outputs the register contents in the command response
  *   word of the following frame；TI E2E 亦明确"next frame"）。
  *
  * 所以寄存器访问 = 「等 DRDY → 时钟一帧发命令」+「等 DRDY → 时钟一帧读响应」，
- * 见 ads_read_reg() / ads_write_reg() / ads_send_cmd()。
+ * 见 ads_read_reg() / ads_write_reg() / ads_send_cmd()——引擎的
+ * ads_engine_xfer_frame() 把「等 DRDY + 交换一帧」打包成不可分割的一次调用。
+ * 流式采样帧由 DRDY ISR 在引擎内直接 kick（M2），消费者只管按序取帧。
  *
  * ⚠ 曾踩的坑：不等 DRDY、一次性时钟两个帧就想一次读完响应。结果帧边界漂移，
  *   读到的"响应"其实是转换数据 —— 表现为读回值随每次上电都不同
@@ -135,23 +133,16 @@ static const char *TAG = "ads131m02";
  * 并发模型（所有 SPI 访问的串行化规则，出并发问题先看这里）
  *
  * 访问者有两类，且运行期可能并发：
- *   ① ads131m02_read()        —— 测量核高频采样；
+ *   ① ads131m02_read()        —— 测量核高频采样（消费引擎流式帧）；
  *   ② ads_read_reg/write_reg/send_cmd() —— init 写配置 + 运行期诊断/自检读寄存器。
- * 本板无片选，帧边界只靠「等 DRDY 后连续时钟整帧」维持（见上）：两路访问
- * 一旦交错时钟，就会互相吞 DRDY、帧错位，读到的值全乱。
+ * 本板无片选，帧边界只靠「DRDY 后时钟整帧」维持（见上）：两路访问一旦
+ * 交错时钟，就会互相吞 DRDY、帧错位，读到的值全乱。
  *
- * 规则：**任何 SPI 访问都必须持有 s_bus_mutex**，且「清残留信号量 → 等 DRDY →
- * 交换帧」是锁内一个不可分割的序列：
- *   · 「清残留」必须在锁内、紧挨着「等 DRDY」：若在锁外清，清完到进入等待
- *     之间别人的传输完成会产生新的残留，等待者就把别人那一轮的 DRDY 当成
- *     自己的帧起点，帧边界随即错位；
- *   · 「等 DRDY」也在锁内短等：ODR=500Hz（一帧 2ms），正常等待 ≤2ms，
- *     超时上限 ADS_DRDY_TIMEOUT_MS。代价是诊断的两帧寄存器访问会短暂挡住
- *     采样 read()，故 ADS_MUTEX_TIMEOUT_MS 按「一次两帧寄存器访问的最坏
- *     持锁时间」取值；
- *   · 不采用「锁外等 DRDY、锁内交换帧」：那样同一时刻可有多个等待者，
- *     各自拿到 DRDY 后排队进锁，轮到自己时帧早被别人时钟走，照样错位。
- * 任一时刻只有一个访问者，DRDY 等待者也只有一个——这就是本驱动的并发模型。
+ * 规则：**任何 SPI 访问都必须持有 s_bus_mutex**。维护访问（②）在锁内
+ * 额外「暂停流式 → 两帧交换 → 恢复流式」（ads_engine_set_stream）：
+ *   · 暂停后 DRDY ISR 只打时间戳不再 kick，维护帧独占总线；
+ *   · 采样侧取不到锁只丢几帧（4kHz 下一帧 250µs），槽环由引擎计数，
+ *     不产生错位；ADS_MUTEX_TIMEOUT_MS 按一次两帧维护访问的最坏持锁取值。
  */
 
 /* ============================================================
@@ -209,28 +200,33 @@ static const char *TAG = "ads131m02";
  * CLOCK 寄存器位定义（手册 §8.6.4 Table 8-17，复位值 0x030E）
  *   bit9    CH1_EN / bit8 CH0_EN：两通道均使能；
  *   bit5    TBM：0 = OSR 由 bit[4:2] 决定（1 = Turbo，OSR 固定 64）；
- *   bit[4:2] OSR[2:0]：000=128 / 001=256 / 010=512 / 011=1024（复位档）
- *                      / 100=2048 / 101=4096 / 110=8192（本工程）/ 111=16384；
+ *   bit[4:2] OSR[2:0]：000=128 / 001=256 / 010=512 / 011=1024（本工程）
+ *                      / 100=2048 / 101=4096 / 110=8192 / 111=16384；
  *   bit[1:0] PWR[1:0]：10 = HR（高分辨率，保持复位值 10）。
  *
- * HR 模式 f_MOD = f_CLKIN/2 = 4.096MHz，ODR = f_MOD/OSR = 4000 Hz（复位档）。
+ * HR 模式 f_MOD = f_CLKIN/2 = 4.096MHz，ODR = f_MOD/OSR = 4000 Hz
+ * （本工程档位，恰为芯片复位档；写入值 0x030E = 复位值，仍显式写入并回读
+ *   以保证采样率确定）。
  *
- * ⚠ 2026-10 实机排查（SBAS853 §8.5.1.5 原文）：
+ * ⚠ DRDY 抑制机制（SBAS853 §8.5.1.5 原文）：
  *   "The DRDY pulse is blocked when new conversions complete while conversion
  *    data are read."——主机读取窗口跨越转换完成时刻时 DRDY 被抑制。
- *   4kHz 档（250µs/帧）下主机"等DRDY+读帧"周期 ~3ms 必然跨越多个转换完成，
- *   DRDY 塌到 ~310Hz。故 OSR 由 011(1024) 提到 110(8192)：
- *   · ODR 降为 500Hz（2ms/帧），读取周期有充足余量避开转换完成时刻；
- *   · 过采样比由 1024× 提到 8192×（8 倍），单样本噪声较复位档降 √8≈2.8 倍。
+ *   2026-10 排查实录：当时 4MHz SPI + 任务调度路径下"等 DRDY+读帧"周期约 3ms，
+ *   在 4kHz 档（250µs/帧）必然跨越转换完成，DRDY 塌到 ~310Hz；曾以
+ *   OSR=8192（ODR=500Hz）加余量绕过。
+ *   现方案（M1 基线）：SPI 提到 20MHz + DMA 把读窗压到 µs 级，读窗固定在
+ *   DRDY 之后 µs 级启动、远离下一个 250µs 转换完成时刻，从机制上避开抑制
+ *   条件，恢复 4kHz。DRDY→SPI 启动延迟 δ 由 ads131m02_get_stats() 实测
+ *   （验收 p99≤20µs），频率护栏保证任何自动降档都不影响该预算。
  *   （若实测 ODR 需调整，改 OSR 档位即可：每 +1 档 ODR 减半。）
  * ============================================================ */
 #define ADS_CLOCK_CH_EN_MASK  0x0300u /**< CH1_EN | CH0_EN */
 #define ADS_CLOCK_OSR_SHIFT   2
-#define ADS_CLOCK_OSR_8192    (0x06u << ADS_CLOCK_OSR_SHIFT) /**< OSR[2:0]=110 → 过采样 8192×（复位档 011=1024× 的 8 倍） */
+#define ADS_CLOCK_OSR_1024    (0x03u << ADS_CLOCK_OSR_SHIFT) /**< OSR[2:0]=011 → 过采样 1024×（= 芯片复位档） */
 #define ADS_CLOCK_PWR_HR      (0x02u)                         /**< PWR[1:0]=10 HR */
-#define ADS_CLOCK_VALUE       (ADS_CLOCK_CH_EN_MASK | ADS_CLOCK_OSR_8192 | ADS_CLOCK_PWR_HR) /**< 0x031A */
-/** 配置后的输出数据率（Hz）：4.096MHz ÷ 8192 = 500Hz（即复位档 4000Hz ÷ 8） */
-#define ADS_ODR_HZ            500u
+#define ADS_CLOCK_VALUE       (ADS_CLOCK_CH_EN_MASK | ADS_CLOCK_OSR_1024 | ADS_CLOCK_PWR_HR) /**< 0x030E（恰为复位值） */
+/** 配置后的输出数据率（Hz）：4.096MHz ÷ 1024 = 4000Hz（250µs/样本） */
+#define ADS_ODR_HZ            4000u
 
 /* ============================================================
  * 时序参数
@@ -238,25 +234,24 @@ static const char *TAG = "ads131m02";
 #define ADS_RESET_LOW_MS    2   /**< RESET# 低电平保持（手册要求 ≥ 1ms） */
 #define ADS_POWERUP_MS      50  /**< 复位释放后等待（上电 + 时钟起振） */
 #define ADS_CMD_GAP_MS      2   /**< 命令之间留出的间隔 */
-#define ADS_DRDY_TIMEOUT_MS 100 /**< 等 DRDY# 超时（一帧 2ms，余量充足） */
+#define ADS_DRDY_TIMEOUT_MS 100 /**< 等 DRDY# 超时（一帧 250µs，100ms 为数百倍余量） */
 /**
  * 取总线互斥锁超时。
  * 「等 DRDY + 交换帧」整个序列都在锁内（见文件头并发模型），因此一次两帧的
  * 寄存器访问最坏持锁 ≈ 2×ADS_DRDY_TIMEOUT_MS，取 300ms 留裕量；
- * 采样侧取不到锁只丢一帧（500Hz 下一帧 2ms），不构成问题。
+ * 采样侧取不到锁只丢一帧（4kHz 下一帧 250µs），不构成问题。
  */
 #define ADS_MUTEX_TIMEOUT_MS 300
 
 /** 是否已初始化 */
 static bool s_initialized = false;
-/** SPI 设备句柄 */
-static spi_device_handle_t s_spi = NULL;
-/** DRDY# 下降沿信号量（ISR 给、任务取） */
-static SemaphoreHandle_t s_drdy_sem = NULL;
-/** SPI 事务互斥锁：所有 SPI 访问（采样 read / 寄存器读写 / 命令）统一持锁，见文件头并发模型 */
+/** SPI 事务互斥锁：读采样与维护访问统一持锁，见文件头并发模型 */
 static SemaphoreHandle_t s_bus_mutex = NULL;
-/** DRDY# 边沿累计（诊断：区分 DRDY 真实速率与任务处理速率） */
-static atomic_uint s_drdy_count;
+/** 采样侧统计（单写者：采样任务；诊断/验收用，δ 统计在引擎侧） */
+static uint32_t s_read_ok = 0;      /**< 成功读取帧数 */
+static uint32_t s_crc_fail = 0;     /**< CRC 校验失败帧数 */
+static uint32_t s_read_timeout = 0; /**< 等帧超时/丢帧次数 */
+static uint32_t s_crc_fail_streak = 0; /**< 连续 CRC 失败计数（M3 容错告警用） */
 
 /**
  * @brief 16bit 命令/寄存器值 -> 线上 24bit 字（MSB 对齐）
@@ -292,67 +287,26 @@ static uint16_t ads_crc16_ccitt(const uint8_t *data, size_t len)
 }
 
 /**
- * @brief DRDY# 下降沿中断服务程序
- *
- * 只做一件事：唤醒等待采样的任务。
- * 约束（hardware_pinout.md §6）：ISR 及其调用的代码/数据必须位于 IRAM，
- * 且不得访问 PSRAM、不得忙等——故这里只调用 FreeRTOS 的信号量 API。
+ * @brief DRDY# 处理与帧传输全部在引擎内（M2）：
+ *   DRDY ISR 直接 kick 一帧 GDMA 传输（drdy_isr → engine_kick，
+ *   见 ads131m02_engine.c）；本文件不再自持 ISR/信号量/传输原语。
  */
-static void IRAM_ATTR ads_drdy_isr(void *arg)
-{
-    (void)arg;
-    atomic_fetch_add_explicit(&s_drdy_count, 1, memory_order_relaxed);
-    BaseType_t hp_task_woken = pdFALSE;
-    xSemaphoreGiveFromISR(s_drdy_sem, &hp_task_woken);
-    portYIELD_FROM_ISR(hp_task_woken);
-}
 
 /**
- * @brief 一次 SPI 事务内连续交换 N 个 24bit 字
+ * @brief 交换一帧（4 字 × 24bit）：引擎的「等 DRDY + DMA 传输」一体调用
  *
- * 全部字必须放在同一个事务里（本板无片选，帧边界只靠连续时钟 + 字数保证）。
- * tx24 / rx24 都是「24bit 原始值」域：命令用 ADS_W(cmd) 对齐，数据直接是码值。
+ * 引擎把「等 DRDY → 启动帧」打包（ads_engine_xfer_frame），帧边界仍由
+ * DRDY 界定。本驱动的两帧寄存器协议 = 连续两次本调用（见 ads_read_reg）。
  *
- * @param tx24 待发送的 24bit 字数组，不可为 NULL
- * @param rx24 输出：收到的 24bit 字数组，可为 NULL（只写不读时）
- * @param word_count 字数，1 ~ ADS_FRAME_WORDS（一帧 = 3 字）
- * @return ESP_OK 成功
+ * @param tx 待发送 4 字（NULL=全 NULL 帧）
+ * @param rx 输出 4 字
+ * @param word_count 字数（引擎帧长固定 4，参数保留兼容调用方）
+ * @return ESP_OK 成功；ESP_ERR_TIMEOUT 等 DRDY 超时
  */
-static esp_err_t ads_xfer_raw(const uint32_t *tx24, uint32_t *rx24, size_t word_count)
+static esp_err_t ads_xfer_raw(const uint32_t *tx, uint32_t *rx, size_t word_count)
 {
-    if (tx24 == NULL || word_count == 0 || word_count > ADS_FRAME_WORDS) {
-        return ESP_ERR_INVALID_ARG;
-    }
-
-    uint8_t tx_buf[ADS_FRAME_WORDS * ADS_WORD_BYTES] = { 0 };
-    uint8_t rx_buf[ADS_FRAME_WORDS * ADS_WORD_BYTES] = { 0 };
-
-    for (size_t i = 0; i < word_count; i++) {
-        uint32_t v = tx24[i] & 0xFFFFFFu;
-        tx_buf[i * ADS_WORD_BYTES + 0] = (uint8_t)(v >> 16);
-        tx_buf[i * ADS_WORD_BYTES + 1] = (uint8_t)(v >> 8);
-        tx_buf[i * ADS_WORD_BYTES + 2] = (uint8_t)v;
-    }
-
-    spi_transaction_t trans = {
-        .length = word_count * ADS_WORD_BYTES * 8, /* 单位：位 */
-        .tx_buffer = tx_buf,
-        .rx_buffer = rx_buf,
-    };
-    esp_err_t err = spi_device_polling_transmit(s_spi, &trans);
-    if (err != ESP_OK) {
-        ESP_LOGE(TAG, "SPI 事务失败: %s", esp_err_to_name(err));
-        return err;
-    }
-
-    if (rx24 != NULL) {
-        for (size_t i = 0; i < word_count; i++) {
-            rx24[i] = ((uint32_t)rx_buf[i * ADS_WORD_BYTES + 0] << 16) |
-                      ((uint32_t)rx_buf[i * ADS_WORD_BYTES + 1] << 8) |
-                      (uint32_t)rx_buf[i * ADS_WORD_BYTES + 2];
-        }
-    }
-    return ESP_OK;
+    (void)word_count;
+    return ads_engine_xfer_frame(tx, rx, ADS_DRDY_TIMEOUT_MS);
 }
 
 /**
@@ -372,34 +326,13 @@ static void ads_bus_unlock(void)
 }
 
 /**
- * @brief 等一次 DRDY# 下降沿（= 一帧的起点）
- *
- * ⚠ 调用前提：必须已持 s_bus_mutex。「清残留 → 等 DRDY → 交换帧」是锁内
- * 不可分割的序列（并发模型见文件头）：清残留与等待之间不允许任何人插进来
- * 产生新的 DRDY，否则等待者会把别人的帧当成自己的帧起点。
- *
- * 先清掉可能残留的信号量（上一轮传输完成后 ISR 给出、没人取的），
- * 再阻塞等待，保证拿到的是"最新的一帧起点"。正常等待 ≤ 一帧周期 2ms。
- *
- * @return ESP_OK；ESP_ERR_TIMEOUT 超时（通常意味着 ADC 无时钟 / DRDY 未接）
- */
-static esp_err_t ads_wait_drdy_locked(void)
-{
-    (void)xSemaphoreTake(s_drdy_sem, 0); /* 清残留 */
-    if (xSemaphoreTake(s_drdy_sem, pdMS_TO_TICKS(ADS_DRDY_TIMEOUT_MS)) != pdTRUE) {
-        return ESP_ERR_TIMEOUT;
-    }
-    return ESP_OK;
-}
-
-/**
- * @brief 读一个寄存器（DRDY 同步的「两帧」访问）
+ * @brief 读一个寄存器（DRDY 同步的「两帧」访问，维护模式）
  *
  * ⚠ 关键：本器件的帧边界由 DRDY# 界定，主机必须「每个 DRDY 周期时钟恰好一帧」。
  *   事务结构：
  *     帧 N   ：[RREG 命令字][dummy][dummy]       ← 命令放在帧首字
  *     帧 N+1 ：[寄存器内容][dummy][dummy]        ← 响应出现在下一帧的首字
- *   因此分两次事务、各等一次 DRDY。
+ *   因此分两次事务、各等一次 DRDY（引擎的 xfer_frame 内含等待）。
  *
  *   曾踩的坑：一次性时钟 2 帧（不等 DRDY）→ 帧边界漂移，读到的"响应"是转换数据，
  *   表现为读回值随每次上电变化、ID 读出 0x2818/0x333E 这类非法值。
@@ -415,33 +348,26 @@ static esp_err_t ads_read_reg(uint8_t addr, uint16_t *value)
     uint32_t tx[ADS_FRAME_WORDS] = { 0 };
     uint32_t rx[ADS_FRAME_WORDS] = { 0 };
 
-    /* 寄存器访问与采样 read() 同样是 SPI 访问，必须持锁（见文件头并发模型）。
+    /* 维护访问：持锁 + 暂停流式（帧起点/总线独占，见文件头并发模型）。
      * 两帧都完成才放锁，中途任何错误路径都统一在解锁处归还。 */
     if (!ads_bus_lock()) {
         return ESP_ERR_TIMEOUT;
     }
+    const bool stream_was_on = ads_engine_set_stream(false);
 
-    /* 帧 N：发 RREG */
-    esp_err_t err = ads_wait_drdy_locked();
-    if (err != ESP_OK) {
-        ESP_LOGE(TAG, "等 DRDY 超时（RREG 0x%02X 命令帧）", addr);
-        goto done;
-    }
+    /* 帧 N：发 RREG（xfer_frame 内含「等 DRDY」） */
     tx[0] = ADS_W(ADS_CMD_RREG(addr, 1));
-    err = ads_xfer_raw(tx, rx, ADS_FRAME_WORDS);
+    esp_err_t err = ads_xfer_raw(tx, rx, ADS_FRAME_WORDS);
     if (err != ESP_OK) {
+        ESP_LOGE(TAG, "RREG 0x%02X 命令帧失败: %s", addr, esp_err_to_name(err));
         goto done;
     }
 
     /* 帧 N+1：帧首字即寄存器内容 */
-    err = ads_wait_drdy_locked();
-    if (err != ESP_OK) {
-        ESP_LOGE(TAG, "等 DRDY 超时（RREG 0x%02X 响应帧）", addr);
-        goto done;
-    }
     tx[0] = ADS_W(ADS_CMD_NULL);
     err = ads_xfer_raw(tx, rx, ADS_FRAME_WORDS);
     if (err != ESP_OK) {
+        ESP_LOGE(TAG, "RREG 0x%02X 响应帧失败: %s", addr, esp_err_to_name(err));
         goto done;
     }
 
@@ -452,6 +378,7 @@ static esp_err_t ads_read_reg(uint8_t addr, uint16_t *value)
              (unsigned)rx[1], (unsigned)rx[2]);
 
 done:
+    ads_engine_set_stream(stream_was_on);
     ads_bus_unlock();
     return err;
 }
@@ -473,33 +400,26 @@ static esp_err_t ads_write_reg(uint8_t addr, uint16_t value)
     uint32_t tx[ADS_FRAME_WORDS] = { 0 };
     uint32_t rx[ADS_FRAME_WORDS] = { 0 };
 
-    /* 寄存器访问统一持锁（见文件头并发模型），两帧完成才放锁 */
+    /* 维护访问：持锁 + 暂停流式，两帧完成才放锁 */
     if (!ads_bus_lock()) {
         return ESP_ERR_TIMEOUT;
     }
+    const bool stream_was_on = ads_engine_set_stream(false);
 
-    /* 帧 N：发 WREG + 数据 */
-    esp_err_t err = ads_wait_drdy_locked();
-    if (err != ESP_OK) {
-        ESP_LOGE(TAG, "等 DRDY 超时（WREG 0x%02X 命令帧）", addr);
-        goto done;
-    }
+    /* 帧 N：发 WREG + 数据（xfer_frame 内含「等 DRDY」） */
     tx[0] = ADS_W(ADS_CMD_WREG(addr, 1));
     tx[1] = ADS_W(value);
-    err = ads_xfer_raw(tx, rx, ADS_FRAME_WORDS);
+    esp_err_t err = ads_xfer_raw(tx, rx, ADS_FRAME_WORDS);
     if (err != ESP_OK) {
+        ESP_LOGE(TAG, "WREG 0x%02X 命令帧失败: %s", addr, esp_err_to_name(err));
         goto done;
     }
 
     /* 帧 N+1：取应答字 */
-    err = ads_wait_drdy_locked();
-    if (err != ESP_OK) {
-        ESP_LOGE(TAG, "等 DRDY 超时（WREG 0x%02X 应答帧）", addr);
-        goto done;
-    }
     tx[0] = ADS_W(ADS_CMD_NULL);
     err = ads_xfer_raw(tx, rx, ADS_FRAME_WORDS);
     if (err != ESP_OK) {
+        ESP_LOGE(TAG, "WREG 0x%02X 应答帧失败: %s", addr, esp_err_to_name(err));
         goto done;
     }
 
@@ -514,6 +434,7 @@ static esp_err_t ads_write_reg(uint8_t addr, uint16_t value)
     ESP_LOGI(TAG, "WREG 0x%02X=0x%04X 已确认（应答 0x%04X）", addr, value, ack);
 
 done:
+    ads_engine_set_stream(stream_was_on);
     ads_bus_unlock();
     return err;
 }
@@ -530,20 +451,17 @@ static esp_err_t ads_send_cmd(uint16_t cmd, uint16_t *response)
     uint32_t tx[ADS_FRAME_WORDS] = { 0 };
     uint32_t rx[ADS_FRAME_WORDS] = { 0 };
 
-    /* 命令同样是 SPI 访问，统一持锁（见文件头并发模型） */
+    /* 命令同样是维护访问：持锁 + 暂停流式 */
     if (!ads_bus_lock()) {
         return ESP_ERR_TIMEOUT;
     }
+    const bool stream_was_on = ads_engine_set_stream(false);
 
-    /* 帧 N：发命令 */
-    esp_err_t err = ads_wait_drdy_locked();
-    if (err != ESP_OK) {
-        ESP_LOGE(TAG, "等 DRDY 超时（命令 0x%04X 帧）", cmd);
-        goto done;
-    }
+    /* 帧 N：发命令（xfer_frame 内含「等 DRDY」） */
     tx[0] = ADS_W(cmd);
-    err = ads_xfer_raw(tx, rx, ADS_FRAME_WORDS);
+    esp_err_t err = ads_xfer_raw(tx, rx, ADS_FRAME_WORDS);
     if (err != ESP_OK) {
+        ESP_LOGE(TAG, "命令 0x%04X 帧失败: %s", cmd, esp_err_to_name(err));
         goto done;
     }
 
@@ -552,19 +470,16 @@ static esp_err_t ads_send_cmd(uint16_t cmd, uint16_t *response)
     }
 
     /* 帧 N+1：响应帧 */
-    err = ads_wait_drdy_locked();
-    if (err != ESP_OK) {
-        ESP_LOGE(TAG, "等 DRDY 超时（命令 0x%04X 响应帧）", cmd);
-        goto done;
-    }
     tx[0] = ADS_W(ADS_CMD_NULL);
     err = ads_xfer_raw(tx, rx, ADS_FRAME_WORDS);
     if (err != ESP_OK) {
+        ESP_LOGE(TAG, "命令 0x%04X 响应帧失败: %s", cmd, esp_err_to_name(err));
         goto done;
     }
     *response = (uint16_t)(rx[0] >> 8);
 
 done:
+    ads_engine_set_stream(stream_was_on);
     ads_bus_unlock();
     return err;
 }
@@ -577,13 +492,11 @@ esp_err_t ads131m02_init(void)
     }
 
     esp_err_t err = ESP_OK;
-    bool isr_handler_added = false;
 
-    /* ---- ① 同步对象：DRDY 信号量 + SPI 事务互斥锁 ---- */
-    s_drdy_sem = xSemaphoreCreateBinary();
+    /* ---- ① 同步对象：SPI 事务互斥锁（DRDY 同步由引擎内部处理） ---- */
     s_bus_mutex = xSemaphoreCreateMutex();
-    if (s_drdy_sem == NULL || s_bus_mutex == NULL) {
-        ESP_LOGE(TAG, "创建同步对象失败（内存不足）");
+    if (s_bus_mutex == NULL) {
+        ESP_LOGE(TAG, "创建互斥锁失败（内存不足）");
         err = ESP_ERR_NO_MEM;
         goto fail_sync;
     }
@@ -617,63 +530,26 @@ esp_err_t ads131m02_init(void)
         goto fail_sync;
     }
 
-    /* ---- ④ 建 SPI 总线与设备（数据量极小，无需 DMA） ---- */
-    const spi_bus_config_t bus_cfg = {
-        .mosi_io_num = BOARD_PIN_ADC_MOSI,
-        .miso_io_num = BOARD_PIN_ADC_MISO,
-        .sclk_io_num = BOARD_PIN_ADC_SCLK,
-        .quadwp_io_num = -1,
-        .quadhd_io_num = -1,
-        .max_transfer_sz = ADS_FRAME_WORDS * ADS_WORD_BYTES,
-    };
-    err = spi_bus_initialize(ADS_SPI_HOST, &bus_cfg, SPI_DMA_DISABLED);
+    /* ---- ④ 建 SPI3+GDMA 帧引擎（M2：DRDY ISR 直启） ----
+     * ⚠ MISO 时序护栏：t_p(SCDO) 最大 20ns（SBAS853 §6.7），20MHz 半周期
+     * 仅 25ns，裕量趋近 0；引擎按 input_delay_ns 做时序补偿，20MHz 下的位错
+     * 由 CRC 帧校验兜底（crc_fail 计数即告警），必要时降频重测（4kHz 不受影响）。 */
+    err = ads_engine_init(BOARD_PIN_ADC_MOSI, BOARD_PIN_ADC_MISO, BOARD_PIN_ADC_SCLK,
+                          ADS_SPI_CLK_HZ, ADS_SPI_INPUT_DELAY_NS);
     if (err != ESP_OK) {
-        ESP_LOGE(TAG, "%s 总线初始化失败: %s", ADS_SPI_HOST_NAME, esp_err_to_name(err));
+        ESP_LOGE(TAG, "SPI3+GDMA 引擎初始化失败: %s", esp_err_to_name(err));
         goto fail_sync;
-    }
-
-    const spi_device_interface_config_t dev_cfg = {
-        .clock_speed_hz = ADS_SPI_CLK_HZ,
-        .mode = ADS_SPI_MODE,
-        /* 本板无片选，器件常选中；帧边界靠整帧字数保证（见文件头） */
-        .spics_io_num = -1,
-        .queue_size = 1,
-    };
-    err = spi_bus_add_device(ADS_SPI_HOST, &dev_cfg, &s_spi);
-    if (err != ESP_OK) {
-        ESP_LOGE(TAG, "添加 SPI 设备失败: %s", esp_err_to_name(err));
-        goto fail_bus;
     }
 
     /* ---- ⑤ DRDY# 下降沿中断 ----
      * 必须**早于**任何寄存器访问安装：本器件的帧由 DRDY 界定，
-     * 寄存器访问要和 ads131m02_read() 一样「等 DRDY 再时钟一帧」，
+     * 寄存器访问与采样同样「等 DRDY 再时钟一帧」，
      * 否则帧边界漂移、读到的"响应"其实是转换数据（详见 ads_read_reg 注释）。 */
-    const gpio_config_t drdy_cfg = {
-        .pin_bit_mask = 1ULL << BOARD_PIN_ADC_DRDY,
-        .mode = GPIO_MODE_INPUT,
-        .pull_up_en = GPIO_PULLUP_ENABLE, /* DRDY# 低有效，上拉兜底防悬空 */
-        .pull_down_en = GPIO_PULLDOWN_DISABLE,
-        .intr_type = GPIO_INTR_NEGEDGE,
-    };
-    err = gpio_config(&drdy_cfg);
+    err = ads_engine_attach_drdy(BOARD_PIN_ADC_DRDY);
     if (err != ESP_OK) {
-        ESP_LOGE(TAG, "DRDY# 脚 IO%d 配置失败: %s", BOARD_PIN_ADC_DRDY, esp_err_to_name(err));
-        goto fail_dev;
+        ESP_LOGE(TAG, "DRDY# 中断安装失败（IO%d）: %s", BOARD_PIN_ADC_DRDY, esp_err_to_name(err));
+        goto fail_sync;
     }
-
-    /* ISR 服务可能已被其他驱动安装过，此时返回 ESP_ERR_INVALID_STATE 属正常 */
-    err = gpio_install_isr_service(0);
-    if (err != ESP_OK && err != ESP_ERR_INVALID_STATE) {
-        ESP_LOGE(TAG, "安装 GPIO ISR 服务失败: %s", esp_err_to_name(err));
-        goto fail_dev;
-    }
-    err = gpio_isr_handler_add(BOARD_PIN_ADC_DRDY, ads_drdy_isr, NULL);
-    if (err != ESP_OK) {
-        ESP_LOGE(TAG, "挂载 DRDY# 中断处理失败: %s", esp_err_to_name(err));
-        goto fail_dev;
-    }
-    isr_handler_added = true;
 
     /* ---- ⑥ 硬复位：RESET# 低脉冲，随后等待上电与时钟起振 ---- */
     gpio_set_level(BOARD_PIN_ADC_RST, 0);
@@ -720,10 +596,11 @@ esp_err_t ads131m02_init(void)
     }
     vTaskDelay(pdMS_TO_TICKS(ADS_CMD_GAP_MS));
 
-    /* ---- ⑩.1 写 CLOCK：HR 模式 + OSR=8192 档 -> 输出数据率 500SPS ----
-     * 与芯片复位默认（OSR=1024 档 4kSPS）不同：提高过采样降噪声，
-     * 并给主机读取留出避开"转换完成时刻"的窗口（SBAS853 §8.5.1.5，
-     * 详见 ADS_CLOCK_VALUE 注释）。仍显式写入并回读，保证采样率确定。 */
+    /* ---- ⑩.1 写 CLOCK：HR 模式 + OSR=1024 档 -> 输出数据率 4kSPS ----
+     * 与芯片复位默认（0x030E）相同，仍显式写入并回读，保证采样率确定。
+     * 4kHz 稳定工作的前提是"读窗不跨越转换完成时刻"（SBAS853 §8.5.1.5），
+     * 由 20MHz+DMA 紧凑读窗保证（详见 ADS_CLOCK_VALUE 注释与
+     * ads131m02_get_stats() 的 δ 实测）。 */
     err = ads_write_reg(ADS_REG_CLOCK, ADS_CLOCK_VALUE);
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "CLOCK(采样率) 写入未确认: %s", esp_err_to_name(err));
@@ -734,7 +611,7 @@ esp_err_t ads131m02_init(void)
     err = ads_read_reg(ADS_REG_CLOCK, &clock_readback);
     if (err == ESP_OK) {
         if (clock_readback == ADS_CLOCK_VALUE) {
-            ESP_LOGI(TAG, "CLOCK 回读 0x%04X：HR 模式 OSR=8192 档，ODR=%u SPS", clock_readback,
+            ESP_LOGI(TAG, "CLOCK 回读 0x%04X：HR 模式 OSR=1024 档，ODR=%u SPS", clock_readback,
                      ADS_ODR_HZ);
         } else {
             ESP_LOGW(TAG, "CLOCK 回读 0x%04X 与目标 0x%04X 不符（实际 ODR 可能不是 %u SPS）",
@@ -821,33 +698,24 @@ esp_err_t ads131m02_init(void)
                               "本工程读直流必须为 0", dcblock);
             }
             if (crc_on) {
-                ESP_LOGE(TAG, "SPI CRC 已启用：一帧变为 STATUS+CH0+CH1+CRC 四个字，"
-                              "驱动需同步改造，否则数据错位");
+                ESP_LOGE(TAG, "输入/寄存器 CRC 已启用（RX_CRC_EN/REG_CRC_EN）：帧内容与驱动假设"
+                              "不同（驱动按 [STATUS][CH0][CH1][输出CRC] 固定 4 字解析），需人工核对");
             }
         } else {
             ESP_LOGW(TAG, "寄存器体检失败（读寄存器出错），跳过");
         }
     }
 
+    /* 开启流式：此后 DRDY ISR 每个边沿直接 kick 一帧（M2 数据面正式启动） */
+    ads_engine_set_stream(true);
+
     s_initialized = true;
-    ESP_LOGI(TAG, "初始化完成（%s mode1 %d Hz，CH0=16x 电流 / CH1=1x 电压，ODR=%u SPS，DRDY#=IO%d）",
-             ADS_SPI_HOST_NAME, ADS_SPI_CLK_HZ, ADS_ODR_HZ, BOARD_PIN_ADC_DRDY);
+    ESP_LOGI(TAG, "初始化完成（SPI3 引擎 mode1 %d Hz，CH0=16x 电流 / CH1=1x 电压，"
+                  "ODR=%u SPS，DRDY#=IO%d）",
+             ADS_SPI_CLK_HZ, ADS_ODR_HZ, BOARD_PIN_ADC_DRDY);
     return ESP_OK;
-fail_dev:
-    if (isr_handler_added) {
-        gpio_isr_handler_remove(BOARD_PIN_ADC_DRDY);
-    }
-    if (s_spi != NULL) {
-        spi_bus_remove_device(s_spi);
-        s_spi = NULL;
-    }
-fail_bus:
-    spi_bus_free(ADS_SPI_HOST);
+fail_dev: /* 设备层错误路径标签（寄存器配置阶段沿用），落回 fail_sync */
 fail_sync:
-    if (s_drdy_sem != NULL) {
-        vSemaphoreDelete(s_drdy_sem);
-        s_drdy_sem = NULL;
-    }
     if (s_bus_mutex != NULL) {
         vSemaphoreDelete(s_bus_mutex);
         s_bus_mutex = NULL;
@@ -864,26 +732,19 @@ esp_err_t ads131m02_read(ads131m02_sample_t *out)
         return ESP_ERR_INVALID_STATE;
     }
 
-    /* 串行化整段「等 DRDY + 读一帧」：与寄存器访问共用同一把锁，
-     * 避免并发调用互相吞 DRDY、把帧交错打乱（见文件头并发模型） */
+    /* 串行化整段「取帧 + 解析」：与维护访问共用同一把锁（见文件头并发模型） */
     if (!ads_bus_lock()) {
         return ESP_ERR_TIMEOUT;
     }
 
-    /* 等 DRDY# 下降沿：代表一轮新的同步采样已就绪。
-     * 锁内先清残留再等，保证等的是"最新一帧起点"（与寄存器访问同一序列）。 */
-    if (ads_wait_drdy_locked() != ESP_OK) {
+    /* 从引擎消费一帧：DRDY ISR 已直接 kick（M2），这里等信号 + 取槽 */
+    uint32_t rx[ADS_FRAME_WORDS] = { 0 };
+    esp_err_t err = ads_engine_read_frame(rx, ADS_DRDY_TIMEOUT_MS);
+    if (err != ESP_OK) {
+        s_read_timeout++;
         ads_bus_unlock();
         return ESP_ERR_TIMEOUT;
     }
-
-    /* 交换 4 个 NULL 字，一口气取回 [STATUS][CH0][CH1][CRC]（无 CS，必须同事务）。
-     * ⚠ 必须整帧 4 字（96 SCLK）：ADC 输出 CRC 恒在帧尾，少读一字会让
-     * 字计数错位，读到 [CH1][STATUS][CH0] 等错位帧（毛刺根因，见帧定义注释）。 */
-    const uint32_t tx[ADS_FRAME_WORDS] = { ADS_W(ADS_CMD_NULL), ADS_W(ADS_CMD_NULL),
-                                           ADS_W(ADS_CMD_NULL), ADS_W(ADS_CMD_NULL) };
-    uint32_t rx[ADS_FRAME_WORDS] = { 0 };
-    esp_err_t err = ads_xfer_raw(tx, rx, ADS_FRAME_WORDS);
 
     if (err == ESP_OK) {
         /* rx[0] 是 STATUS，rx[1]/rx[2] 为 24bit 补码，rx[3] 高 16bit 为帧 CRC。
@@ -906,6 +767,29 @@ esp_err_t ads131m02_read(ads131m02_sample_t *out)
         const uint16_t crc_calc = ads_crc16_ccitt(raw9, sizeof(raw9));
         const uint16_t crc_rx = (uint16_t)(rx[3] >> 8); /* 第 4 字高 16bit */
         out->crc_ok = (crc_calc == crc_rx);
+        if (!out->crc_ok) {
+            s_crc_fail++;
+            /* M3 容错观测：连续 CRC 失败说明帧完整性持续异常（位错/时序越界），
+             * 单发告警便于长跑发现；帧错位在本引擎"每 kick 一帧"模型下不跨帧持续。 */
+            if (++s_crc_fail_streak == 32u) {
+                ESP_LOGE(TAG, "连续 32 帧 CRC 校验失败：请检查 MISO 时序（降 SCLK 验证）"
+                              "或帧格式配置");
+            }
+        } else {
+            s_crc_fail_streak = 0;
+        }
+
+        /* 每 4096 帧（≈1s @4kHz）打印一次基线统计（M2 验收观测口） */
+        const uint32_t n = ++s_read_ok;
+        if ((n & 0xFFFu) == 0u) {
+            ads_engine_stats_t es;
+            ads_engine_get_stats(&es);
+            ESP_LOGI(TAG, "[基线统计] DRDY=%u kick=%u 丢=%u ok=%u crc_fail=%u timeout=%u "
+                          "| δ(DRDY→SPI)µs min/avg/max=%u/%u/%u",
+                     (unsigned)es.drdy_count, (unsigned)es.kick_count, (unsigned)es.drop_count,
+                     (unsigned)n, (unsigned)s_crc_fail, (unsigned)s_read_timeout,
+                     es.lat_min_us, es.lat_avg_us, es.lat_max_us);
+        }
     }
 
     ads_bus_unlock();
@@ -915,6 +799,24 @@ esp_err_t ads131m02_read(ads131m02_sample_t *out)
 uint32_t ads131m02_get_sample_rate_hz(void)
 {
     return s_initialized ? ADS_ODR_HZ : 0;
+}
+
+void ads131m02_get_stats(ads131m02_stats_t *out)
+{
+    if (out == NULL) {
+        return;
+    }
+    ads_engine_stats_t es;
+    ads_engine_get_stats(&es);
+    out->drdy_count = es.drdy_count;
+    out->edge_ok = es.kick_count;   /* 语义（M2）：成功 kick 的帧数 */
+    out->edge_busy = es.drop_count; /* 语义（M2）：槽满丢弃的帧数 */
+    out->read_ok = s_read_ok;
+    out->crc_fail = s_crc_fail;
+    out->read_timeout = s_read_timeout;
+    out->lat_min_us = es.lat_min_us;
+    out->lat_avg_us = es.lat_avg_us;
+    out->lat_max_us = es.lat_max_us;
 }
 
 /** 自检连续采样帧数：全部为 0 才判定"数据无意义"，单帧为 0 属正常 */
@@ -989,5 +891,7 @@ esp_err_t ads131m02_selftest(void)
 
 uint32_t ads131m02_drdy_count(void)
 {
-    return atomic_load_explicit(&s_drdy_count, memory_order_relaxed);
+    ads_engine_stats_t es;
+    ads_engine_get_stats(&es);
+    return es.drdy_count;
 }
