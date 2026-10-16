@@ -94,7 +94,8 @@ CONFIG_COMPILER_OPTIMIZATION_ASSERTIONS_ENABLE=y
 # FreeRTOS 与系统节拍
 # ============================================================
 CONFIG_FREERTOS_UNICORE=n
-# 1kHz 节拍（1 tick = 1ms）：满足测量核 2ms（500Hz）采样周期的定时精度要求。
+# 1kHz 节拍（1 tick = 1ms）：供显示/逻辑定时；采样节奏由 DRDY# 硬件中断自驱动
+#（4kHz，250µs/样本），不依赖节拍精度。
 # 代码中统一使用 pdMS_TO_TICKS()，因此改这里不会破坏延时逻辑。
 CONFIG_FREERTOS_HZ=1000
 
@@ -197,7 +198,7 @@ CONFIG_LWIP_MAX_SOCKETS=16
 # Flash 擦除窗口与中断安全（必须）
 # ============================================================
 # NVS 定时落盘（电能/运行时间）会擦除 Flash，期间两条 CPU 的 cache 短暂关闭；
-# 此时 ADS131M02 的 DRDY# 仍以 500Hz 产生 GPIO 下降沿中断。GPIO ISR 派发服务
+# 此时 ADS131M02 的 DRDY# 仍以 4kHz 产生 GPIO 下降沿中断。GPIO ISR 派发服务
 # 默认链接在 Flash 中，若在 cache 关闭窗口被挂起触发会引发 Cache error 崩溃。
 # 把 GPIO 控制/中断函数放 IRAM 后，任意 Flash 擦除期间 GPIO 中断均安全。
 # 注意：V6.1 已把该选项由 GPIO_ISR_IRAM_SAFE 更名为 GPIO_CTRL_FUNC_IN_IRAM，

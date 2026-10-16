@@ -101,7 +101,7 @@ components/
 │   ├── aht20/ imu_sc7a20h/ battery_adc/ buzzer/ status_led/ key_button/
 ├── middleware/           中间件：event_bus、data_store（seqlock）、lvgl_port、
 │                         fs_storage（SPIFFS 字体）、wifi_manager / web_console（接口骨架，规划中）
-└── services/             业务服务：power_measure（500SPS 测量链路）、system_state、
+└── services/             业务服务：power_measure（4kSPS 测量链路）、system_state、
                           settings（NVS 持久化）、orientation（自动转屏）、ui（三页界面）
 managed_components/       组件管理器托管依赖（不入库，由 lock 复现）
 docs/                     架构设计与引脚文档

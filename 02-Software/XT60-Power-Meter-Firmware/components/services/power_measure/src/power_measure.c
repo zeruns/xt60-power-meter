@@ -59,8 +59,8 @@
  * ─────────────────────────────────────────────────────────────
  * 四、波形缓冲（PSRAM，三级降采样）
  * ─────────────────────────────────────────────────────────────
- *   tier0   500Hz × 4000 点  —— 1s 窗（原始逐点，已过 4 点滑动平均轻滤，可回看 8s）
- *   tier1    50Hz × 24000 点 —— 60s 窗（每 10 点均值，可回看 480s）
+ *   tier0  4000Hz × 4000 点  —— 1s 窗（原始逐点，已过 4 点滑动平均轻滤）
+ *   tier1    50Hz × 24000 点 —— 60s 窗（每 80 点均值，可回看 480s）
  *   tier2  1.25Hz × 6000 点  —— 10min 窗（每 40 个 tier1 点均值，可回看 80min）
  * 每个点含 V/I/P/E 四个 float + 时间戳；UI 用 pm_wave_copy() 按
  * 固定时间槽聚合取数（契约：每槽固定时长，与采样率无关）。
@@ -101,15 +101,17 @@ static const char *TAG = "power_measure"; /**< ESP_LOG 日志标签，过滤本�
 /* ============================================================
  * 采样与计算参数
  * ============================================================ */
-#define PM_SAMPLE_RATE_HZ  500u                  /**< ADC 输出数据率（与驱动 CLOCK OSR=8192 档配置一致） */
-#define PM_BLOCK_SAMPLES   100u                  /**< 标称 500Hz 下 200ms 的样本数（仅作历史参考） */
+#define PM_SAMPLE_RATE_HZ  4000u                 /**< ADC 输出数据率（与驱动 CLOCK OSR=1024 档配置一致） */
+#define PM_BLOCK_SAMPLES   800u                  /**< 标称 4000Hz 下 200ms 的样本数（仅作历史参考） */
 #define PM_BLOCK_PERIOD_MS (1000u * PM_BLOCK_SAMPLES / PM_SAMPLE_RATE_HZ) /**< 块周期：墙钟 200ms */
 #define PM_BLOCK_PER_SEC   (PM_SAMPLE_RATE_HZ / PM_BLOCK_SAMPLES) /**< 每秒块数 = 5 */
 
 /** 显示平滑系数（对块均值做一阶低通）：约 0.8s 时间常数，兼顾响应与稳定 */
 #define PM_DISPLAY_EMA_ALPHA 0.25f
-/** 波形轻滤：4 点滑动平均（500Hz 采样 → 约 125Hz 等效带宽），抑制高频噪声 */
-#define PM_WAVE_MAVG_N 4u
+/** 波形轻滤：8 点滑动平均（4000Hz 采样 → 约 500Hz 等效带宽）。
+ *  M4 显示平滑：OSR=1024 档单样本噪声约为 OSR=8192 档的 √8≈2.8 倍，
+ *  8 点均值把显示噪声压回约原水平（统计/电能不受轻滤影响，仍用原始样本）。 */
+#define PM_WAVE_MAVG_N 8u
 
 /** 前端默认标定（未实测标定时的理论值，见 power_calc.h 的量纲说明）
  *  电压：满量程 ±1.2V@PGA1× / 2^23 码，外部分压 101:1（R33 100k / R39 1k）
@@ -130,10 +132,10 @@ typedef struct {
                       *   因此实际采样率偏低/波动时时间尺度依然正确。 */
 } wave_point_t;
 
-#define PM_TIER0_CAP 4000u   /**< 500Hz × 8s（远超 1s 窗所需，余量足） */
+#define PM_TIER0_CAP 4000u   /**< 4000Hz × 1s（恰好覆盖 1s 窗；4kHz 下回看余量=窗长） */
 #define PM_TIER1_CAP 24000u  /**< 50Hz × 480s（覆盖最长 60s 窗） */
 #define PM_TIER2_CAP 6000u   /**< 1.25Hz × 4800s（覆盖最长 10min 窗） */
-#define PM_TIER1_DECIM 10u   /**< tier0→tier1：10 点均值（500/10=50Hz） */
+#define PM_TIER1_DECIM 80u   /**< tier0→tier1：80 点均值（4000/80=50Hz，tier1 速率与旧版一致） */
 #define PM_TIER2_DECIM 40u   /**< tier1→tier2：40 点均值（50/40=1.25Hz） */
 
 typedef struct {
@@ -522,7 +524,7 @@ static void wave_push_sample(float v, float i)
     wave_point_t pt = { .v = fv, .i = fi, .p = fv * fi, .e = e_now, .t_ms = now_ms };
     ring_push(&s_tier[0], &pt);
 
-    /* tier0→tier1：每 10 个 tier0 样本求均值压成 1 点（500Hz→50Hz） */
+    /* tier0→tier1：每 80 个 tier0 样本求均值压成 1 点（4000Hz→50Hz） */
     s_tier1_acc.v += fv;
     s_tier1_acc.i += fi;
     s_tier1_acc.p += pt.p;
@@ -677,10 +679,12 @@ static void save_persist(void)
 }
 
 /* ============================================================
- * 采样任务（Core1，500Hz，DRDY 自节奏）
+ * 采样任务（Core1，4kHz，DRDY 自节奏）
  * ============================================================ */
 #define PM_SAMPLE_STACK   4096  /**< 采样任务栈（IDF 中单位是字节，不是 FreeRTOS 原生的"字"） */
-#define PM_SAMPLE_PRIO    22    /**< 采样任务优先级：高，保证不被 UI 任务抢占丢帧 */
+#define PM_SAMPLE_PRIO    24    /**< 采样任务优先级：全系统最高（合法上限 24，FreeRTOS
+                                 *  configMAX_PRIORITIES=25 即 0~24；M1 基线兜底路线，
+                                 *  保证 DRDY→读帧启动延迟 δ 抖动最小、不被 UI 抢占丢帧） */
 #define PM_AUX_STACK      6144  /**< 辅助任务栈（I2C/浮点日志用得多，给大些） */
 #define PM_AUX_PRIO       5     /**< 辅助任务优先级：低，慢 I2C 不该抢测量 */
 #define PM_AUX_PERIOD_MS  2000  /**< 温湿度/电池采集周期（ms） */
@@ -693,8 +697,8 @@ static void save_persist(void)
  * 只有 ~310-320Hz 且抖动——根因是 DRDY 抑制机制（SBAS853 §8.5.1.5：读帧
  * 期间完成的转换其 DRDY 被吞），并非 MCLK/晶振异常。原方案"每 100 个
  * 有效样本开一窗"在 310Hz 下被拖到 ~2.6Hz（即用户所见"首页刷新率低/
- * 数据不动"的根源）。改为每 25ms 强制输出一帧即时均值：500Hz 时约
- * 12 样本/帧，UI 恒定 40Hz 有数据；且样本数波动/丢帧不影响刷新节奏。 */
+ * 数据不动"的根源）。改为每 25ms 强制输出一帧即时均值：4000Hz 时约
+ * 100 样本/帧，UI 恒定 40Hz 有数据；且样本数波动/丢帧不影响刷新节奏。 */
 #define PM_DISPLAY_SUBWINDOW_US 25000ull
 
 /**
