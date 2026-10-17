@@ -64,7 +64,9 @@
 
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
+#include "esp_heap_caps.h"
 #include "esp_http_server.h"
+#include "esp_timer.h"
 #include "esp_log.h"
 
 #include "data_store.h"
@@ -479,12 +481,15 @@ static esp_err_t root_get_handler(httpd_req_t *req)
     return httpd_resp_sendstr(req, web_console_page_html);
 }
 
+static void hist_tick(void); /* 前向声明（定义见下方历史记录模块） */
+
 /** GET /api/state：当前测量快照 */
 static esp_err_t api_state_get_handler(httpd_req_t *req)
 {
     char json[WEB_CONSOLE_JSON_BUF_LEN];
     esp_err_t err = build_state_json(json, sizeof(json));
     if (err == ESP_OK) {
+        hist_tick(); /* F9：轮询场景也捎带记录（WS 未启用时的唯一节拍来源） */
         return send_json(req, HTTPD_200, json);
     }
     if (err == ESP_ERR_INVALID_STATE) {
@@ -493,6 +498,74 @@ static esp_err_t api_state_get_handler(httpd_req_t *req)
     }
     return send_json(req, HTTPD_500,
                      "{\"ok\":false,\"code\":\"internal\",\"msg\":\"build json failed\"}");
+}
+
+/* ============================ 历史记录与 CSV 导出（F9） ============================
+ * 分钟级内存环：每 60s 记一帧快照，保留 60 点（1 小时），GET /api/export.csv
+ * 逐行分块输出。记录挂在快照 JSON 生成路径上（ws 推送与 /api/state 都会走到），
+ * 用墙钟节拍去重，WS 未启用/页面轮询场景同样有数据。
+ * 历史不落 Flash：写存储限频与寿命管理在 v1.0.0「连续记录」再做，本版先满足
+ * 「带走最近一小时数据」的最小导出需求。 */
+#define HIST_POINTS 60
+typedef struct {
+    int64_t ts_us;   /* 记录时刻（esp_timer µs，导出时转分钟相对时） */
+    data_store_snapshot_t snap;
+} hist_point_t;
+static hist_point_t s_hist[HIST_POINTS];
+static int s_hist_head = 0;   /* 下一个写入位 */
+static int s_hist_count = 0;
+static int64_t s_hist_last_us = 0;
+
+/** 快照历史记录（墙钟 60s 节拍；由快照生成路径捎带触发） */
+static void hist_tick(void)
+{
+    data_store_snapshot_t snap;
+    if (data_store_get(&snap) != ESP_OK) {
+        return;
+    }
+    const int64_t now = esp_timer_get_time();
+    if (s_hist_last_us != 0 && (now - s_hist_last_us) < 60 * 1000000LL) {
+        return;
+    }
+    s_hist_last_us = now;
+    s_hist[s_hist_head].ts_us = now;
+    s_hist[s_hist_head].snap = snap;
+    s_hist_head = (s_hist_head + 1) % HIST_POINTS;
+    if (s_hist_count < HIST_POINTS) {
+        s_hist_count++;
+    }
+}
+
+/** GET /api/export.csv：导出分钟级历史（text/csv，附件下载） */
+static esp_err_t api_export_csv_handler(httpd_req_t *req)
+{
+    hist_tick(); /* 导出前顺手补一帧最新，保证含"此刻" */
+    httpd_resp_set_type(req, "text/csv");
+    httpd_resp_set_hdr(req, "Content-Disposition", "attachment; filename=\"xt60-history.csv\"");
+
+    /* 表头 + 逐行分块发送（60 行约 6KB，chunk 避免大缓冲） */
+    char line[160];
+    snprintf(line, sizeof(line),
+             "t_min,voltage_v,current_a,power_w,energy_wh,capacity_ah,temp_c,humidity_pct,"
+             "battery_mv,runtime_s\r\n");
+    if (httpd_resp_send_chunk(req, line, HTTPD_RESP_USE_STRLEN) != ESP_OK) {
+        return ESP_FAIL;
+    }
+    const int base_idx = (s_hist_head - s_hist_count + HIST_POINTS) % HIST_POINTS;
+    const int64_t base = (s_hist_count > 0) ? s_hist[base_idx].ts_us : 0;
+    for (int k = 0; k < s_hist_count; k++) {
+        const hist_point_t *h = &s_hist[(base_idx + k) % HIST_POINTS];
+        const double t_min = (double)(h->ts_us - base) / 60000000.0;
+        snprintf(line, sizeof(line), "%.2f,%.3f,%.4f,%.3f,%.4f,%.4f,%.1f,%.0f,%u,%u\r\n",
+                 t_min, (double)h->snap.voltage_v, (double)h->snap.current_a,
+                 (double)h->snap.power_w, (double)h->snap.energy_wh, (double)h->snap.capacity_ah,
+                 (double)h->snap.temperature_c, (double)h->snap.humidity_pct,
+                 (unsigned)h->snap.battery_mv, (unsigned)h->snap.runtime_s);
+        if (httpd_resp_send_chunk(req, line, HTTPD_RESP_USE_STRLEN) != ESP_OK) {
+            return ESP_FAIL;
+        }
+    }
+    return httpd_resp_send_chunk(req, NULL, 0); /* 结束块 */
 }
 
 /** POST /api/config：JSON 键值对 → 注册的回调 */
@@ -736,6 +809,7 @@ static void ws_push_task(void *arg)
         if (build_state_json(json, sizeof(json)) == ESP_OK) {
             ws_broadcast(json);
         }
+        hist_tick(); /* F9：分钟级历史记录（内部 60s 墙钟节拍去重） */
         vTaskDelay(pdMS_TO_TICKS(WEB_CONSOLE_PUSH_PERIOD_MS));
     }
 
@@ -782,7 +856,7 @@ esp_err_t web_console_start(void)
     httpd_config_t config = HTTPD_DEFAULT_CONFIG();
     config.server_port = WEB_CONSOLE_PORT;
     config.max_open_sockets = WEB_CONSOLE_MAX_CLIENTS;
-    config.max_uri_handlers = 4; /* / 、/ws 、/api/state 、/api/config */
+    config.max_uri_handlers = 5; /* / 、/ws 、/api/state 、/api/config 、/api/export.csv */
     config.max_resp_headers = 4;
     config.stack_size = 6144;    /* URI 处理器要拼 JSON + 回调上层写 NVS，比默认 4096 留宽些 */
     config.lru_purge_enable = true; /* 连接满时淘汰最久未用的，避免僵尸会话占坑 */
@@ -805,6 +879,12 @@ esp_err_t web_console_start(void)
         .uri = "/api/state",
         .method = HTTP_GET,
         .handler = api_state_get_handler,
+    };
+    static const httpd_uri_t uri_export = {
+        .uri = "/api/export.csv",
+        .method = HTTP_GET,
+        .handler = api_export_csv_handler,
+        .user_ctx = NULL,
     };
     static const httpd_uri_t uri_config = {
         .uri = "/api/config",
@@ -829,7 +909,8 @@ esp_err_t web_console_start(void)
     if (httpd_register_uri_handler(server, &uri_root) != ESP_OK ||
         httpd_register_uri_handler(server, &uri_ws) != ESP_OK ||
         httpd_register_uri_handler(server, &uri_state) != ESP_OK ||
-        httpd_register_uri_handler(server, &uri_config) != ESP_OK) {
+        httpd_register_uri_handler(server, &uri_config) != ESP_OK ||
+        httpd_register_uri_handler(server, &uri_export) != ESP_OK) {
         ESP_LOGE(TAG, "URI 注册失败");
         httpd_stop(server);
         return ESP_FAIL;
@@ -840,9 +921,14 @@ esp_err_t web_console_start(void)
 #if CONFIG_HTTPD_WS_SUPPORT
     s_push_stop_req = false;
     TaskHandle_t task = NULL;
-    if (xTaskCreatePinnedToCore(ws_push_task, "web_console_ws",
-                                WEB_CONSOLE_PUSH_TASK_STACK, NULL,
-                                WEB_CONSOLE_PUSH_TASK_PRIO, &task, 0) != pdPASS) {
+    /* 任务栈放 PSRAM（MALLOC_CAP_SPIRAM）：WS 推送任务不做 ISR 相关操作，
+     * 不需要内部 RAM 栈；内部 RAM 仅剩极少余量（v0.5.0 实测），4KB 内部栈
+     * 会创建失败（ESP_ERR_NO_MEM）。⚠ 测量采样任务仍必须内部 RAM 栈
+     * （见架构文档：ISR 在任务栈上运行且不能访问 PSRAM）。 */
+    if (xTaskCreatePinnedToCoreWithCaps(ws_push_task, "web_console_ws",
+                                        WEB_CONSOLE_PUSH_TASK_STACK, NULL,
+                                        WEB_CONSOLE_PUSH_TASK_PRIO, &task, 0,
+                                        MALLOC_CAP_SPIRAM) != pdPASS) {
         ESP_LOGE(TAG, "WS 推送任务创建失败");
         s_server = NULL;
         httpd_stop(server);

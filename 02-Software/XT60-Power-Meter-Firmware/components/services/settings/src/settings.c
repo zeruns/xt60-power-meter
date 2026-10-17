@@ -60,6 +60,9 @@ static const char *TAG = "settings";
 #define SETTINGS_KEY_ORIENT_ANG "orient_d"
 #define SETTINGS_KEY_WAVE_SMOOTH "wave_smt"
 #define SETTINGS_KEY_ALARM "alarm_cfg" /**< 告警阈值（settings_alarm_t blob） */
+#define SETTINGS_KEY_WAVE_WIN "wave_win"   /**< 波形时间窗档位（B20） */
+#define SETTINGS_KEY_WAVE_MODE "wave_mode" /**< 波形显示模式（B20） */
+#define SETTINGS_KEY_SCR_OFF "scr_off"     /**< 自动息屏档位（F4） */
 
 /** 告警阈值出厂默认（全部关闭，阈值按前端满量程给合理上限） */
 #define SETTINGS_ALARM_V_LIMIT_DEF 15.0f
@@ -167,6 +170,9 @@ static void load_defaults(settings_t *cfg)
     cfg->orientation_auto = 0;   /* 出厂手动方向（横屏 0°），避免开机乱转 */
     cfg->orientation_angle = 0;  /* 默认横屏 */
     cfg->wave_smooth = 0; /* 波形曲线平滑默认关（忠实反映原始趋势） */
+    cfg->wave_window = 1;    /* 波形默认 10s 窗（B20） */
+    cfg->wave_mode = 3;      /* 波形默认电压+电流模式（PM_WAVE_MODE_VI=3，与旧版 UI 一致） */
+    cfg->screen_off_s = 0;   /* 默认永不自动息屏（F4） */
 }
 
 /**
@@ -287,6 +293,20 @@ static void load_from_nvs(void)
         s_cache.wave_smooth = smooth ? 1u : 0u;
     }
 
+    /* ---- 波形时间窗/显示模式 + 息屏档位（B20/F4）---- */
+    uint8_t ww = 0;
+    if (nvs_get_u8(handle, SETTINGS_KEY_WAVE_WIN, &ww) == ESP_OK && ww <= 5u) {
+        s_cache.wave_window = ww;
+    }
+    uint8_t wm = 0;
+    if (nvs_get_u8(handle, SETTINGS_KEY_WAVE_MODE, &wm) == ESP_OK && wm <= 4u) {
+        s_cache.wave_mode = wm;
+    }
+    uint8_t so = 0;
+    if (nvs_get_u8(handle, SETTINGS_KEY_SCR_OFF, &so) == ESP_OK && so <= 3u) {
+        s_cache.screen_off_s = so;
+    }
+
     /* ---- 告警阈值（blob）----
      * nvs_get_blob：按键读出一整块二进制数据；长度不符说明是旧布局，
      * 保持出厂默认（全部关闭）更安全。 */
@@ -348,6 +368,15 @@ static esp_err_t persist_cache(void)
     }
     if (err == ESP_OK) {
         err = nvs_set_u8(handle, SETTINGS_KEY_WAVE_SMOOTH, s_cache.wave_smooth);
+    }
+    if (err == ESP_OK) {
+        err = nvs_set_u8(handle, SETTINGS_KEY_WAVE_WIN, s_cache.wave_window);
+    }
+    if (err == ESP_OK) {
+        err = nvs_set_u8(handle, SETTINGS_KEY_WAVE_MODE, s_cache.wave_mode);
+    }
+    if (err == ESP_OK) {
+        err = nvs_set_u8(handle, SETTINGS_KEY_SCR_OFF, s_cache.screen_off_s);
     }
     if (err == ESP_OK) {
         err = nvs_set_blob(handle, SETTINGS_KEY_ALARM, &s_alarm_cache, sizeof(s_alarm_cache));
@@ -769,4 +798,80 @@ esp_err_t settings_set_alarm(const settings_alarm_t *in)
     /* 与其他设置一致走防抖落盘（频繁拖动阈值滑条不烧 Flash） */
     mark_dirty_and_schedule();
     return ESP_OK;
+}
+
+esp_err_t settings_set_wave_window(uint8_t window)
+{
+    if (!s_ready) {
+        return ESP_ERR_INVALID_STATE;
+    }
+    if (window > 5u) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    portENTER_CRITICAL(&s_lock);
+    s_cache.wave_window = window;
+    portEXIT_CRITICAL(&s_lock);
+    mark_dirty_and_schedule();
+    return ESP_OK;
+}
+
+esp_err_t settings_set_wave_mode(uint8_t mode)
+{
+    if (!s_ready) {
+        return ESP_ERR_INVALID_STATE;
+    }
+    if (mode > 4u) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    portENTER_CRITICAL(&s_lock);
+    s_cache.wave_mode = mode;
+    portEXIT_CRITICAL(&s_lock);
+    mark_dirty_and_schedule();
+    return ESP_OK;
+}
+
+esp_err_t settings_set_screen_off(uint8_t level)
+{
+    if (!s_ready) {
+        return ESP_ERR_INVALID_STATE;
+    }
+    if (level > 3u) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    portENTER_CRITICAL(&s_lock);
+    s_cache.screen_off_s = level;
+    portEXIT_CRITICAL(&s_lock);
+    mark_dirty_and_schedule();
+    return ESP_OK;
+}
+
+esp_err_t settings_restore_factory(void)
+{
+    if (!s_ready) {
+        return ESP_ERR_INVALID_STATE;
+    }
+    /* 擦除 xt60cfg 整命名空间（含告警阈值 blob 与全部用户偏好）；
+     * 标定在 pm 命名空间由 power_measure 自管，此处不触碰（保留） */
+    nvs_handle_t h;
+    esp_err_t err = nvs_open(SETTINGS_NVS_NAMESPACE, NVS_READWRITE, &h);
+    if (err == ESP_OK) {
+        err = nvs_erase_all(h);
+        if (err == ESP_OK) {
+            err = nvs_commit(h);
+        }
+        nvs_close(h);
+    }
+    /* 无论 NVS 操作成败，内存缓存都回出厂默认（立即生效） */
+    portENTER_CRITICAL(&s_lock);
+    load_defaults(&s_cache);
+    alarm_defaults(&s_alarm_cache);
+    portEXIT_CRITICAL(&s_lock);
+    s_dirty = false; /* 擦除后无需再落默认值（下次改动自然写入） */
+    esp_timer_stop(s_save_timer);
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "恢复出厂：NVS 擦除失败（%s），仅内存已回默认", esp_err_to_name(err));
+    } else {
+        ESP_LOGI(TAG, "恢复出厂完成：用户设置已清空并回到出厂默认");
+    }
+    return err;
 }

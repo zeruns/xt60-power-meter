@@ -62,6 +62,10 @@ typedef struct {
     uint8_t orientation_auto; /**< 屏幕是否随重力自动旋转（1=自动，0=手动，出厂默认 0） */
     uint16_t orientation_angle; /**< 手动方向角度（0/90/180/270，默认 0=横屏） */
     uint8_t wave_smooth; /**< 波形曲线平滑（1=开启，0=关闭，出厂默认 0） */
+    /* ---- v0.5.0 新增（B20 波形持久化 / F4 息屏）---- */
+    uint8_t wave_window; /**< 波形时间窗档位（0=1s 1=10s 2=30s 3=60s 4=120s 5=10min，默认 1=10s） */
+    uint8_t wave_mode;   /**< 波形显示模式（0~4 与 PM_WAVE_MODE_* 对应，默认 0） */
+    uint8_t screen_off_s; /**< 自动息屏时长档位（0=永不 1=30s 2=60s 3=120s，默认 0） */
 } settings_t;
 
 /**
@@ -178,3 +182,33 @@ esp_err_t settings_get_alarm(settings_alarm_t *out);
  * @return ESP_OK 成功；ESP_ERR_INVALID_ARG 参数非法；ESP_ERR_INVALID_STATE 尚未初始化
  */
 esp_err_t settings_set_alarm(const settings_alarm_t *in);
+
+/**
+ * @brief 更新波形时间窗档位（掉电保留，B20）
+ * @param window 0~5（1s/10s/30s/60s/120s/10min）
+ */
+esp_err_t settings_set_wave_window(uint8_t window);
+
+/**
+ * @brief 更新波形显示模式（掉电保留，B20）
+ * @param mode 0~4
+ */
+esp_err_t settings_set_wave_mode(uint8_t mode);
+
+/**
+ * @brief 更新自动息屏档位（F4）
+ * @param level 0=永不 1=30s 2=60s 3=120s
+ */
+esp_err_t settings_set_screen_off(uint8_t level);
+
+/**
+ * @brief 恢复出厂设置（F6）：清空用户设置（NVS xt60cfg 整命名空间）并
+ * 恢复内存缓存为出厂默认值
+ *
+ * 调用方负责编排其余动作：电能/容量清零走 power_measure_reset_energy()，
+ * WiFi 凭据清空走 wifi_manager_forget()，**标定参数保留**（仪器属性）。
+ * 清空后立即生效，无需重启。
+ *
+ * @return ESP_OK 成功；ESP_ERR_INVALID_STATE 尚未初始化
+ */
+esp_err_t settings_restore_factory(void);
