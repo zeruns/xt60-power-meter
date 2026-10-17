@@ -4,10 +4,14 @@
  */
 #include "app_tasks.h"
 
+#include <stdlib.h>
+#include <string.h>
+
 #include "ads131m02.h"
 #include "data_store.h"
 #include "lvgl_port.h"
 #include "power_measure.h"
+#include "settings.h"
 #include "system_state.h"
 #include "ui.h"
 
@@ -17,6 +21,10 @@
 #include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
+
+#include "ota_update.h"
+#include "web_console.h"
+#include "wifi_manager.h"
 
 /** 日志标签 */
 static const char *TAG = "app_task";
@@ -142,6 +150,18 @@ static void task_sys_monitor(void *arg)
             }
         }
 
+        /* --- 引擎统计（M5 验收取数口径：drop/超时/δ，见 ads131m02.h）---
+         * 判读：drop 与 超时 应为 0 或极小；δ max 远小于 250µs 转换周期；
+         * crc_fail 持续增长提示帧错位（需重同步）。 */
+        {
+            ads131m02_stats_t est;
+            ads131m02_get_stats(&est);
+            ESP_LOGI(TAG, "引擎: kick=%u drop=%u read_ok=%u crc_fail=%u 超时=%u δ min/avg/max=%u/%u/%uµs",
+                     (unsigned)est.edge_ok, (unsigned)est.edge_busy, (unsigned)est.read_ok,
+                     (unsigned)est.crc_fail, (unsigned)est.read_timeout, (unsigned)est.lat_min_us,
+                     (unsigned)est.lat_avg_us, (unsigned)est.lat_max_us);
+        }
+
         /* --- 测量数据链路 ---
          * data_store 尚无数据时返回 ESP_ERR_INVALID_STATE，
          * 这是"测量核还没开始工作"的正常表现，不算故障。 */
@@ -155,6 +175,96 @@ static void task_sys_monitor(void *arg)
         }
 
         vTaskDelay(pdMS_TO_TICKS(CONFIG_APP_SYS_MONITOR_PERIOD_MS));
+    }
+}
+
+/**
+ * @brief web_console 参数下发回调：把网页键值对写进 settings（v0.5.0 联网数据版）
+ *
+ * 支持键：alarm_v_en/alarm_i_en/alarm_p_en（0/1）、alarm_v_limit/alarm_i_limit/
+ * alarm_p_limit（float）、buzzer_volume/lcd_brightness/display_rate_hz。
+ * 在 httpd 任务执行，只做内存缓存写 + 防抖落盘（settings_set_* 内部已防抖）。
+ */
+static esp_err_t web_config_handler(const char *key, const char *value)
+{
+    if (key == NULL || value == NULL) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    settings_alarm_t alm;
+    settings_t cfg;
+
+    if (strcmp(key, "alarm_v_en") == 0 || strcmp(key, "alarm_i_en") == 0 ||
+        strcmp(key, "alarm_p_en") == 0) {
+        if (settings_get_alarm(&alm) != ESP_OK) {
+            return ESP_ERR_INVALID_STATE;
+        }
+        uint8_t on = (uint8_t)atoi(value);
+        if (strcmp(key, "alarm_v_en") == 0) {
+            alm.v_en = on;
+        } else if (strcmp(key, "alarm_i_en") == 0) {
+            alm.i_en = on;
+        } else {
+            alm.p_en = on;
+        }
+        return settings_set_alarm(&alm);
+    }
+    if (strcmp(key, "alarm_v_limit") == 0 || strcmp(key, "alarm_i_limit") == 0 ||
+        strcmp(key, "alarm_p_limit") == 0) {
+        if (settings_get_alarm(&alm) != ESP_OK) {
+            return ESP_ERR_INVALID_STATE;
+        }
+        float v = strtof(value, NULL);
+        if (strcmp(key, "alarm_v_limit") == 0) {
+            alm.v_limit = v;
+        } else if (strcmp(key, "alarm_i_limit") == 0) {
+            alm.i_limit = v;
+        } else {
+            alm.p_limit = v;
+        }
+        return settings_set_alarm(&alm);
+    }
+    if (strcmp(key, "buzzer_volume") == 0) {
+        return settings_set_buzzer_volume((uint8_t)atoi(value));
+    }
+    if (strcmp(key, "lcd_brightness") == 0) {
+        return settings_set_lcd_brightness((uint8_t)atoi(value));
+    }
+    if (strcmp(key, "display_rate_hz") == 0) {
+        return settings_set_display_rate_hz((uint8_t)atoi(value));
+    }
+    (void)cfg;
+    return ESP_ERR_NOT_FOUND;
+}
+
+/**
+ * @brief 启动联网数据服务（v0.5.0）：WiFi 状态机 + Web 控制台 + OTA 回滚检查
+ *
+ * 全部非关键：任一步失败只记录日志降级运行，测量/显示不受影响。
+ * WiFi 启动后（含 AP 配网模式）即可访问 Web 控制台；HTTP 服务本身
+ * 不依赖 STA 已连接——AP 模式下手机直连热点也能配网/读数。
+ */
+static void net_services_start(void)
+{
+    /* OTA 回滚检查（最早做：新固件启动失败自动回滚，见 ota_update.h） */
+    esp_err_t oerr = ota_update_rollback_if_pending();
+    if (oerr != ESP_OK) {
+        ESP_LOGW(TAG, "OTA 回滚检查异常: %s", esp_err_to_name(oerr));
+    } else {
+        ESP_LOGI(TAG, "OTA 回滚检查完成，当前版本 %s", ota_update_get_current_version());
+    }
+
+    /* WiFi 管理：有凭据走 STA，无凭据进 AP 配网模式 */
+    esp_err_t werr = wifi_manager_start();
+    if (werr != ESP_OK) {
+        ESP_LOGW(TAG, "WiFi 启动失败（降级为离线运行）: %s", esp_err_to_name(werr));
+        return;
+    }
+
+    /* 参数下发回调注入（web → settings），再拉起 Web 控制台 */
+    (void)web_console_set_config_handler(web_config_handler);
+    esp_err_t cerr = web_console_start();
+    if (cerr != ESP_OK) {
+        ESP_LOGW(TAG, "Web 控制台启动失败: %s", esp_err_to_name(cerr));
     }
 }
 
@@ -200,6 +310,12 @@ esp_err_t app_tasks_start(void)
         ESP_LOGE(TAG, "创建 sys_monitor 任务失败（栈 %d 字节）", CONFIG_APP_SYS_MONITOR_STACK);
         return ESP_ERR_NO_MEM;
     }
+
+    /* ---- 联网数据服务（v0.5.0）：非关键，失败降级离线运行 ----
+     * ⚠ 必须在测量与 UI 任务之后启动：WiFi 栈 + LWIP + HTTP 启动会占用大量
+     * RAM，若先启动会挤掉 UI 的内存（实测 ESP_ERR_NO_MEM -> UI 无界面运行）。
+     * 先让测量/UI 各自占好内存，联网最后进场。 */
+    net_services_start();
 
     ESP_LOGI(TAG, "应用任务创建完成（巡检任务绑定 Core %d，周期 %d ms）", APP_CORE_UI,
              CONFIG_APP_SYS_MONITOR_PERIOD_MS);

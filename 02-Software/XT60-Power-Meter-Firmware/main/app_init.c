@@ -35,6 +35,7 @@
 #include "system_state.h"
 #include "touch_cst816d.h"
 
+#include "esp_core_dump.h"
 #include "esp_log.h"
 
 /** 日志标签 */
@@ -310,6 +311,18 @@ static bool run_selftest(bool *critical_failed)
 
 esp_err_t app_init_startup(void)
 {
+    /* ---- 崩溃取证（B16）：上次 panic 留有 coredump 就开机打印摘要 ----
+     * coredump 分区"只写不读"的闭环补全：过去崩溃要手动跑 espcoredump.py
+     * 才知道发生了什么，现在开机即见「哪个任务、哪个 PC 崩的」。
+     * 摘要读取失败（无转储/分区损坏）静默跳过，不影响启动。 */
+    {
+        esp_core_dump_summary_t cs;
+        if (esp_core_dump_get_summary(&cs) == ESP_OK) {
+            ESP_LOGW(TAG, "检测到上次崩溃转储：任务=%s PC=0x%08lx（完整现场可用 "
+                          "espcoredump.py 从 coredump 分区提取）",
+                     cs.exc_task, (unsigned long)cs.exc_pc);
+        }
+    }
     bool critical_failed = false;
 
     ESP_LOGI(TAG, "开始系统初始化（共 %u 个步骤）", (unsigned)BOOT_STEP_COUNT);
