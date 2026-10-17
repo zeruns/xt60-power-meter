@@ -428,7 +428,7 @@ opcode 封装与约 200 条分页式初始化序列都由组件负责，**驱动
 | `components/middleware/lvgl_port/` | 应用侧适配：字体（SPIFFS→PSRAM）、触摸 indev、首帧计数、旋转；LVGL 内核/任务/心跳/锁/显示由官方 `espressif/esp_lvgl_port` 提供 |
 | `components/middleware/fs_storage/` | storage 分区挂为 `/spiffs`，字体镜像（`spiffs_create_partition_image`） |
 | `components/services/ui/` | 启动页 + 测量/波形/设置三页（tileview/chart/roller 官方组件） |
-| `components/services/power_measure/` | 4kHz 采样、RMS/功率/电能、三级波形缓冲、NVS 掉电保存 |
+| `components/services/power_measure/` | 4kHz 采样、块均值/功率/电能/容量（直流口径非 RMS）、三级波形缓冲、NVS 掉电保存 |
 
 ### 字体方案（OFL Noto Sans SC，文件系统存放）
 
@@ -457,7 +457,7 @@ opcode 封装与约 200 条分页式初始化序列都由组件负责，**驱动
 - Core1 采样任务由 DRDY 自节奏，每样本做标定换算并写 PSRAM 三级环形缓冲：
   tier0 4000Hz×4000（1s 窗）、tier1 50Hz×24000（480s，覆盖 60s 窗）、
   tier2 1.25Hz×6000（80min，覆盖 10min 窗）；
-  每 200ms（墙钟，约 800 样本）输出一帧 V/I 真有效值、平均功率与积分电能到 data_store。
+  每 200ms（墙钟，约 800 样本）输出一帧 V/I 块均值（直流口径）、平均功率与积分电能到 data_store。
 - 温湿度/电池由 Core0 辅助任务 2s 采集一次，在块边界由采样任务合并进快照
   （维持 data_store 单写者）；电能/运行时间每 30s 落 NVS，启动恢复。
 
