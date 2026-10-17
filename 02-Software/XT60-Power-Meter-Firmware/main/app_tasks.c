@@ -193,6 +193,38 @@ static esp_err_t web_config_handler(const char *key, const char *value)
     settings_alarm_t alm;
     settings_t cfg;
 
+    /* ---- F7 配网 API：wifi_ssid / wifi_pass 成对下发 → STA 连接 ----
+     * 两键到齐才发起连接（JSON 体内先后顺序不限）；空密码网络 pass 允许为空
+     * 字符串。wifi_manager_connect() 内部等待连接结果（最长约 15s），会占用
+     * httpd 任务一段时间——配网页单次提交场景可接受，且连接成功后设备将离开
+     * AP 模式，本次连接本身也即将断开。凭据由 wifi_manager 持久化（NVS wifi）。 */
+    {
+        static char s_pending_ssid[33] = "";
+        static char s_pending_pass[65] = "";
+        static bool s_pass_seen = false; /* 区分「没收到 pass」与「pass 为空密码」 */
+        bool wifi_touched = false;
+        if (strcmp(key, "wifi_ssid") == 0) {
+            snprintf(s_pending_ssid, sizeof(s_pending_ssid), "%s", value);
+            wifi_touched = true;
+        } else if (strcmp(key, "wifi_pass") == 0) {
+            snprintf(s_pending_pass, sizeof(s_pending_pass), "%s", value);
+            s_pass_seen = true;
+            wifi_touched = true;
+        }
+        /* 两键到齐（顺序不限）即发起连接 */
+        if (wifi_touched && s_pending_ssid[0] != '\0' && s_pass_seen) {
+            ESP_LOGI(TAG, "配网下发：%s，发起 STA 连接", s_pending_ssid);
+            esp_err_t werr = wifi_manager_connect(s_pending_ssid, s_pending_pass);
+            s_pending_ssid[0] = '\0';
+            s_pending_pass[0] = '\0';
+            s_pass_seen = false;
+            return werr;
+        }
+        if (wifi_touched) {
+            return ESP_OK; /* 只到齐一半，等另一半 */
+        }
+    }
+
     if (strcmp(key, "alarm_v_en") == 0 || strcmp(key, "alarm_i_en") == 0 ||
         strcmp(key, "alarm_p_en") == 0) {
         if (settings_get_alarm(&alm) != ESP_OK) {

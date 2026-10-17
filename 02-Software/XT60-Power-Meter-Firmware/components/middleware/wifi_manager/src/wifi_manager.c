@@ -103,6 +103,9 @@ static const char *TAG = "wifi_manager";
 /** 配网热点信道（2.4G 中间信道，干扰与覆盖的折中） */
 #define WIFI_MANAGER_AP_CHANNEL 6
 
+/** 配网热点密码（WPA2-PSK，≥8 字符）；量产改设备唯一码贴机身 */
+#define WIFI_MANAGER_AP_PASS "xt60config"
+
 /** 配网热点最多允许接入的终端数（配网场景 1~2 台，留点余量） */
 #define WIFI_MANAGER_AP_MAX_CONN 4
 
@@ -420,7 +423,11 @@ static esp_err_t enter_ap_mode(void)
     memcpy(ap_cfg.ap.ssid, s_ap_ssid, ap_len);
     ap_cfg.ap.ssid_len = (uint8_t)ap_len;
     ap_cfg.ap.channel = WIFI_MANAGER_AP_CHANNEL;
-    ap_cfg.ap.authmode = WIFI_AUTH_OPEN; /* 开放热点：配网期只求方便连接 */
+    /* WPA2-PSK 加密（不再用开放热点）：① Windows 对开放网络常静默拒绝连接
+     * （2026-10 实测扫描不到/连接即断）；② 开放热点会把配网通道暴露给任何
+     * 旁人。⚠ 量产应改为设备唯一密码（贴机身），此处为开发期统一密码。 */
+    ap_cfg.ap.authmode = WIFI_AUTH_WPA2_PSK;
+    strncpy((char *)ap_cfg.ap.password, WIFI_MANAGER_AP_PASS, sizeof(ap_cfg.ap.password) - 1);
     ap_cfg.ap.max_connection = WIFI_MANAGER_AP_MAX_CONN;
     ap_cfg.ap.ssid_hidden = 0;
 

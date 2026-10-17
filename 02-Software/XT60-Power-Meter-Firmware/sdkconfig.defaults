@@ -54,15 +54,15 @@ CONFIG_SPIRAM_BOOT_INIT=y
 # 对量产与售后排查很有价值。
 CONFIG_SPIRAM_MEMTEST=y
 CONFIG_SPIRAM_USE_MALLOC=y
-# 小于 1KB 的分配走内部 RAM；更大的走 PSRAM。
-# ⚠ 不能设太大（曾用 16KB/8KB）：WiFi static rx buffer（1600B/个）会被
-# 强制推入内部 RAM，而 esp_wifi 对该池要求 DMA 能力内存，实测
-# 「malloc buffer fail → Init static rx buffer num: 0」→ esp_wifi_init
-# 报 NO_MEM（内部 RAM 仍有数十 KB 空闲）；降到 1KB 后该池走 PSRAM。
-CONFIG_SPIRAM_MALLOC_ALWAYSINTERNAL=1024
-# 预留 16KB 内部 RAM 专供"必须从内部 RAM 分配"的场景（DMA 描述符等）
-# （32KB→16KB：同上实测调优；DMA 描述符等小对象远用不满 32KB）
-CONFIG_SPIRAM_MALLOC_RESERVE_INTERNAL=16384
+# 小于 512B 的分配走内部 RAM；更大的走 PSRAM。
+# ⚠ 阈值必须低于 WiFi beacon 缓冲（752B）：曾用 16KB/8KB/1KB 三档，均把
+# 752B beacon 缓冲强制推入内部 RAM →「alloc eb len=752 type=4 fail」→
+# beacon 发不出（配网热点扫不到）+ WiFi 驱动任务 NULL 解引用崩溃
+# （LoadProhibited @ wifi 任务，2026-10 上板实测）。降到 512 后该池走 PSRAM。
+CONFIG_SPIRAM_MALLOC_ALWAYSINTERNAL=512
+# 预留 8KB 内部 RAM 专供"必须从内部 RAM 分配"的场景（DMA 描述符等）
+# （32KB→16KB→8KB：WiFi 内存实测调优；大任务栈已移 PSRAM，预留可收窄）
+CONFIG_SPIRAM_MALLOC_RESERVE_INTERNAL=8192
 # 把 WiFi 与 LWIP 的收发缓冲放到 PSRAM：
 # WiFi 缓冲占用很大（数十 KB），放内部 RAM 会挤占采样与 DMA 所需空间。
 CONFIG_SPIRAM_TRY_ALLOCATE_WIFI_LWIP=y

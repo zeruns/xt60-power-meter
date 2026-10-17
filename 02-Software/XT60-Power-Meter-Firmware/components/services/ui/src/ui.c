@@ -681,13 +681,15 @@ esp_err_t ui_init(void)
         return ESP_ERR_INVALID_STATE;
     }
 
-    /* xTaskCreatePinnedToCore：创建 FreeRTOS 任务并绑定到指定 CPU 核。
-     * 参数依次为：入口函数、任务名、栈字节数、入参、优先级、句柄输出、目标核。
-     * UI 绑定 Core 0（交互核），测量任务在 Core 1，互不抢占。 */
-    BaseType_t ok = xTaskCreatePinnedToCore(task_ui, UI_TASK_NAME,
-                                            UI_TASK_STACK_BYTES, NULL,
-                                            UI_TASK_PRIORITY, NULL,
-                                            UI_TASK_CORE);
+    /* xTaskCreatePinnedToCoreWithCaps：创建任务并绑定 Core 0（交互核），栈放 PSRAM。
+     * ⚠ UI 任务不做 ISR 相关操作（按键走事件队列），栈可以放 PSRAM；
+     * WiFi 全开后内部 RAM 仅剩百字节级（phy_track_pll_init 的 esp_timer_create
+     * 实测 NO_MEM 崩溃），12KB 大栈必须让位给 WiFi/PHY 的内部刚性需求。
+     * 测量采样任务仍保持内部 RAM 栈（ISR 在其栈上运行，见架构文档）。 */
+    BaseType_t ok = xTaskCreatePinnedToCoreWithCaps(task_ui, UI_TASK_NAME,
+                                                    UI_TASK_STACK_BYTES, NULL,
+                                                    UI_TASK_PRIORITY, NULL,
+                                                    UI_TASK_CORE, MALLOC_CAP_SPIRAM);
     if (ok != pdPASS) {
         ESP_LOGE(TAG, "创建 UI 任务失败（栈 %d 字节）", UI_TASK_STACK_BYTES);
         return ESP_ERR_NO_MEM;

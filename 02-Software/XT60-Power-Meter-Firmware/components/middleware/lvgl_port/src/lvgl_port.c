@@ -53,11 +53,12 @@ static const char *TAG = "lvgl_port";
 /** LVGL 心跳周期（毫秒）：交给官方 esp_lvgl_port 的 timer_period_ms */
 #define LVGL_PORT_TICK_MS 5
 
-/* 渲染缓冲块高度：PARTIAL 模式按行分块刷新。
- * 台阶1 优化（20 → 40 行）：减小 flush 次数、提升 DMA 效率与帧率。
- * 284*40*2 ≈ 22.7KB/缓冲；开启双缓冲（render 与 DMA 并行）后
- * 主缓冲×2 + 软件旋转缓冲×1 ≈ 68KB 内部 RAM，仍有充足余量。 */
-#define LVGL_PORT_BUF_ROWS 40
+/* 渲染缓冲块高度：PARTIAL 模式按行分块刷新（双缓冲，各 8 行，284*16*2≈9KB/个）。
+ * ⚠ 40→16（2026-10 WiFi 联调实测）：WiFi 稳态会吃掉约 85KB 内部 RAM，而
+ * phy_track_pll_init 的 esp_timer_create 要求 MALLOC_CAP_INTERNAL，内存耗尽
+ * 时 NO_MEM 崩溃；draw buffer 是内部 RAM 最大可压缩项（DMA 只读内部 RAM，
+ * 不能移 PSRAM）。渲染按 8 行小块提交，帧率略降但显示流水不变。 */
+#define LVGL_PORT_BUF_ROWS 16
 /** 软件旋转输出缓冲行数：与主缓冲等大（90/270° 旋转前后像素总数不变） */
 #define LVGL_PORT_SWROT_ROWS LVGL_PORT_BUF_ROWS
 /** LVGL 任务栈大小（字节）与优先级、绑定核（0=交互核） */
@@ -255,6 +256,11 @@ esp_err_t lvgl_port_app_init(void)
     cfg.task_affinity = LVGL_PORT_TASK_CORE;
     cfg.task_max_sleep_ms = 500;
     cfg.timer_period_ms = LVGL_PORT_TICK_MS;
+    /* LVGL 任务栈放 PSRAM（task_stack_caps 官方支持）：16KB 大栈是内部 RAM
+     * 大户，WiFi 全开后内部 RAM 仅剩百字节级（phy_track_pll_init 实测
+     * esp_timer_create NO_MEM 崩溃）。LVGL 渲染任务不做 ISR 操作
+     * （flush 的 DMA 完成回调在 ISR 自己的栈上），放 PSRAM 安全。 */
+    cfg.task_stack_caps = MALLOC_CAP_SPIRAM;
     esp_err_t err = lvgl_port_init(&cfg);
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "官方 LVGL 移植层初始化失败: %s", esp_err_to_name(err));
