@@ -60,7 +60,18 @@ typedef struct {
     float humidity_pct;  /**< 机内相对湿度（%） */
     uint32_t battery_mv; /**< 电池电压（mV），0 表示尚未采集到 */
     uint32_t runtime_s;  /**< 电能统计运行时间（秒，含掉电恢复部分） */
+    /* ---- 以下为 v0.2.0 新增（峰值 / 容量 / 告警，追加在尾部保持 seqlock 语义）---- */
+    float capacity_ah;   /**< 累计容量（Ah，含掉电恢复部分） */
+    float v_max, v_min;  /**< 本次上电电压峰/谷值（V） */
+    float i_max, i_min;  /**< 本次上电电流峰/谷值（A） */
+    float p_max, p_min;  /**< 本次上电功率峰/谷值（W） */
+    uint32_t alert_mask; /**< 当前越限状态位图（DATA_ALERT_*），0=无告警 */
 } data_store_snapshot_t;
+
+/** 越限告警位（alert_mask） */
+#define DATA_ALERT_OVP (1u << 0) /**< 过压 */
+#define DATA_ALERT_OCP (1u << 1) /**< 过流 */
+#define DATA_ALERT_OPP (1u << 2) /**< 过功率 */
 
 /**
  * @brief 初始化数据仓库

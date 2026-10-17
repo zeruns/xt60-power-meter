@@ -59,6 +59,12 @@ static const char *TAG = "settings";
 #define SETTINGS_KEY_ORIENT_AUTO "orient_a"
 #define SETTINGS_KEY_ORIENT_ANG "orient_d"
 #define SETTINGS_KEY_WAVE_SMOOTH "wave_smt"
+#define SETTINGS_KEY_ALARM "alarm_cfg" /**< 告警阈值（settings_alarm_t blob） */
+
+/** 告警阈值出厂默认（全部关闭，阈值按前端满量程给合理上限） */
+#define SETTINGS_ALARM_V_LIMIT_DEF 15.0f
+#define SETTINGS_ALARM_I_LIMIT_DEF 5.0f
+#define SETTINGS_ALARM_P_LIMIT_DEF 50.0f
 
 /** 防抖时长（毫秒）：最后一次修改后静默这么久才真正写 Flash */
 #define SETTINGS_SAVE_DELAY_MS     1500
@@ -96,6 +102,9 @@ static bool settings_rate_valid(uint8_t hz)
 
 /** 内存缓存：保存当前生效的配置 */
 static settings_t s_cache;
+
+/** 告警阈值内存缓存（blob 键 "alarm_cfg" 持久化，见 settings.h） */
+static settings_alarm_t s_alarm_cache;
 
 /** 是否已初始化 */
 static bool s_ready = false;
@@ -158,6 +167,19 @@ static void load_defaults(settings_t *cfg)
     cfg->orientation_auto = 0;   /* 出厂手动方向（横屏 0°），避免开机乱转 */
     cfg->orientation_angle = 0;  /* 默认横屏 */
     cfg->wave_smooth = 0; /* 波形曲线平滑默认关（忠实反映原始趋势） */
+}
+
+/**
+ * @brief 把告警阈值重置为出厂默认（全部关闭）
+ */
+static void alarm_defaults(settings_alarm_t *a)
+{
+    a->v_en = 0;
+    a->i_en = 0;
+    a->p_en = 0;
+    a->v_limit = SETTINGS_ALARM_V_LIMIT_DEF;
+    a->i_limit = SETTINGS_ALARM_I_LIMIT_DEF;
+    a->p_limit = SETTINGS_ALARM_P_LIMIT_DEF;
 }
 
 /**
@@ -265,6 +287,19 @@ static void load_from_nvs(void)
         s_cache.wave_smooth = smooth ? 1u : 0u;
     }
 
+    /* ---- 告警阈值（blob）----
+     * nvs_get_blob：按键读出一整块二进制数据；长度不符说明是旧布局，
+     * 保持出厂默认（全部关闭）更安全。 */
+    settings_alarm_t alarm;
+    size_t alen = sizeof(alarm);
+    if (nvs_get_blob(handle, SETTINGS_KEY_ALARM, &alarm, &alen) == ESP_OK &&
+        alen == sizeof(alarm)) {
+        s_alarm_cache = alarm;
+        ESP_LOGI(TAG, "已载入告警阈值（V:%u %.2fV I:%u %.2fA P:%u %.2fW）",
+                 (unsigned)alarm.v_en, (double)alarm.v_limit, (unsigned)alarm.i_en,
+                 (double)alarm.i_limit, (unsigned)alarm.p_en, (double)alarm.p_limit);
+    }
+
     /* nvs_close(句柄)：关闭命名空间句柄，释放 NVS 内部的缓存页占用。
      * 句柄用完必须关闭，否则会泄漏 NVS 句柄槽位 */
     nvs_close(handle);
@@ -313,6 +348,9 @@ static esp_err_t persist_cache(void)
     }
     if (err == ESP_OK) {
         err = nvs_set_u8(handle, SETTINGS_KEY_WAVE_SMOOTH, s_cache.wave_smooth);
+    }
+    if (err == ESP_OK) {
+        err = nvs_set_blob(handle, SETTINGS_KEY_ALARM, &s_alarm_cache, sizeof(s_alarm_cache));
     }
     if (err == ESP_OK) {
         /* nvs_set_xxx 只是写入 RAM 中的 NVS 页缓存，
@@ -436,6 +474,7 @@ esp_err_t settings_init(void)
     /* ① 先把缓存填上出厂默认值：这样即使后面 NVS 出问题，
      *    设备也一定能拿到一份合法配置继续运行（优雅降级） */
     load_defaults(&s_cache);
+    alarm_defaults(&s_alarm_cache);
 
     /* ② 创建防抖定时器（与 NVS 是否可用无关，先建好备用）。
      *    esp_timer_create_args_t 是定时器参数结构体：
@@ -689,4 +728,45 @@ esp_err_t settings_save_now(void)
         ESP_LOGI(TAG, "配置已立即保存");
     }
     return err;
+}
+
+esp_err_t settings_get_alarm(settings_alarm_t *out)
+{
+    if (out == NULL) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    if (!s_ready) {
+        return ESP_ERR_INVALID_STATE;
+    }
+    /* 缓存读取与 set 竞争，短临界区拷一份（24 字节，几条指令） */
+    portENTER_CRITICAL(&s_lock);
+    *out = s_alarm_cache;
+    portEXIT_CRITICAL(&s_lock);
+    return ESP_OK;
+}
+
+esp_err_t settings_set_alarm(const settings_alarm_t *in)
+{
+    if (in == NULL) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    if (!s_ready) {
+        return ESP_ERR_INVALID_STATE;
+    }
+    /* 校验：阈值必须是有限正数（拒绝 NaN/inf/≤0），非法输入整体拒绝保持原值 */
+    if (!(in->v_limit > 0.0f) || !(in->i_limit > 0.0f) || !(in->p_limit > 0.0f)) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    settings_alarm_t norm = *in;
+    norm.v_en = norm.v_en ? 1u : 0u;
+    norm.i_en = norm.i_en ? 1u : 0u;
+    norm.p_en = norm.p_en ? 1u : 0u;
+
+    portENTER_CRITICAL(&s_lock);
+    s_alarm_cache = norm;
+    portEXIT_CRITICAL(&s_lock);
+
+    /* 与其他设置一致走防抖落盘（频繁拖动阈值滑条不烧 Flash） */
+    mark_dirty_and_schedule();
+    return ESP_OK;
 }

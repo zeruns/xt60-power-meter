@@ -8,8 +8,11 @@
  * （test/host/test_power_calc.c）大量覆盖，比上板试错快两个数量级。
  *
  * 调用关系：power_measure.c 的 task_sample 每样本调用
- * power_calc_raw_to_value 换算 V/I，每 200ms 块调用 power_calc_energy_wh
- * 积分电能；本文件只做数学，不做任何 IO。
+ * power_calc_raw_to_value 换算 V/I；电能积分由 power_measure.c 内部以
+ * double 矩形积分完成（float 接口在 >1024Wh 后增量被舍入吞，故不走
+ * power_calc_energy_wh，见其注释）；power_calc_energy_wh / power_calc_power_w /
+ * power_calc_is_over_limit 目前由主机单元测试覆盖（固件未直接调用）。
+ * 本文件只做数学，不做任何 IO。
  */
 #include "power_calc.h"
 

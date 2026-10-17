@@ -99,11 +99,38 @@ static void on_system_state_changed(const app_event_t *event, void *user_ctx)
     apply_state_outputs(state);
 }
 
+/**
+ * @brief 测量告警事件处理（v0.2.0 仪器功能批 F3）
+ *
+ * 越限上升沿时鸣响错误提示音。持续越限期间测量核只在**状态变化**时
+ * 重发事件，因此这里一次事件 = 一声；不与 FAULT 长鸣竞争（FAULT 态优先）。
+ */
+static void on_measure_alert(const app_event_t *event, void *user_ctx)
+{
+    (void)user_ctx;
+    if (is_buzzer_broken()) {
+        return;
+    }
+    /* FAULT 态已有每秒长鸣，不再叠加告警音 */
+    if (system_state_get() == SYSTEM_STATE_FAULT) {
+        return;
+    }
+    uint32_t mask = event->data.alert.alert_mask;
+    ESP_LOGW(TAG, "测量告警：mask=0x%x V=%.2f I=%.2f", (unsigned)mask,
+             (double)event->data.alert.voltage_v, (double)event->data.alert.current_a);
+    (void)buzzer_play(BUZZER_TONE_ERROR);
+}
+
 esp_err_t device_ctrl_init(void)
 {
     /* ① 订阅系统状态变化事件 */
     esp_err_t err =
         event_bus_subscribe(APP_EVENT_SYSTEM_STATE_CHANGED, on_system_state_changed, NULL);
+    if (err != ESP_OK) {
+        return err;
+    }
+    /* ①b 订阅测量告警事件（v0.2.0 F3：越限→蜂鸣） */
+    err = event_bus_subscribe(APP_EVENT_MEASURE_ALERT, on_measure_alert, NULL);
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "订阅系统状态事件失败: %s", esp_err_to_name(err));
         return err;

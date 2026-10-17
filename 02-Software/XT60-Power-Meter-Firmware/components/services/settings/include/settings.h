@@ -65,6 +65,21 @@ typedef struct {
 } settings_t;
 
 /**
+ * @brief 告警阈值配置（v0.2.0 仪器功能批）
+ *
+ * 三项独立使能 + 阈值；判定在测量核块边界做（见 power_measure.c），
+ * 本结构只负责持久化用户设定。
+ */
+typedef struct {
+    uint8_t v_en;   /**< 过压告警使能（1=开启） */
+    uint8_t i_en;   /**< 过流告警使能 */
+    uint8_t p_en;   /**< 过功率告警使能 */
+    float v_limit;  /**< 过压阈值（V） */
+    float i_limit;  /**< 过流阈值（A） */
+    float p_limit;  /**< 过功率阈值（W） */
+} settings_alarm_t;
+
+/**
  * @brief 初始化配置服务：初始化 NVS 并把配置载入内存缓存
  *
  * 即使 NVS 不可用（首次上电、分区损坏等）也会成功返回——
@@ -146,3 +161,20 @@ esp_err_t settings_set_wave_smooth(uint8_t on);
  *         ESP_ERR_NVS_* NVS 写入失败（内存缓存仍然有效，不影响当前运行）
  */
 esp_err_t settings_save_now(void);
+
+/**
+ * @brief 读取当前告警阈值配置（内存缓存）
+ * @param out 输出，不可为 NULL
+ * @return ESP_OK 成功；ESP_ERR_INVALID_STATE 尚未初始化
+ */
+esp_err_t settings_get_alarm(settings_alarm_t *out);
+
+/**
+ * @brief 更新告警阈值配置：写入内存缓存并安排延迟落盘（防抖）
+ *
+ * 非法输入（阈值 ≤0、NaN/inf）拒绝并保持原值不变。
+ *
+ * @param in 新配置，不可为 NULL
+ * @return ESP_OK 成功；ESP_ERR_INVALID_ARG 参数非法；ESP_ERR_INVALID_STATE 尚未初始化
+ */
+esp_err_t settings_set_alarm(const settings_alarm_t *in);

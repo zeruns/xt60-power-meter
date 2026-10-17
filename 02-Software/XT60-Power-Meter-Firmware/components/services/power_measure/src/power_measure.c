@@ -82,7 +82,9 @@
 #include "aht20.h"
 #include "battery_adc.h"
 #include "data_store.h"
+#include "event_bus.h"
 #include "power_calc.h"
+#include "settings.h"
 #include "system_state.h"
 
 #include "esp_heap_caps.h"
@@ -159,6 +161,11 @@ static const window_map_t s_window_map[PM_WAVE_WINDOW_MAX] = {
 #define PM_NVS_NS "pm"                       /**< NVS 命名空间（相当于表名） */
 #define PM_NVS_KEY_DATA "pmdat"              /**< 电能/运行时间 blob 的键名 */
 #define PM_NVS_MAGIC 0x504D3031u /**< 'PM01'：blob 版本魔数，读到不认识的格式就丢弃 */
+/* 【B11 数值修复】电能/容量的权威值以 double 独立键存储：
+ * pmdat.energy_wh 是 float（保留兼容旧固件布局），>1024Wh 后一次落盘/恢复
+ * 会引入 0.5 ulp 级舍入偏差；独立 double 键消除该偏差，旧键缺失时回退。 */
+#define PM_NVS_KEY_ENERGY_HI "pmdw" /**< 累计电能（double，权威） */
+#define PM_NVS_KEY_CAP_HI "pmah"    /**< 累计容量（double，Ah） */
 
 /** 掉电保存的数据布局（整体作为一个 blob 存 NVS） */
 typedef struct {
@@ -185,6 +192,17 @@ static SemaphoreHandle_t s_calib_mutex = NULL; /**< 互斥锁：保护 s_calib �
  *  double 有 53 位尾数，按 1W·h 分辨率算可累计约 900 万 Wh，永不丢增量。
  *  对外接口仍是 float（见 power_measure.h），取值时再转换。 */
 static double s_energy_wh = 0.0;
+/** 累计容量（Ah）：同上用 double 累计，与电能并列积分（v0.2.0 仪器功能批 F2） */
+static double s_capacity_ah = 0.0;
+
+/** 本次上电的峰/谷值（v0.2.0 仪器功能批 F1）：块均值口径，task_sample 单写者，
+ *  40Hz 快照同任务读取无需加锁。首次块边界用首块均值初始化。 */
+static float s_v_max = 0, s_v_min = 0, s_i_max = 0, s_i_min = 0, s_p_max = 0, s_p_min = 0;
+static bool s_peak_init = false;
+
+/** 当前越限状态位图（DATA_ALERT_*，v0.2.0 仪器功能批 F3）
+ *  块边界判定、块边界清零；上升沿才发 APP_EVENT_MEASURE_ALERT 事件。 */
+static uint32_t s_alert_mask = 0;
 /** 累计运行时间（秒）。
  *  单写者约定：上面两个值只由 task_sample 写（清零/积分都在块边界），
  *  task_aux 落盘时只读。 */
@@ -605,6 +623,20 @@ static void load_persist_and_calib(void)
                  (unsigned)blob.runtime_s);
     }
 
+    /* 权威 double 键优先（B11）：pmdw/pmah 存在则覆盖 float 恢复值，
+     * 消除 >1024Wh 量级落盘/恢复的 float 舍入偏差；缺失（首版固件/升级首启）
+     * 时保持上面 float 恢复值或 0。 */
+    double e_hi = 0.0, c_hi = 0.0;
+    size_t dlen = sizeof(e_hi);
+    if (nvs_get_blob(h, PM_NVS_KEY_ENERGY_HI, &e_hi, &dlen) == ESP_OK && dlen == sizeof(e_hi)) {
+        s_energy_wh = e_hi;
+    }
+    dlen = sizeof(c_hi);
+    if (nvs_get_blob(h, PM_NVS_KEY_CAP_HI, &c_hi, &dlen) == ESP_OK && dlen == sizeof(c_hi)) {
+        s_capacity_ah = c_hi;
+    }
+    ESP_LOGI(TAG, "已恢复容量 %.6f Ah", s_capacity_ah);
+
     /* 标定参数独立存放（键 "calib"），允许只更新其一 */
     size_t clen = sizeof(s_calib);
     if (nvs_get_blob(h, "calib", &s_calib, &clen) == ESP_OK && clen == sizeof(s_calib)) {
@@ -646,9 +678,12 @@ static void save_persist(void)
      * 后面的 NVS 写入用的都是这份快照，与生产者互不干扰 */
     pm_persist_t blob = { .magic = PM_NVS_MAGIC };
     power_measure_calib_t calib_snap;
+    double e_hi = 0.0, c_hi = 0.0;
     xSemaphoreTake(s_persist_mutex, portMAX_DELAY);
     blob.energy_wh = (float)s_energy_wh; /* double→float：NVS 布局保持兼容 */
     blob.runtime_s = s_runtime_s;
+    e_hi = s_energy_wh; /* 权威 double（B11） */
+    c_hi = s_capacity_ah;
     xSemaphoreGive(s_persist_mutex);
     xSemaphoreTake(s_calib_mutex, portMAX_DELAY);
     calib_snap = s_calib;
@@ -667,7 +702,9 @@ static void save_persist(void)
      * 避免"只写了一半"的不一致状态 */
     esp_err_t e1 = nvs_set_blob(h, PM_NVS_KEY_DATA, &blob, sizeof(blob));
     esp_err_t e2 = nvs_set_blob(h, "calib", &calib_snap, sizeof(calib_snap));
-    if (e1 == ESP_OK && e2 == ESP_OK) {
+    esp_err_t e3 = nvs_set_blob(h, PM_NVS_KEY_ENERGY_HI, &e_hi, sizeof(e_hi));
+    esp_err_t e4 = nvs_set_blob(h, PM_NVS_KEY_CAP_HI, &c_hi, sizeof(c_hi));
+    if (e1 == ESP_OK && e2 == ESP_OK && e3 == ESP_OK && e4 == ESP_OK) {
         /* nvs_commit：提交后数据才真正落到 flash；不调它等于白写 */
         nvs_commit(h);
     } else {
@@ -689,7 +726,8 @@ static void save_persist(void)
 #define PM_AUX_PRIO       5     /**< 辅助任务优先级：低，慢 I2C 不该抢测量 */
 #define PM_AUX_PERIOD_MS  2000  /**< 温湿度/电池采集周期（ms） */
 #define PM_SAVE_PERIOD_TICKS 15u /* 辅助任务每 15 拍（30s）落一次盘 */
-#define PM_ADC_FAULT_AFTER_FAILS 2000u /**< 连续读失败多少次判定 ADC 故障 */
+#define PM_ADC_FAULT_AFTER_FAILS 50u /**< 连续读**超时**多少次判定 ADC 故障（B8 分流后只计真故障；
+                                      *  50 次 × 最坏 400ms ≈ 5~20s 内上报，替代原 2000 次的分钟级延迟） */
 #define PM_DIAG_PERIOD_BLOCKS 25u /* 每 25 块（5s）打印一次诊断 */
 
 /* 快速显示子窗口周期（微秒）：**墙钟时间驱动**，与实际 ODR 解耦。
@@ -718,7 +756,8 @@ static void task_sample(void *arg)
     power_calc_channel_calib_t vcal = { 0 }, ical = { 0 }; /**< 换算用标定副本 */
     double sum_v = 0, sum_i = 0, sum_p = 0;   /**< 块内累加（用 double 防长块累加丢精度） */
     uint32_t block_cnt = 0;                   /**< 块内有效样本数 */
-    uint32_t fail_streak = 0;                 /**< ADC 连续读失败计数 */
+    uint32_t fail_streak = 0;                 /**< ADC 连续读**超时**计数（真故障候选） */
+    uint32_t frame_drop = 0;                  /**< 槽满丢帧计数（B8 分流：瞬态，不计故障） */
     bool fault_reported = false;              /**< ADC 故障是否已上报 system_state */
     uint32_t sec_acc_ms = 0; /**< 运行时间累积（毫秒，满 1000 进 1 秒） */
 
@@ -758,10 +797,23 @@ static void task_sample(void *arg)
     for (;;) {
         /* ads131m02_read：读一帧 ADC 数据（内部在 DRDY 事件上等待，
          * 即"自节奏"——由 ADC 数据就绪节拍驱动循环，而非定时器硬凑频率） */
+        /* M3 帧错位自恢复：驱动检测到连续 CRC 失败会置重同步请求，
+         * 在本循环（无锁上下文）消费执行「RESET# + 重配 + 恢复流式」。
+         * 不能放进 ads131m02_read（其持总线锁，重同步内部寄存器访问自带
+         * 同一把锁会死锁），故固定在每轮循环开头消费。 */
+        (void)ads131m02_resync_if_needed();
+
         ads131m02_sample_t raw;
         esp_err_t err = ads131m02_read(&raw);
+        if (err == ESP_ERR_INVALID_STATE) {
+            /* 【B8 故障分流】槽满丢帧：瞬态事件（下一帧照常），只计数不上报
+             * 故障、不进 fail_streak——丢帧与"ADC 真死"是两回事。 */
+            frame_drop++;
+            continue;
+        }
         if (err != ESP_OK) {
-            /* 连续失败达到阈值才上报一次故障：偶发 SPI 抖动不该弹告警 */
+            /* 等 DRDY 超时 = 真故障候选。连续失败达到阈值才上报一次故障：
+             * 偶发 SPI 抖动不该弹告警。 */
             if (++fail_streak == PM_ADC_FAULT_AFTER_FAILS && !fault_reported) {
                 ESP_LOGE(TAG, "ADC 连续 %u 次读取失败，上报测量前端故障", (unsigned)fail_streak);
                 system_state_report_fault(SYSTEM_FAULT_ADC);
@@ -890,6 +942,7 @@ static void task_sample(void *arg)
              * double 需两拍写，锁保证读到完整值，代价仅几条指令） */
             xSemaphoreTake(s_persist_mutex, portMAX_DELAY);
             const double energy_base = s_energy_wh;
+            const double cap_base = s_capacity_ah;
             const uint32_t runtime_base = s_runtime_s;
             xSemaphoreGive(s_persist_mutex);
             data_store_snapshot_t qsnap = {
@@ -897,11 +950,22 @@ static void task_sample(void *arg)
                 .current_a = qi,
                 .power_w = qp,
                 .energy_wh = (float)(energy_base + block_energy_wh),
+                /* v0.2.0 新字段（F1/F2/F3）：容量 + 峰谷 + 当前告警 */
+                .capacity_ah = (float)cap_base,
+                .v_max = s_v_max,
+                .v_min = s_v_min,
+                .i_max = s_i_max,
+                .i_min = s_i_min,
+                .p_max = s_p_max,
+                .p_min = s_p_min,
+                .alert_mask = s_alert_mask,
             };
-            /* 借辅助数据的互斥锁读温湿度/电池（task_aux 是写者） */
+            /* 借辅助数据的互斥锁读温湿度/电池（task_aux 是写者）。
+             * 【B19 修复】温湿度未读到有效值时写 NaN（而非 0）——
+             * 真实的 0℃/0%RH 与"无数据"必须可区分，UI 按 NaN 显示占位符。 */
             xSemaphoreTake(s_aux_data.mutex, portMAX_DELAY);
-            qsnap.temperature_c = s_aux_data.temp_c;
-            qsnap.humidity_pct = s_aux_data.humidity_pct;
+            qsnap.temperature_c = s_aux_data.temp_valid ? s_aux_data.temp_c : NAN;
+            qsnap.humidity_pct = s_aux_data.temp_valid ? s_aux_data.humidity_pct : NAN;
             qsnap.battery_mv = s_aux_data.battery_mv;
             xSemaphoreGive(s_aux_data.mutex);
             qsnap.runtime_s = runtime_base;
@@ -944,6 +1008,54 @@ static void task_sample(void *arg)
             float i_mean = (float)(sum_i / block_cnt);
             float p_mean = (float)(sum_p / block_cnt);
 
+            /* ---- 峰/谷值更新（F1）：块均值口径，首次块用首块初始化 ---- */
+            if (!s_peak_init) {
+                s_v_max = s_v_min = v_mean;
+                s_i_max = s_i_min = i_mean;
+                s_p_max = s_p_min = p_mean;
+                s_peak_init = true;
+            } else {
+                if (v_mean > s_v_max) s_v_max = v_mean;
+                if (v_mean < s_v_min) s_v_min = v_mean;
+                if (i_mean > s_i_max) s_i_max = i_mean;
+                if (i_mean < s_i_min) s_i_min = i_mean;
+                if (p_mean > s_p_max) s_p_max = p_mean;
+                if (p_mean < s_p_min) s_p_min = p_mean;
+            }
+
+            /* ---- 告警判定（F3）：块边界消费 settings 阈值 ----
+             * 上升沿（mask 由 0 变非 0）发 APP_EVENT_MEASURE_ALERT 事件
+             * （device_ctrl 订阅转蜂鸣，UI 订阅弹窗）；持续越限维持 mask，
+             * 恢复后清 0。event_bus_post 超时传 0：不阻塞采样任务。 */
+            {
+                settings_alarm_t alm;
+                uint32_t new_mask = 0;
+                if (settings_get_alarm(&alm) == ESP_OK) {
+                    if (alm.v_en && v_mean > alm.v_limit) {
+                        new_mask |= DATA_ALERT_OVP;
+                    }
+                    if (alm.i_en && i_mean > alm.i_limit) {
+                        new_mask |= DATA_ALERT_OCP;
+                    }
+                    if (alm.p_en && p_mean > alm.p_limit) {
+                        new_mask |= DATA_ALERT_OPP;
+                    }
+                }
+                if (new_mask != 0 && new_mask != s_alert_mask) {
+                    /* 上升沿（含换项）：广播告警事件（不阻塞；丢弃可观测） */
+                    app_event_t ev = {
+                        .type = APP_EVENT_MEASURE_ALERT,
+                        .data.alert = {
+                            .voltage_v = v_mean,
+                            .current_a = i_mean,
+                            .alert_mask = new_mask,
+                        },
+                    };
+                    (void)event_bus_post(&ev, 0);
+                }
+                s_alert_mask = new_mask;
+            }
+
             /* 显示平滑：一阶低通（EMA），避免数值高频跳动。
              * alpha 越小越平滑、响应越慢，0.25 约 0.8s 时间常数。 */
             if (!disp_init) {
@@ -968,6 +1080,7 @@ static void task_sample(void *arg)
             if (atomic_exchange(&s_reset_energy_req, false)) {
                 xSemaphoreTake(s_persist_mutex, portMAX_DELAY);
                 s_energy_wh = 0.0;
+                s_capacity_ah = 0.0;
                 s_runtime_s = 0;
                 xSemaphoreGive(s_persist_mutex);
                 sec_acc_ms = 0;
@@ -985,6 +1098,8 @@ static void task_sample(void *arg)
             block_start_us = block_now_us;
             xSemaphoreTake(s_persist_mutex, portMAX_DELAY);
             s_energy_wh += (double)p_mean * (double)dt_s / 3600.0;
+            /* 容量积分（F2）：A·s → Ah，与电能并列、同用墙钟 dt */
+            s_capacity_ah += (double)i_mean * (double)dt_s / 3600.0;
 
             /* 运行时间：按实际采样时间累加（每满 1s 进 1） */
             sec_acc_ms += (uint32_t)(dt_s * 1000.0f + 0.5f);
@@ -1010,18 +1125,20 @@ static void task_sample(void *arg)
                 const uint32_t drdy_delta = drdy_now - diag_last_drdy;
                 diag_last_us = diag_now_us;
                 diag_last_drdy = drdy_now;
-                ESP_LOGI(TAG, "诊断: wall=%ums drdy+%u(%.0fHz) 帧=%u 丢弃=%u(%.1f%%) | "
+                ESP_LOGI(TAG, "诊断: wall=%ums drdy+%u(%.0fHz) 帧=%u 丢弃=%u(%.1f%%) 槽满丢帧=%u | "
                               "原始码 V[min=%ld max=%ld 均值=%.0f] I[min=%ld max=%ld 均值=%.0f] | "
                               "换算 V=%.5fV I=%.5fA P=%.5fW",
                          (unsigned)diag_wall_ms, (unsigned)drdy_delta,
                          diag_wall_ms ? (1000.0 * (double)drdy_delta / (double)diag_wall_ms) : 0.0,
                          (unsigned)frame_total, (unsigned)frame_reject,
                          frame_total ? (100.0f * (float)frame_reject / (float)frame_total) : 0.0f,
+                         (unsigned)frame_drop,
                          (long)raw_v_min, (long)raw_v_max, raw_n ? (raw_v_sum / raw_n) : 0.0,
                          (long)raw_i_min, (long)raw_i_max, raw_n ? (raw_i_sum / raw_n) : 0.0,
                          (double)disp_v, (double)disp_i, (double)disp_p);
                 frame_total = 0;
                 frame_reject = 0;
+                frame_drop = 0;
                 raw_n = 0;
                 raw_v_sum = raw_i_sum = 0;
             }
