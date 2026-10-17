@@ -15,6 +15,38 @@ on:
   workflow_dispatch:
 
 jobs:
+  host-tests:
+    name: 主机单元测试（gcc，Linux）
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v4
+
+      # 三个纯 C 测试套件（无平台依赖，与 test/host/run_host_tests.ps1 同源同参）
+      - name: 编译并运行主机单测
+        shell: bash
+        run: |
+          set -e
+          echo "::group::power_calc"
+          gcc -std=c11 -Wall -Wextra -I components/services/power_measure/include \
+            test/host/test_power_calc.c \
+            components/services/power_measure/src/power_calc.c -o /tmp/test_power_calc
+          /tmp/test_power_calc
+          echo "::endgroup::"
+          echo "::group::button_fsm"
+          gcc -std=c11 -Wall -Wextra -I components/drivers/key_button/include \
+            test/host/test_button_fsm.c \
+            components/drivers/key_button/src/button_fsm.c -o /tmp/test_button_fsm
+          /tmp/test_button_fsm
+          echo "::endgroup::"
+          echo "::group::aht20_calc"
+          gcc -std=c11 -Wall -Wextra -I components/drivers/aht20/include \
+            test/host/test_aht20_calc.c \
+            components/drivers/aht20/src/aht20_calc.c -o /tmp/test_aht20_calc
+          /tmp/test_aht20_calc
+          echo "::endgroup::"
+
   build:
     name: idf.py build（ESP-IDF v6.1）
     runs-on: ubuntu-latest
@@ -48,8 +80,8 @@ jobs:
             echo "## CI 结果"
             echo ""
             echo "- \`idf.py build\`：见上方步骤状态（ESP-IDF v6.1 容器）。"
+            echo "- \`主机单元测试\`：独立 job 在 Linux gcc 下执行（与本机 run_host_tests.ps1 同源）。"
             echo "- **已跳过（仅 Windows 可运行）**："
-            echo "  - 主机单元测试 \`test/host/run_host_tests.ps1\`（需 PowerShell + 主机端 C 编译器）"
             echo "  - UI 模拟器回归 \`tools/ui_sim/build.ps1\`（需 MSVC + CMake/Ninja），"
             echo "    UI 改动请在本机跑完并确认 \`[scene] !!\` 告警为 0 后再提交。"
             echo "- 本地一键回归入口：\`tools/ci/run_ci.ps1\`（构建 + 主机单测 + UI 回归）。"
