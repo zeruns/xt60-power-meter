@@ -17,9 +17,9 @@
  *   │ ┌──────────┐ ┌──────────┐        │ y=144
  *   │ │ 电能统计  │ │ 告警设置  │        │
  *   │ └──────────┘ └──────────┘        │
- *   │ ┌──────────┐                    │ y=190
- *   │ │ 关于本机  │        （空位）     │ 第 8 格留空（功能 7 项）
- *   │ └──────────┘                    │
+ *   │ ┌──────────┐ ┌──────────┐        │ y=190
+ *   │ │ 关于本机  │ │ 恢复出厂  │        │ 第 8 格＝恢复出厂（F6）
+ *   │ └──────────┘ └──────────┘        │
  *   └──────────────────────────────────┘
  *
  * 二级页：覆盖整个 tile 的浮层（随 tile 一起被横向滑动，不跨页），
@@ -35,19 +35,22 @@
  *   · 电能清零：power_measure_reset_energy（测量核在块边界执行，防跨核撕裂）；
  *   · 告警阈值：settings_get/set_alarm（v_en/i_en/p_en 使能 + V/A/W 三阈值，
  *     判定在测量核做，本页只管持久化用户设定）；
- *   · WiFi：v0.5.0 才提供联网能力，本页为路线图说明（诚实预期管理）。
+ *   · WiFi：wifi_manager（状态查询/忘记网络，F7 真实状态页）；
+ *   · 恢复出厂：settings_restore_factory + power_measure_reset_energy +
+ *     wifi_manager_forget 三步编排（标定保留，F6）。
  *
  * ────────────────────────────────────────────────────────────
  * 页面结构（各子页一览）
  * ────────────────────────────────────────────────────────────
  *   首页 2×4 网格 → 点击进入对应二级页：
  *   · 测量设置  → 校准向导（通道选择 → 标准值输入 → 完成提示，三级）
- *   · 显示设置  → 亮度滑条 + 自动旋转开关 + 0/90/180/270° 角度按钮
+ *   · 显示设置  → 亮度滑条 + 自动旋转开关 + 自动息屏档位（F4）+ 角度按钮
  *   · 蜂鸣器    → 响度滑条 + 试听按钮
- *   · WiFi      → 路线图说明页（联网能力 v0.5.0 才有，本页不提供开关）
+ *   · WiFi      → 状态页（状态/IP 或热点名 + 忘记网络，F7）
  *   · 电能统计  → 累计电能/运行时间 + 确认框清零
  *   · 告警设置  → 过压/过流/过功率三阈值（＋/－ 步进）+ 三项使能开关
  *   · 关于本机  → 信息对话框（无二级页）
+ *   · 恢复出厂  → 确认框 → 清用户设置/电能统计/WiFi（标定保留，F6）
  *
  * ────────────────────────────────────────────────────────────
  * 关键交互约定（全项目 UI 通用，本页严格落实）
@@ -95,6 +98,7 @@
 #include "orientation.h"
 #include "power_measure.h"
 #include "settings.h"
+#include "wifi_manager.h" /* F7：WiFi 状态页（wifi_manager_get_state/get_ip/get_ap_ssid/forget） */
 /* ui_nav：取当前页码（ui_nav_current_page）——设置首页的网格焦点模式需要
  * 知道"用户此刻真的在设置页"，否则按键接管会波及测量/波形页的翻页键位 */
 #include "ui_nav.h"
@@ -140,7 +144,7 @@ typedef enum {
     SUB_CALIB_DONE, /**< 标定完成提示（1.4s 后自动返回） */
     SUB_DISPLAY,    /**< 显示设置：亮度 + 方向 */
     SUB_BUZZER,     /**< 蜂鸣器响度 */
-    SUB_WIFI,       /**< WiFi 路线图说明 */
+    SUB_WIFI,       /**< WiFi 状态与配网（F7 真实状态页） */
     SUB_ENERGY,     /**< 电能统计与清零 */
     SUB_ALARM,      /**< 告警设置：过压/过流/过功率阈值 + 使能 */
 } sub_kind_t;
@@ -163,6 +167,8 @@ static lv_obj_t *s_energy_wh_label = NULL;    /**< 电能统计：累计电能 *
 static lv_obj_t *s_energy_rt_label = NULL;    /**< 电能统计：运行时间 */
 static lv_obj_t *s_bright_value_label = NULL; /**< 显示设置：亮度数值 */
 static lv_obj_t *s_vol_value_label = NULL;    /**< 蜂鸣器：响度数值 */
+static lv_obj_t *s_wifi_state_label = NULL;   /**< WiFi 页：状态行（5Hz 刷新，F7） */
+static lv_obj_t *s_wifi_hint_label = NULL;    /**< WiFi 页：配网提示行（随状态切换） */
 static lv_obj_t *s_alarm_value_labels[3] = { 0 }; /**< 告警设置：三阈值数值标签（V/A/W） */
 
 /** 告警设置页：当前编辑中的配置（改完即 settings_set_alarm，防抖落盘） */
@@ -819,6 +825,8 @@ static void subpage_close(void)
     s_energy_rt_label = NULL;
     s_bright_value_label = NULL;
     s_vol_value_label = NULL;
+    s_wifi_state_label = NULL;
+    s_wifi_hint_label = NULL;
     memset(s_alarm_value_labels, 0, sizeof(s_alarm_value_labels));
     memset(s_angle_btns, 0, sizeof(s_angle_btns));
     s_auto_switch = NULL;
@@ -1414,6 +1422,36 @@ static void bright_slider_cb(lv_event_t *e)
     }
 }
 
+/** 自动息屏档位名称表（下标 = settings.screen_off_s：0=永不 1=30s 2=60s 3=120s） */
+static const char *const s_scr_off_names[4] = { "永不", "30 秒", "60 秒", "120 秒" };
+
+/**
+ * @brief "自动息屏"按钮：档位循环切换（永不 → 30s → 60s → 120s → 永不）
+ *
+ * 档位含义见 settings.screen_off_s（F4）：ui.c 主循环按"档位×30s 无输入"熄背光，
+ * 任意按键唤醒。与"步长"按钮同款做法：直接改按钮自己的文字标签。
+ *
+ * @param e LVGL 点击事件（目标是"自动息屏"按钮）
+ */
+static void screen_off_cycle_cb(lv_event_t *e)
+{
+    lv_obj_t *btn = lv_event_get_target(e);
+    settings_t cfg;
+    uint8_t level = 0;
+    if (settings_get(&cfg) == ESP_OK) {
+        level = (cfg.screen_off_s < 4u) ? cfg.screen_off_s : 0u;
+    }
+    level = (uint8_t)((level + 1u) % 4u); /* 取模循环：永不→30→60→120→永不 */
+    (void)settings_set_screen_off(level);
+    (void)settings_save_now(); /* 离散档位选择，立即落盘（防断电丢失） */
+    lv_obj_t *lbl = lv_obj_get_child(btn, 0); /* 按钮内第 0 个子对象 = 文字标签 */
+    if (lbl != NULL) {
+        char buf[32];
+        snprintf(buf, sizeof(buf), "自动息屏：%s", s_scr_off_names[level]);
+        lv_label_set_text(lbl, buf);
+    }
+}
+
 /**
  * @brief 打开"显示设置"二级页（亮度 + 自动旋转 + 角度按钮）
  *
@@ -1489,6 +1527,17 @@ static void display_open_cb(void)
     lv_obj_add_event_cb(s_auto_switch, auto_switch_cb, LV_EVENT_VALUE_CHANGED, NULL);
     focus_add(s_auto_switch); /* 焦点链第 2 项：自动旋转开关（长按 K2 切换） */
 
+    /* ---- 自动息屏（F4）：档位循环切换按钮（永不/30s/60s/120s） ---- */
+    uint8_t off_level = 0;
+    if (settings_get(&cfg) == ESP_OK) {
+        off_level = (cfg.screen_off_s < 4u) ? cfg.screen_off_s : 0u;
+    }
+    char off_buf[32];
+    snprintf(off_buf, sizeof(off_buf), "自动息屏：%s", s_scr_off_names[off_level]);
+    lv_obj_t *off_btn = plain_button(c, off_buf, LV_PCT(60), 30);
+    lv_obj_add_event_cb(off_btn, screen_off_cycle_cb, LV_EVENT_CLICKED, NULL);
+    focus_add(off_btn); /* 焦点链第 3 项：自动息屏档位（长按 K2 循环切换） */
+
     lv_obj_t *cap2 = plain_label(c, "屏幕方向", LVGL_PORT_FONT_16, COL_INK, false);
     lv_obj_set_width(cap2, LV_PCT(100));
     lv_obj_set_style_margin_top(cap2, 6, 0);
@@ -1506,7 +1555,7 @@ static void display_open_cb(void)
         lv_obj_add_event_cb(b, angle_clicked_cb, LV_EVENT_CLICKED,
                             (void *)(intptr_t)s_angle_vals[i]);
         s_angle_btns[i] = b; /* 记下按钮指针，供 angle_buttons_refresh 改高亮 */
-        focus_add(b);        /* 焦点链第 3~6 项：0/90/180/270° 角度按钮 */
+        focus_add(b);        /* 焦点链第 4~7 项：0/90/180/270° 角度按钮 */
     }
     angle_buttons_refresh(); /* 打开页时按实际角度点亮对应按钮 */
 
@@ -1613,45 +1662,140 @@ static void buzzer_open_cb(void)
 }
 
 /* ============================================================
- * 二级页：WiFi（路线图说明，联网能力在 v0.5.0）
+ * 二级页：WiFi 状态与配网（F7 真实状态页）
  * ============================================================ */
 
+/** WiFi 状态中文名（下标 = wifi_manager_state_t 枚举值，五态一一对应） */
+static const char *const s_wifi_state_names[5] = {
+    "未启动", "连接中", "已连接", "配网模式", "连接失败",
+};
+
 /**
- * @brief 打开"WiFi 与热点"二级页（纯说明页，无任何可操作控件）
+ * @brief 刷新 WiFi 状态行与提示行（建页时与 5Hz 刷新各调一次）
  *
- * v0.5.0 才有联网能力，本页只做"路线图"诚实告知，不放假开关钓用户预期。
- * 全文都是静态文本，因此页面里没有按钮——这不影响"纯按键可达"约定：
- * 用户随时可按标题栏"返回"离开。
+ * 状态行格式（wifi_manager_get_state 中文名 + IP 或热点名）：
+ *   已连接   → "已连接 · IP x.x.x.x"（取不到 IP 显示 "--"）；
+ *   配网模式 → "配网模式 · 热点 <wifi_manager_get_ap_ssid>"；
+ *   连接中   → "连接中 · <已保存热点名>"（无凭据时只显示状态名）；
+ *   未启动 / 连接失败 → 只显示状态名。
+ * 提示行随状态切换：配网模式提示"手机连热点后浏览器开 192.168.4.1 配网"。
+ */
+static void wifi_update_status(void)
+{
+    if (s_wifi_state_label == NULL) {
+        return; /* 页已关闭：防野指针（与其余刷新标签同一约定） */
+    }
+    wifi_manager_state_t st = wifi_manager_get_state();
+    const char *name = (st <= WIFI_MANAGER_STATE_FAILED) ? s_wifi_state_names[st] : "未知";
+    char line[64];
+    if (st == WIFI_MANAGER_STATE_CONNECTED) {
+        char ip[16] = ""; /* wifi_manager_get_ip 至少 16 字节（含结尾 0） */
+        if (wifi_manager_get_ip(ip, sizeof(ip)) != ESP_OK) {
+            snprintf(ip, sizeof(ip), "--");
+        }
+        snprintf(line, sizeof(line), "%s · IP %s", name, ip);
+    } else if (st == WIFI_MANAGER_STATE_AP_MODE) {
+        char ap[WIFI_MANAGER_AP_SSID_MAX_LEN + 1] = "";
+        if (wifi_manager_get_ap_ssid(ap, sizeof(ap)) != ESP_OK) {
+            snprintf(ap, sizeof(ap), "--");
+        }
+        snprintf(line, sizeof(line), "%s · 热点 %s", name, ap);
+    } else if (st == WIFI_MANAGER_STATE_CONNECTING) {
+        char ssid[WIFI_MANAGER_SSID_MAX_LEN + 1] = "";
+        if (wifi_manager_get_ssid(ssid, sizeof(ssid)) == ESP_OK && ssid[0] != '\0') {
+            snprintf(line, sizeof(line), "%s · %s", name, ssid);
+        } else {
+            snprintf(line, sizeof(line), "%s", name);
+        }
+    } else {
+        snprintf(line, sizeof(line), "%s", name);
+    }
+    lv_label_set_text(s_wifi_state_label, line);
+
+    if (s_wifi_hint_label != NULL) {
+        if (st == WIFI_MANAGER_STATE_AP_MODE) {
+            /* 配网指引：AP 模式下手机连热点 → 浏览器开 192.168.4.1 配网页 */
+            lv_label_set_text(s_wifi_hint_label,
+                              "手机连接上述热点后，\n浏览器打开 192.168.4.1 完成配网。");
+        } else {
+            lv_label_set_text(s_wifi_hint_label, "“忘记网络”将清除已保存的 WiFi 凭据。");
+        }
+    }
+}
+
+/**
+ * @brief "忘记网络"确认后动作：清 WiFi 凭据并回配网热点（F7）
+ *
+ * 由 show_confirm 的 ok_cb 调用（确认框已先被关闭）。wifi_manager_forget
+ * 会等待内部任务完成（最长数秒），期间界面短暂无响应，属一次性操作可接受。
+ * 结果分成功/失败两种提示；无论成败都刷新状态行（背后的状态页同步更新）。
+ */
+static void wifi_forget_ok(void)
+{
+    esp_err_t err = wifi_manager_forget();
+    wifi_update_status(); /* 先刷背后状态页，再弹结果框 */
+    if (err == ESP_OK) {
+        buzzer_play(BUZZER_TONE_OK);
+        show_notice("已忘记网络", "WiFi 凭据已清除，\n设备回到配网热点模式。");
+    } else {
+        buzzer_play(BUZZER_TONE_ERROR);
+        show_notice("操作未完成", "清除 WiFi 凭据失败，请重试。");
+    }
+}
+
+/**
+ * @brief "忘记网络"按钮：破坏性操作先弹确认框（取消/确定）
+ * @param e LVGL 点击事件（未使用）
+ */
+static void wifi_forget_clicked_cb(lv_event_t *e)
+{
+    (void)e;
+    show_confirm("忘记 WiFi 网络？",
+                 "将清除已保存的 WiFi 凭据，\n设备回到配网热点模式。\n"
+                 "测量数据与标定参数不受影响。",
+                 wifi_forget_ok);
+}
+
+/**
+ * @brief 打开"WiFi 与热点"二级页（真实状态页：状态/IP 或热点名 + 忘记网络）
+ *
+ * 状态来自 wifi_manager（middleware 数据面）：未启动/连接中/已连接/配网模式/
+ * 连接失败；已连接显示 IP、配网模式显示热点名与配网指引。
+ * 纯按键可达：唯一可操作控件（忘记网络按钮）登记焦点链，
+ * "返回"固定在标题栏（长按 K1），长按 K2 激活焦点按钮弹确认框。
  */
 static void wifi_open_cb(void)
 {
     lv_obj_t *c = subpage_open(SUB_WIFI, "WiFi 与热点");
 
-    /* LV_SYMBOL_WIFI：LVGL 内置 WiFi 字形符号（免图片资源） */
-    /* 图标 24px：32px 时整页超出可视区约 8px，底部提示行被截断（实拍 f05） */
-    lv_obj_t *icon = plain_label(c, LV_SYMBOL_WIFI, LVGL_PORT_FONT_24, COL_PRIMARY, false);
+    /* LV_SYMBOL_WIFI：LVGL 内置 WiFi 字形符号（免图片资源）；16px 小图标省纵向空间 */
+    lv_obj_t *icon = plain_label(c, LV_SYMBOL_WIFI, LVGL_PORT_FONT_16, COL_PRIMARY, false);
     (void)icon;
 
-    lv_obj_t *main_txt = plain_label(c, "联网功能计划于 v0.5.0 提供", LVGL_PORT_FONT_16, COL_INK,
-                                     true);
-    lv_obj_set_style_text_align(main_txt, LV_TEXT_ALIGN_CENTER, 0);
+    /* 状态行：品牌蓝加粗（本页主信息），由 wifi_update_status 填充并 5Hz 刷新 */
+    s_wifi_state_label = plain_label(c, "--", LVGL_PORT_FONT_16, COL_PRIMARY, true);
+    lv_obj_set_width(s_wifi_state_label, LV_PCT(100));
+    lv_label_set_long_mode(s_wifi_state_label, LV_LABEL_LONG_WRAP); /* 超宽折行不截断 */
+    lv_obj_set_style_text_align(s_wifi_state_label, LV_TEXT_ALIGN_CENTER, 0);
 
-    lv_obj_t *list = plain_label(c,
-                                 "届时将包含：\n"
-                                 "· 自托管 Web 控制台\n"
-                                 "· 历史数据记录与 CSV 导出\n"
-                                 "· OTA 固件在线升级",
-                                 LVGL_PORT_FONT_14, COL_INK, false);
-    lv_obj_set_width(list, LV_PCT(100));
-    /* lv_label_set_long_mode(..., LV_LABEL_LONG_WRAP)：超宽自动折行（不截断） */
-    lv_label_set_long_mode(list, LV_LABEL_LONG_WRAP);
-    lv_obj_set_style_pad_left(list, 6, 0);
+    /* 提示行：配网模式给 192.168.4.1 指引，其余状态提示"忘记网络"含义 */
+    s_wifi_hint_label = plain_label(c, "", LVGL_PORT_FONT_12, COL_GRAY, false);
+    lv_obj_set_width(s_wifi_hint_label, LV_PCT(100));
+    lv_label_set_long_mode(s_wifi_hint_label, LV_LABEL_LONG_WRAP);
+    lv_obj_set_style_text_align(s_wifi_hint_label, LV_TEXT_ALIGN_CENTER, 0);
 
-    /* 短句一屏放下（原长句折行把底部提示挤出可视区，实拍 f05 底部截断） */
-    lv_obj_t *note = plain_label(c, "当前版本请通过屏幕本体查看数据。", LVGL_PORT_FONT_12,
-                                 COL_GRAY, false);
-    lv_obj_set_width(note, LV_PCT(100));
-    lv_label_set_long_mode(note, LV_LABEL_LONG_WRAP);
+    /* "忘记网络"按钮：清凭据回配网热点（红字示警 + 确认框，与"清零统计"同款） */
+    lv_obj_t *btn = plain_button(c, "忘记网络", LV_PCT(100), 40);
+    lv_obj_set_style_border_color(btn, COL_DANGER, 0);
+    lv_obj_t *lbl = lv_obj_get_child(btn, 0);
+    if (lbl != NULL) {
+        lv_obj_set_style_text_color(lbl, COL_DANGER, 0);
+        lv_obj_set_style_text_font(lbl, lvgl_port_get_font_bold(LVGL_PORT_FONT_16), 0);
+    }
+    lv_obj_add_event_cb(btn, wifi_forget_clicked_cb, LV_EVENT_CLICKED, NULL);
+    focus_add(btn); /* 焦点链第 1 项：忘记网络（长按 K2 弹确认框） */
+
+    wifi_update_status(); /* 建页即填状态，不等 5Hz 刷新的第一帧 */
 }
 
 /* ============================================================
@@ -2023,6 +2167,56 @@ static void about_open_cb(void)
 }
 
 /* ============================================================
+ * 恢复出厂设置（F6，网格第 8 格入口）
+ * ============================================================ */
+
+/**
+ * @brief 恢复出厂"确定"动作：清用户设置 → 电能清零 → 忘记 WiFi（逐项容错）
+ *
+ * 顺序固定：settings_restore_factory()（清 xt60cfg 用户设置回出厂默认；
+ * 标定参数存 pm 命名空间，不受影响、有意保留）
+ * → power_measure_reset_energy()（电能/运行时间清零）
+ * → wifi_manager_forget()（清 WiFi 凭据并回配网热点）。
+ * 三步相互独立，任一步失败不阻断其余步骤，最后按结果给提示框。
+ * ⚠ wifi_manager_forget 会等待内部任务完成（最长数秒），期间界面短暂无响应，
+ * 属一次性低频操作，可接受。
+ */
+static void factory_reset_ok(void)
+{
+    bool ok_set = (settings_restore_factory() == ESP_OK);
+    bool ok_nrg = (power_measure_reset_energy() == ESP_OK);
+    bool ok_wifi = (wifi_manager_forget() == ESP_OK);
+
+    if (ok_set && ok_nrg && ok_wifi) {
+        buzzer_play(BUZZER_TONE_OK);
+        show_notice("已恢复出厂",
+                    "用户设置、电能统计与 WiFi 网络已清除，\n标定参数已保留。");
+    } else {
+        /* 逐项容错：结果框把没做成的项目列出来，用户可单独重试 */
+        char text[128];
+        snprintf(text, sizeof(text), "以下项目未能完成：\n%s%s%s",
+                 ok_set ? "" : "· 用户设置清除\n",
+                 ok_nrg ? "" : "· 电能统计清零\n",
+                 ok_wifi ? "" : "· WiFi 网络清除");
+        show_notice("恢复出厂部分完成", text);
+        buzzer_play(BUZZER_TONE_ERROR);
+    }
+}
+
+/**
+ * @brief 网格"恢复出厂"入口：破坏性操作先弹确认框（正文列清除项/保留项）
+ *
+ * 签名为 cell_cb_t（无参无返回），由 cell_clicked_cb 转发调用。
+ */
+static void factory_open_cb(void)
+{
+    show_confirm("恢复出厂设置？",
+                 "将清除：\n· 用户设置\n· 电能统计\n· WiFi 网络\n"
+                 "标定参数保留。\n此操作不可恢复！",
+                 factory_reset_ok);
+}
+
+/* ============================================================
  * 首页网格
  * ============================================================ */
 
@@ -2131,7 +2325,7 @@ void screen_settings_create(lv_obj_t *tile)
     lv_obj_set_scrollable(grid, false);
 
     /* 功能格表：图标 + 名称 + 打开函数，按行序 r*2 / r*2+1 两两成行。
-     * 7 个功能占满前 3.5 行，第 8 格留空（cb=NULL，不可点也不进焦点链）。
+     * 8 个功能格占满 2×4 网格（第 8 格＝恢复出厂，F6）。
      * 替换某格功能只改这一行，排版代码不用动。 */
     static const struct {
         const char *icon;
@@ -2145,7 +2339,7 @@ void screen_settings_create(lv_obj_t *tile)
         { LV_SYMBOL_REFRESH, "电能统计", energy_open_cb },
         { LV_SYMBOL_WARNING, "告警设置", alarm_open_cb },
         { LV_SYMBOL_LIST, "关于本机", about_open_cb },
-        { "", "", NULL }, /* 留空位：网格凑满 2 列 4 行 */
+        { LV_SYMBOL_TRASH, "恢复出厂", factory_open_cb },
     };
 
     for (int r = 0; r < 4; r++) {
@@ -2211,6 +2405,10 @@ void screen_settings_refresh(const data_store_snapshot_t *snap)
                      (unsigned)(snap->runtime_s % 60u));
             lv_label_set_text(s_energy_rt_label, buf);
         }
+        break;
+    case SUB_WIFI:
+        /* WiFi 状态页：状态/IP 随连接进度变化，5Hz 刷新保持"真实状态" */
+        wifi_update_status();
         break;
     default:
         break;

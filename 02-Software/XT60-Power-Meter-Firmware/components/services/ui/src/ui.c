@@ -157,6 +157,12 @@ typedef struct {
 
 static QueueHandle_t s_key_queue = NULL; /**< 按键消息队列（FreeRTOS queue，task_ui 内创建） */
 
+/* ---- 自动息屏（F4） ---- */
+static int64_t s_last_input_us = 0; /**< 最近一次按键输入时刻（µs；超时即息屏） */
+static bool s_screen_off = false;   /**< true=背光已熄（息屏态）；任意按键唤醒 */
+
+static void screen_off_wake(void); /* 前向声明（定义见 apply_backlight 之后） */
+
 /**
  * @brief 按键驱动回调：运行在 esp_timer 任务，禁止碰 LVGL，只投递
  *
@@ -212,6 +218,10 @@ static void drain_key_queue(void)
     /* xQueueReceive：从队列取一条消息；超时 0 = 队列空立刻返回 pdFALSE，
      * 于是 while 循环在取空时退出，不会拖慢主循环节拍。 */
     while (xQueueReceive(s_key_queue, &msg, 0) == pdTRUE) {
+        /* F4 自动息屏：任何按键都表明"用户在操作"——更新最后输入时刻；
+         * 息屏中则立即唤醒（恢复 cfg.lcd_brightness 背光，见 screen_off_wake）。 */
+        s_last_input_us = esp_timer_get_time();
+        screen_off_wake();
         /* 告警弹窗优先于一切按键路由：弹窗期间任意按键=确认关闭
          * （与启动故障弹窗"任意按键放行"同语义——触摸排线故障时也能关） */
         if (s_alert_box != NULL) {
@@ -270,6 +280,22 @@ static void apply_backlight(void)
     }
     (void)lcd_nv3030b_set_backlight(bright); /* 调 LCD 驱动设置 PWM 背光占空比（%） */
     ESP_LOGI(TAG, "背光已打开（%u%%）", bright);
+}
+
+/**
+ * @brief 自动息屏唤醒（F4）：息屏态下恢复用户设置的背光亮度（幂等）
+ *
+ * 无参数无返回值。已亮屏时什么都不做，因此按键/告警弹窗等唤醒点可放心调用。
+ * 调用时通常持有 LVGL 锁，但本函数只碰 settings 缓存与 LCD 背光驱动，
+ * 不访问 LVGL 对象树。
+ */
+static void screen_off_wake(void)
+{
+    if (!s_screen_off) {
+        return;
+    }
+    s_screen_off = false;
+    apply_backlight(); /* 恢复 cfg.lcd_brightness（settings 缓存里的用户亮度） */
 }
 
 /**
@@ -488,6 +514,7 @@ static void task_ui(void *arg)
      *   · 设置页：5Hz（校准向导读数/电能统计等少量实时值）。
      * 数据源恒定 40Hz 快拍 + 200ms 权威块（电能/真 RMS 不受显示设置影响）。 */
     last = xTaskGetTickCount();
+    s_last_input_us = esp_timer_get_time(); /* 输入计时起点＝进主循环时刻（防开机即息屏） */
 
     for (;;) {
         /* UI 任务心跳：每轮更新，供 app_task 判断 UI 任务是否也停摆 */
@@ -498,6 +525,21 @@ static void task_ui(void *arg)
             drain_key_queue(); /* 先处理积压按键，保证按键响应优先于数据刷新 */
 
             const int64_t now_us = esp_timer_get_time();
+
+            /* ⓪ 自动息屏（F4）：距上次按键超过档位时长（档位×30s：1→30s
+             * 2→60s 3→120s；0=永不）→ 背光置 0。只在熄灭瞬间写一次驱动
+             * （s_screen_off 防重复设 PWM）；息屏中任意按键由 drain_key_queue
+             * 更新时间戳并唤醒。 */
+            settings_t socfg;
+            if (settings_get(&socfg) == ESP_OK && socfg.screen_off_s > 0 && !s_screen_off) {
+                const int64_t off_after_us = (int64_t)socfg.screen_off_s * 30LL * 1000000LL;
+                if (now_us - s_last_input_us >= off_after_us) {
+                    (void)lcd_nv3030b_set_backlight(0);
+                    s_screen_off = true;
+                    ESP_LOGI(TAG, "自动息屏：无输入超过 %us，背光已关闭",
+                             (unsigned)socfg.screen_off_s * 30u);
+                }
+            }
 
             /* ① 40Hz 快照环：每 25ms 从 data_store 拷一帧进历史环。
              * 用"距上次采样的时间差"判节拍（而非固定次数），偶尔一次卡顿
@@ -551,6 +593,10 @@ static void task_ui(void *arg)
                     lv_obj_t *ok = lv_msgbox_add_footer_button(box, "确认");
                     lv_obj_add_event_cb(ok, alert_ok_cb, LV_EVENT_CLICKED, NULL);
                     s_alert_box = box;
+                    /* F4：告警是安全信息，息屏中弹出也必须点亮屏幕让用户看到；
+                     * 顺带重置输入时刻，保证弹窗至少完整展示一个息屏周期 */
+                    s_last_input_us = now_us;
+                    screen_off_wake();
                 } else if (cur == 0 && s_alert_box != NULL) {
                     /* 恢复正常：自动关闭在开的告警弹窗 */
                     alert_box_close();

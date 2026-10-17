@@ -186,8 +186,8 @@ static lv_obj_t *s_lbl_time_r;                /**< 时间轴右刻度 "0"（现�
 static lv_obj_t *s_axis_a[3];                 /**< 主轴刻度（上/中/下 ×3） */
 static lv_obj_t *s_axis_b[3];                 /**< 副轴刻度（上/中/下 ×3） */
 
-static pm_wave_window_t s_window = PM_WAVE_10S; /**< 当前时间窗（旋转重建时保留） */
-static pm_wave_mode_t s_mode = PM_WAVE_MODE_VI; /**< 当前波形模式（默认电压+电流） */
+static pm_wave_window_t s_window = PM_WAVE_10S; /**< 当前时间窗（B20：create 时从 settings 恢复） */
+static pm_wave_mode_t s_mode = PM_WAVE_MODE_VI; /**< 当前波形模式（B20：create 时从 settings 恢复） */
 
 /* 纵轴量程滞回状态（避免每帧改量程导致曲线乱跳） */
 static bool s_range_valid = false;
@@ -453,10 +453,14 @@ static void apply_roller_selection(void)
     bool changed = false;
     if (w >= 0 && w < PM_WAVE_WINDOW_MAX && (pm_wave_window_t)w != s_window) {
         s_window = (pm_wave_window_t)w;
+        /* B20 波形持久化：时间窗写入 settings（内存缓存立即生效，防抖落盘） */
+        (void)settings_set_wave_window((uint8_t)w);
         changed = true;
     }
     if (m >= 0 && m < PM_WAVE_MODE_MAX && (pm_wave_mode_t)m != s_mode) {
         s_mode = (pm_wave_mode_t)m;
+        /* B20 波形持久化：波形模式写入 settings */
+        (void)settings_set_wave_mode((uint8_t)m);
         changed = true;
     }
     if (changed) {
@@ -465,6 +469,8 @@ static void apply_roller_selection(void)
         s_shrink_cnt_b = 0;
         s_hold_min_val = NAN; /* 极值锚点失效，重新锚定 */
         s_hold_max_val = NAN;
+        /* "确定"是离散动作（非拖动）：立即落盘，防马上断电丢失本次选择 */
+        (void)settings_save_now();
     }
 }
 
@@ -1479,7 +1485,19 @@ void screen_wave_create(lv_obj_t *tile)
         s_axis_a[k] = NULL;
         s_axis_b[k] = NULL;
     }
-    /* s_window / s_mode / 量程滞回状态保留：用户的波形选择不被旋转打断 */
+    /* B20 波形持久化：从 settings 恢复时间窗/波形模式初值。
+     * 与旧"旋转重建保留静态值"策略等价——用户每次确定切换都已实时写回
+     * settings 内存缓存（apply_roller_selection），重建时读回的即是最新值。
+     * 越界值回默认：10s 窗 / 电压+电流模式（与旧版默认一致）。量程滞回状态仍保留不重建。 */
+    settings_t wcfg;
+    if (settings_get(&wcfg) == ESP_OK) {
+        s_window = (wcfg.wave_window < (uint8_t)PM_WAVE_WINDOW_MAX)
+                       ? (pm_wave_window_t)wcfg.wave_window
+                       : PM_WAVE_10S;
+        s_mode = (wcfg.wave_mode < (uint8_t)PM_WAVE_MODE_MAX)
+                     ? (pm_wave_mode_t)wcfg.wave_mode
+                     : PM_WAVE_MODE_VI;
+    }
 
     lv_obj_set_style_bg_color(tile, lv_color_white(), 0);
     lv_obj_set_style_bg_opa(tile, LV_OPA_COVER, 0);
