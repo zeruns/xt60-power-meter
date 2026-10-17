@@ -34,6 +34,7 @@
 #include "driver/gpio.h"
 #include "esp_attr.h"
 #include "esp_cpu.h"
+#include "esp_intr_alloc.h"
 #include "esp_log.h"
 #include "esp_private/gpio.h"
 #include "esp_private/gdma.h"
@@ -92,6 +93,17 @@ static atomic_uint s_drop_count;         /**< 槽满丢帧数 */
 /** DRDY 同步信号量（ISR 给、任务取；流式与维护共用「帧起点」语义） */
 static SemaphoreHandle_t s_drdy_sem = NULL;
 
+/* ---- 维护帧直启（M3 修复）----
+ * 为什么维护帧也要在 DRDY ISR 里 kick：
+ *   「任务取信号量 → 再 kick」在 DRDY 边沿到 kick 之间插入了**不确定的任务
+ *   调度延迟**。4kHz 档帧周期仅 250µs，延迟抖动会让命令帧落到错误的帧窗，
+ *   芯片认不出 RREG/WREG 命令（实测寄存器读回全是 STATUS=0x0503、命令回显
+ *   0x0655 串到错误帧）。流式帧之所以正常，正因它在 ISR 内直启、确定性对齐。
+ *   故维护帧同样改为「任务置请求 → DRDY ISR 直启 → ISR 通知完成」，
+ *   使每次 xfer 精确落在一个 DRDY 边沿、精确推进一帧。 */
+static const uint32_t *volatile s_maint_tx = NULL; /**< 维护帧待发 4 字（非 NULL=请求 ISR kick） */
+static SemaphoreHandle_t s_maint_done_sem = NULL;  /**< 维护帧 kick 完成（ISR give、任务 take） */
+
 /* ---- δ 统计（DRDY 边沿 → SPI 启动；ISR 写、任务只读快照）---- */
 static volatile uint32_t s_lat_min_us = UINT32_MAX;
 static volatile uint32_t s_lat_max_us = 0;
@@ -100,8 +112,11 @@ static volatile uint32_t s_lat_n = 0;
 
 /**
  * @brief 24bit 字数组 → 线上字节（MSB 先出）
+ *
+ * IRAM_ATTR：被 IRAM 的 engine_kick 调用（DRDY ISR 路径），cache 关闭
+ * 窗口内必须可执行——不能依赖编译器把它内联进 engine_kick。
  */
-static void pack_words(const uint32_t *words, uint8_t *buf, size_t n)
+static void IRAM_ATTR pack_words(const uint32_t *words, uint8_t *buf, size_t n)
 {
     for (size_t i = 0; i < n; i++) {
         const uint32_t v = (words != NULL) ? (words[i] & 0xFFFFFFu) : 0u;
@@ -187,7 +202,16 @@ static void IRAM_ATTR drdy_isr(void *arg)
     BaseType_t woken = pdFALSE;
     xSemaphoreGiveFromISR(s_drdy_sem, &woken);
 
-    if (atomic_load_explicit(&s_stream_on, memory_order_relaxed)) {
+    /* 维护帧直启（M3）：任务已置 s_maint_tx 请求，在 DRDY 边沿精确 kick 一帧。
+     * 维护与流式互斥（维护前 set_stream(false)），故这里是 else-if 关系。 */
+    const uint32_t *mtx = s_maint_tx;
+    if (mtx != NULL) {
+        s_maint_tx = NULL;
+        engine_kick(mtx, s_slot[0]); /* 维护帧固定借用槽 0（流式已停，无并发） */
+        BaseType_t mw = pdFALSE;
+        xSemaphoreGiveFromISR(s_maint_done_sem, &mw);
+        woken = (woken == pdTRUE) || (mw == pdTRUE);
+    } else if (atomic_load_explicit(&s_stream_on, memory_order_relaxed)) {
         const uint32_t kick = atomic_load_explicit(&s_kick_seq, memory_order_relaxed);
         const uint32_t read = atomic_load_explicit(&s_read_seq, memory_order_relaxed);
         if (kick - read < ENG_RING) {
@@ -342,6 +366,11 @@ esp_err_t ads_engine_init(int mosi, int miso, int sclk, int clk_hz, int input_de
     if (s_drdy_sem == NULL) {
         return ESP_ERR_NO_MEM;
     }
+    /* 维护帧完成信号量（M3 直启）：ISR 直启维护帧后 give，xfer_frame take */
+    s_maint_done_sem = xSemaphoreCreateBinary();
+    if (s_maint_done_sem == NULL) {
+        return ESP_ERR_NO_MEM;
+    }
     return ESP_OK;
 }
 
@@ -358,8 +387,11 @@ esp_err_t ads_engine_attach_drdy(int drdy_gpio)
     if (err != ESP_OK) {
         return err;
     }
-    /* ISR 服务可能已被他人安装（返回 INVALID_STATE 属正常） */
-    err = gpio_install_isr_service(0);
+    /* ESP_INTR_FLAG_IRAM：flash 擦写关 cache 窗口内 DRDY 中断照常服务；
+     * 不带该标志时中断分配器会在擦写期间禁用本中断 → 4kHz 丢边沿，
+     * NVS 落盘瞬间出现数据缺口（docs/ads131-4khz-implementation-plan.md §4.2）。
+     * ISR 服务可能已被他人安装（返回 INVALID_STATE 属正常） */
+    err = gpio_install_isr_service(ESP_INTR_FLAG_IRAM);
     if (err != ESP_OK && err != ESP_ERR_INVALID_STATE) {
         return err;
     }
@@ -368,7 +400,18 @@ esp_err_t ads_engine_attach_drdy(int drdy_gpio)
 
 bool ads_engine_set_stream(bool on)
 {
-    return atomic_exchange_explicit(&s_stream_on, on, memory_order_relaxed);
+    const bool was = atomic_exchange_explicit(&s_stream_on, on, memory_order_relaxed);
+    if (!on) {
+        /* 暂停流式（或维护前的对齐起拍）：无条件 drain 掉 ISR 累积的 DRDY
+         * 同步信号，让随后的维护帧从「下一个 DRDY」干净起拍——这是 RREG/WREG
+         * 两帧协议帧边界连续的前提。⚠ 不能只在 was==true 时 drain：init 阶段
+         * 流式本就关闭（was=false），但 DRDY ISR 仍在每个边沿 give 信号量并
+         * 饱和为 1，若不 drain，第一个命令帧会吃到陈旧信号、在非帧边界 kick，
+         * 导致命令不被芯片识别（实测寄存器读回全 0x0503）。 */
+        while (xSemaphoreTake(s_drdy_sem, 0) == pdTRUE) {
+        }
+    }
+    return was;
 }
 
 esp_err_t ads_engine_xfer_frame(const uint32_t *tx, uint32_t *rx, uint32_t timeout_ms)
@@ -376,13 +419,15 @@ esp_err_t ads_engine_xfer_frame(const uint32_t *tx, uint32_t *rx, uint32_t timeo
     if (s_hw == NULL || rx == NULL) {
         return ESP_ERR_INVALID_STATE;
     }
-    /* 「清残留 → 等新鲜 DRDY → 交换帧」不可分割（与 M1 驱动同一语义）：
-     * 吃陈旧信号量会在任意相位 kick，无 CS 下即帧错位。 */
-    (void)xSemaphoreTake(s_drdy_sem, 0); /* 清残留 */
-    if (xSemaphoreTake(s_drdy_sem, pdMS_TO_TICKS(timeout_ms)) != pdTRUE) {
+    /* 维护帧直启（M3 修复）：置请求 → DRDY ISR 在边沿精确 kick → 等完成 → 取数。
+     * 关键收益：kick 从「任务被调度后」提前到「DRDY 边沿（ISR 内）」，消除任务
+     * 调度延迟对帧对齐的影响——这是此前命令不被芯片识别的根因。 */
+    s_maint_tx = tx; /* 触发下一个 DRDY 边沿由 ISR 直启本帧 */
+    if (xSemaphoreTake(s_maint_done_sem, pdMS_TO_TICKS(timeout_ms)) != pdTRUE) {
+        /* 超时：清掉悬空请求，避免后续 DRDY 误启陈旧帧 */
+        s_maint_tx = NULL;
         return ESP_ERR_TIMEOUT;
     }
-    engine_kick(tx, s_slot[0]); /* 维护帧借用槽 0（流式已暂停，无并发） */
     if (!wait_spi_done(1000)) { /* 1ms 封顶：正常 ~5µs，超时即硬件异常 */
         /* 超时 = SPI 事务未能完成，排查入口：描述符 owner 位、cmd.usr、
          * dma_int_raw.trans_done。已知成因两类（2026-10 实测）：
@@ -409,8 +454,11 @@ esp_err_t ads_engine_read_frame(uint32_t *rx, uint32_t timeout_ms)
     const uint32_t seq = atomic_load_explicit(&s_read_seq, memory_order_relaxed);
     const uint32_t kick = atomic_load_explicit(&s_kick_seq, memory_order_relaxed);
     if (seq == kick) {
-        /* 本 DRDY 因槽满没 kick（丢帧）：不产出数据 */
-        return ESP_ERR_TIMEOUT;
+        /* 本 DRDY 因槽满没 kick（丢帧）：不产出数据。
+         * 【B8 故障分流】丢帧返回 ESP_ERR_INVALID_STATE（区别于等 DRDY 超时的
+         * ESP_ERR_TIMEOUT）——丢帧是"错过一帧、下一帧照常"的瞬态，不该与
+         * "ADC 真死"混入同一条故障计数。 */
+        return ESP_ERR_INVALID_STATE;
     }
     if (!wait_spi_done(1000)) {
         return ESP_ERR_TIMEOUT;

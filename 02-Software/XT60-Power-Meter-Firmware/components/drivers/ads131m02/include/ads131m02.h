@@ -60,6 +60,17 @@ esp_err_t ads131m02_selftest(void);
  */
 uint32_t ads131m02_drdy_count(void);
 
+/**
+ * @brief 帧重同步请求消费（M3 容错，采样循环在无锁上下文调用）
+ *
+ * read() 检测到连续 CRC 失败（帧错位）时置重同步请求；本函数消费该请求并
+ * 执行「RESET# 硬复位 + 重新配置 + 恢复流式」。无请求时立即返回。
+ * ⚠ 不要在持有驱动总线锁的上下文调用（内部寄存器访问自带该锁）。
+ *
+ * @return ESP_OK 无请求或重同步成功；其他=重同步失败（保持停流待重试）
+ */
+esp_err_t ads131m02_resync_if_needed(void);
+
 /** 驱动运行统计（M1 基线验收与长期健康监控；自开机累计，不复位） */
 typedef struct {
     uint32_t drdy_count;   /**< DRDY# 下降沿累计 */

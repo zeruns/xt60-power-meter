@@ -251,7 +251,13 @@ static SemaphoreHandle_t s_bus_mutex = NULL;
 static uint32_t s_read_ok = 0;      /**< 成功读取帧数 */
 static uint32_t s_crc_fail = 0;     /**< CRC 校验失败帧数 */
 static uint32_t s_read_timeout = 0; /**< 等帧超时/丢帧次数 */
-static uint32_t s_crc_fail_streak = 0; /**< 连续 CRC 失败计数（M3 容错告警用） */
+static uint32_t s_crc_fail_streak = 0; /**< 连续 CRC 失败计数（M3 重同步触发用） */
+
+/** 连续 CRC 失败多少帧判定帧错位并请求重同步（无 CS 下 4 连败即不自愈） */
+#define ADS_CRC_RESYNC_AFTER 4u
+
+/** 帧重同步请求（read() 置位、采样循环经 ads131m02_resync_if_needed 消费） */
+static atomic_bool s_resync_req = false;
 
 /**
  * @brief 16bit 命令/寄存器值 -> 线上 24bit 字（MSB 对齐）
@@ -484,6 +490,90 @@ done:
     return err;
 }
 
+/**
+ * @brief 应用寄存器配置序列：UNLOCK → GAIN1 → CLOCK（init 与运行期重同步共用）
+ *
+ * 提取自 ads131m02_init() 的 ⑦⑨⑩.1：任何需要"重新配置芯片"的路径
+ * （初始化、CRC 连败重同步）都走同一份序列，避免两处漂移。
+ *
+ * @return ESP_OK 全部写入并回读一致；其他=关键寄存器配置失败
+ */
+static esp_err_t ads_apply_config(void)
+{
+    /* 解锁寄存器写保护（WREG 前必须，否则写入被静默丢弃） */
+    esp_err_t err = ads_send_cmd(ADS_CMD_UNLOCK, NULL);
+    if (err != ESP_OK) {
+        return err;
+    }
+    vTaskDelay(pdMS_TO_TICKS(ADS_CMD_GAP_MS));
+
+    /* GAIN1：CH0=16x（电流）/ CH1=1x（电压） */
+    err = ads_write_reg(ADS_REG_GAIN1, ADS_GAIN1_VALUE);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "GAIN1 写入未确认: %s", esp_err_to_name(err));
+    }
+    vTaskDelay(pdMS_TO_TICKS(ADS_CMD_GAP_MS));
+
+    /* 回读校验 GAIN1（写入未生效如未解锁，这里会暴露） */
+    uint16_t gain1_readback = 0;
+    err = ads_read_reg(ADS_REG_GAIN1, &gain1_readback);
+    if (err != ESP_OK) {
+        return err;
+    }
+    if (gain1_readback == ADS_GAIN1_VALUE) {
+        ESP_LOGI(TAG, "GAIN1 写入并回读一致（0x%04X），寄存器访问正常", gain1_readback);
+    } else {
+        ESP_LOGE(TAG, "GAIN1 回读不一致（回读=0x%04X 写入=0x%04X）", gain1_readback,
+                 ADS_GAIN1_VALUE);
+    }
+    vTaskDelay(pdMS_TO_TICKS(ADS_CMD_GAP_MS));
+
+    /* CLOCK：HR 模式 + OSR=1024 档 → ODR=4000SPS */
+    err = ads_write_reg(ADS_REG_CLOCK, ADS_CLOCK_VALUE);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "CLOCK(采样率) 写入未确认: %s", esp_err_to_name(err));
+    }
+    vTaskDelay(pdMS_TO_TICKS(ADS_CMD_GAP_MS));
+
+    uint16_t clock_readback = 0;
+    if (ads_read_reg(ADS_REG_CLOCK, &clock_readback) == ESP_OK) {
+        if (clock_readback == ADS_CLOCK_VALUE) {
+            ESP_LOGI(TAG, "CLOCK 回读 0x%04X：HR 模式 OSR=1024 档，ODR=%u SPS", clock_readback,
+                     ADS_ODR_HZ);
+        } else {
+            ESP_LOGW(TAG, "CLOCK 回读 0x%04X 与目标 0x%04X 不符", clock_readback, ADS_CLOCK_VALUE);
+        }
+    }
+    return ESP_OK;
+}
+
+/**
+ * @brief 运行期重同步（M3 容错）：CRC 连败 → 硬复位 + 重新配置
+ *
+ * 无 CS 接法下帧错位不自愈（手册 §8.5.1.7），连续 CRC 失败即判定帧边界
+ * 已错乱。最小闭环：停流式 → RESET# 硬复位 → 重新应用配置 → 清计数。
+ * 仍然失败由调用方再触发（有限次），避免无限复位循环。
+ *
+ * @return ESP_OK 重同步完成（配置生效）；其他=复位后仍配置失败
+ */
+static esp_err_t ads_resync(void)
+{
+    ESP_LOGW(TAG, "帧重同步：RESET# 硬复位 + 重新配置（连续 CRC 失败触发）");
+    ads_engine_set_stream(false);
+
+    /* SYNC#/RESET# 低电平 2ms（≥ 手册 2048·t_CLKIN≈250µs）→ 等 POR 完成 */
+    gpio_set_level(BOARD_PIN_ADC_RST, 0);
+    vTaskDelay(pdMS_TO_TICKS(ADS_RESET_LOW_MS));
+    gpio_set_level(BOARD_PIN_ADC_RST, 1);
+    vTaskDelay(pdMS_TO_TICKS(ADS_POWERUP_MS));
+
+    const esp_err_t err = ads_apply_config();
+    if (err == ESP_OK) {
+        ESP_LOGI(TAG, "重同步完成：寄存器配置已恢复");
+    }
+    return err;
+}
+
 esp_err_t ads131m02_init(void)
 {
     if (s_initialized) {
@@ -557,66 +647,15 @@ esp_err_t ads131m02_init(void)
     gpio_set_level(BOARD_PIN_ADC_RST, 1);
     vTaskDelay(pdMS_TO_TICKS(ADS_POWERUP_MS));
 
-    /* ---- ⑦ 解锁寄存器写保护（WREG 前必须，否则写入被静默丢弃） ----
-     * 不在此处额外发软件 RESET 命令的原因（依据手册 §8.4.1.3 / §8.5.1.11）：
-     *   软件 RESET(0011h) 只在“整帧时钟完整”时才被锁存，帧不完整时器件只会
-     *   回显 0011h 且不复位；而本工程 CRC 关闭、每帧固定 3 字，早期实测也确实
-     *   只收到回显。第⑥步的 SYNC/RESET# 引脚硬复位（低电平 2ms ≥ 手册要求的
-     *   2048·tCLKIN≈250µs，随后等待 50ms ≫ tPOR/tREGACQ）已经完整完成复位，
-     *   再发一个无法保证被锁存的软件 RESET 反而产生误导，故省略。 */
-    err = ads_send_cmd(ADS_CMD_UNLOCK, NULL);
+    /* ---- ⑦⑨⑩⑩.1 应用寄存器配置：UNLOCK → GAIN1 → CLOCK ----
+     * 详细序列（含各步取舍）见 ads_apply_config()；init 与运行期重同步
+     * （CRC 连败自恢复）共用同一份配置，避免两处漂移。
+     * 不发软件 RESET 的原因（依据手册 §8.4.1.3 / §8.5.1.11）：
+     *   软件 RESET(0011h) 只在"整帧时钟完整"时才被锁存，帧不完整时器件只会
+     *   回显 0011h 且不复位；第⑥步的 SYNC/RESET# 引脚硬复位已经完整完成复位。 */
+    err = ads_apply_config();
     if (err != ESP_OK) {
         goto fail_dev;
-    }
-    vTaskDelay(pdMS_TO_TICKS(ADS_CMD_GAP_MS));
-
-    /* ---- ⑨ 写 GAIN1：CH0 = 16x（电流）/ CH1 = 1x（电压） ----
-     * ads_write_reg() 会校验 WREG 应答字，写入未生效（如未解锁）会明确报错。 */
-    err = ads_write_reg(ADS_REG_GAIN1, ADS_GAIN1_VALUE);
-    if (err != ESP_OK) {
-        /* 不在此处返回失败的理由见文件头「上板调试要点」：ads131m02 是启动表里的
-         * 关键模块，一旦返回失败会把系统推到 FAULT。故只「响亮地报错」，
-         * 最终判定交给运行期 read() 超时（由 power_measure 上报 SYSTEM_FAULT_ADC）。 */
-        ESP_LOGE(TAG, "GAIN1 写入未确认: %s", esp_err_to_name(err));
-    }
-    vTaskDelay(pdMS_TO_TICKS(ADS_CMD_GAP_MS));
-
-    /* ---- ⑩ 读回校验 GAIN1 ---- */
-    uint16_t gain1_readback = 0;
-    err = ads_read_reg(ADS_REG_GAIN1, &gain1_readback);
-    if (err != ESP_OK) {
-        goto fail_dev;
-    }
-    if (gain1_readback == ADS_GAIN1_VALUE) {
-        ESP_LOGI(TAG, "GAIN1 写入并回读一致（0x%04X），寄存器访问正常", gain1_readback);
-    } else {
-        ESP_LOGE(TAG, "GAIN1 回读不一致（回读=0x%04X 写入=0x%04X）：寄存器访问可能有问题，"
-                      "请按文件头调试要点排查",
-                 gain1_readback, ADS_GAIN1_VALUE);
-    }
-    vTaskDelay(pdMS_TO_TICKS(ADS_CMD_GAP_MS));
-
-    /* ---- ⑩.1 写 CLOCK：HR 模式 + OSR=1024 档 -> 输出数据率 4kSPS ----
-     * 与芯片复位默认（0x030E）相同，仍显式写入并回读，保证采样率确定。
-     * 4kHz 稳定工作的前提是"读窗不跨越转换完成时刻"（SBAS853 §8.5.1.5），
-     * 由 20MHz+DMA 紧凑读窗保证（详见 ADS_CLOCK_VALUE 注释与
-     * ads131m02_get_stats() 的 δ 实测）。 */
-    err = ads_write_reg(ADS_REG_CLOCK, ADS_CLOCK_VALUE);
-    if (err != ESP_OK) {
-        ESP_LOGE(TAG, "CLOCK(采样率) 写入未确认: %s", esp_err_to_name(err));
-    }
-    vTaskDelay(pdMS_TO_TICKS(ADS_CMD_GAP_MS));
-
-    uint16_t clock_readback = 0;
-    err = ads_read_reg(ADS_REG_CLOCK, &clock_readback);
-    if (err == ESP_OK) {
-        if (clock_readback == ADS_CLOCK_VALUE) {
-            ESP_LOGI(TAG, "CLOCK 回读 0x%04X：HR 模式 OSR=1024 档，ODR=%u SPS", clock_readback,
-                     ADS_ODR_HZ);
-        } else {
-            ESP_LOGW(TAG, "CLOCK 回读 0x%04X 与目标 0x%04X 不符（实际 ODR 可能不是 %u SPS）",
-                     clock_readback, ADS_CLOCK_VALUE, ADS_ODR_HZ);
-        }
     }
 
     /* ---- ⑪ 通信判定：读器件 ID ----
@@ -737,9 +776,15 @@ esp_err_t ads131m02_read(ads131m02_sample_t *out)
         return ESP_ERR_TIMEOUT;
     }
 
-    /* 从引擎消费一帧：DRDY ISR 已直接 kick（M2），这里等信号 + 取槽 */
+    /* 从引擎消费一帧：DRDY ISR 已直接 kick（M2），这里等信号 + 取槽。
+     * 【B8 故障分流】ESP_ERR_INVALID_STATE = 槽满丢帧（瞬态，不计超时统计）；
+     * ESP_ERR_TIMEOUT = 等 DRDY 超时（真故障候选，计数供故障判定）。 */
     uint32_t rx[ADS_FRAME_WORDS] = { 0 };
     esp_err_t err = ads_engine_read_frame(rx, ADS_DRDY_TIMEOUT_MS);
+    if (err == ESP_ERR_INVALID_STATE) {
+        ads_bus_unlock();
+        return ESP_ERR_INVALID_STATE; /* 丢帧：透传给调用方区分处理 */
+    }
     if (err != ESP_OK) {
         s_read_timeout++;
         ads_bus_unlock();
@@ -769,11 +814,16 @@ esp_err_t ads131m02_read(ads131m02_sample_t *out)
         out->crc_ok = (crc_calc == crc_rx);
         if (!out->crc_ok) {
             s_crc_fail++;
-            /* M3 容错观测：连续 CRC 失败说明帧完整性持续异常（位错/时序越界），
-             * 单发告警便于长跑发现；帧错位在本引擎"每 kick 一帧"模型下不跨帧持续。 */
-            if (++s_crc_fail_streak == 32u) {
-                ESP_LOGE(TAG, "连续 32 帧 CRC 校验失败：请检查 MISO 时序（降 SCLK 验证）"
-                              "或帧格式配置");
+            /* M3 重同步状态机（最小闭环）：连续 4 帧 CRC 错 → 判定帧错位
+             * （无 CS 接法下错位不自愈，手册 §8.5.1.7）→ 置重同步请求。
+             * ⚠ 不在本函数内直接调 ads_resync()：read() 持有总线锁，而
+             * ads_apply_config() 内的寄存器访问函数自带同一把锁，同任务
+             * 嵌套取锁即死锁。改为置标志，由采样循环在无锁上下文消费
+             * （ads131m02_resync_if_needed）。 */
+            if (++s_crc_fail_streak >= ADS_CRC_RESYNC_AFTER) {
+                s_crc_fail_streak = 0;
+                atomic_store(&s_resync_req, true);
+                ESP_LOGW(TAG, "连续 %u 帧 CRC 失败，请求帧重同步", ADS_CRC_RESYNC_AFTER);
             }
         } else {
             s_crc_fail_streak = 0;
@@ -793,6 +843,22 @@ esp_err_t ads131m02_read(ads131m02_sample_t *out)
     }
 
     ads_bus_unlock();
+    return err;
+}
+
+esp_err_t ads131m02_resync_if_needed(void)
+{
+    /* atomic_exchange：一次性消费请求标志（多核/多上下文安全） */
+    if (!atomic_exchange(&s_resync_req, false)) {
+        return ESP_OK; /* 无请求：常态快速返回 */
+    }
+    esp_err_t err = ads_resync();
+    if (err == ESP_OK) {
+        /* 重同步成功恢复流式采样（ads_resync 内部已停流式） */
+        ads_engine_set_stream(true);
+    } else {
+        ESP_LOGE(TAG, "重同步后配置仍失败: %s（保持停流，等待下轮再试）", esp_err_to_name(err));
+    }
     return err;
 }
 

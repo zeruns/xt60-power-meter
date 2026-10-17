@@ -204,3 +204,8 @@ CONFIG_LWIP_MAX_SOCKETS=16
 # 注意：V6.1 已把该选项由 GPIO_ISR_IRAM_SAFE 更名为 GPIO_CTRL_FUNC_IN_IRAM，
 # 沿用旧名会被报为 unknown kconfig symbol 并静默失效（等于失去本保护）。
 CONFIG_GPIO_CTRL_FUNC_IN_IRAM=y
+# DRDY ISR 内调用 esp_timer_get_time()（δ 延迟统计，ads131m02_engine.c）。
+# 该函数的 IRAM 属性随 CONFIG_ESP_TIMER_IN_IRAM 条件编译
+# （IDF esp_timer_impl.h 的 ESP_TIMER_IRAM_ATTR 宏），不开此项时它留在 Flash，
+# cache 关闭窗口被 DRDY 中断命中即 Cache error 崩溃。
+CONFIG_ESP_TIMER_IN_IRAM=y
