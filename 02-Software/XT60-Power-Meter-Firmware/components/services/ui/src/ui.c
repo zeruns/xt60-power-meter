@@ -8,7 +8,8 @@
  *      底部页面指示点；触摸横滑或 K1/K2 按键翻页；波形页上滑出设置滑板。
  *
  * 数据来源：middleware/data_store 快照（测量任务在 Core1 写入），
- * 本任务以 5Hz 读取刷新，不直接访问任何驱动。
+ * 本任务按页面节奏读取刷新：测量页 1/5/10/20/30Hz 可设、波形页固定 25Hz、
+ * 状态栏与设置页 5Hz，不直接访问任何驱动。
  *
  * 任务约定：UI 任务绑定 Core 0（交互核），所有 LVGL 访问都在
  * lvgl_port 互斥锁保护下；按键回调运行在 esp_timer 任务，只向队列投递，
@@ -78,16 +79,6 @@ static const char *TAG = "ui";
 #define UI_INPUT_QUEUE_LEN 16         /**< 按键消息队列深度（FreeRTOS 队列，满则丢弃新事件） */
 
 static bool s_ui_inited = false; /**< ui_init 防重复初始化标志 */
-
-/* ============================================================
- * 临时诊断开关（复现"首页数据快速刷新后 UI 卡死"）。定位后请改回 0/删除。
- *
- * 开启后 UI 任务会每隔约 1s 自动执行一步操作序列，等价于"无人值守地
- * 反复开/关快速菜单、翻页、旋转屏幕"，从而在 PC 侧串口日志里稳定复现
- * 卡死，并借助 app_task 的"冻结诊断"行判定卡在渲染管线还是 UI 任务。
- * 用法：把 UI_SELFTEST 改成 1 重新编译烧录即可，无需接任何调试器。
- * ============================================================ */
-#define UI_SELFTEST 0 /**< 1=开启无人值守 UI 压力自测（临时诊断用，发布前必须为 0） */
 
 /** UI 任务心跳（主循环每轮更新）：供 app_task 判断 UI 任务是否也停摆 */
 static volatile int64_t s_ui_loop_us = 0;     /**< 最近一轮主循环的时间戳（esp_timer 微秒） */
@@ -184,11 +175,36 @@ static void button_cb(button_id_t id, button_event_t event, void *ctx)
     }
 }
 
+/** 当前告警弹窗对象（NULL = 未打开；v0.2.0 仪器功能批 F3） */
+static lv_obj_t *s_alert_box = NULL;
+/** 上次已弹过窗的告警位图：仅在上升沿弹窗，持续越限不重复弹 */
+static uint32_t s_alert_shown_mask = 0;
+
+/**
+ * @brief 关闭告警弹窗（调用时持有 LVGL 锁）
+ */
+static void alert_box_close(void)
+{
+    if (s_alert_box != NULL) {
+        lv_msgbox_close(s_alert_box);
+        s_alert_box = NULL;
+    }
+}
+
+/**
+ * @brief 告警弹窗"确认"按钮回调：关闭弹窗
+ */
+static void alert_ok_cb(lv_event_t *e)
+{
+    (void)e;
+    alert_box_close();
+}
+
 /**
  * @brief 处理队列中所有待处理的按键消息（调用时持有 LVGL 锁）
  *
  * 每轮主循环调用一次，把积压消息一次取空（while 循环取到队空为止），
- * 再逐条交给 ui_nav 做页面路由。
+ * 再逐条交给 ui_nav 做页面路由。告警弹窗打开时例外：按键先归弹窗。
  */
 static void drain_key_queue(void)
 {
@@ -196,6 +212,12 @@ static void drain_key_queue(void)
     /* xQueueReceive：从队列取一条消息；超时 0 = 队列空立刻返回 pdFALSE，
      * 于是 while 循环在取空时退出，不会拖慢主循环节拍。 */
     while (xQueueReceive(s_key_queue, &msg, 0) == pdTRUE) {
+        /* 告警弹窗优先于一切按键路由：弹窗期间任意按键=确认关闭
+         * （与启动故障弹窗"任意按键放行"同语义——触摸排线故障时也能关） */
+        if (s_alert_box != NULL) {
+            alert_box_close();
+            continue;
+        }
         ui_nav_handle_key(msg.id, msg.event);
     }
 }
@@ -259,8 +281,9 @@ static void apply_backlight(void)
  * 主循环节奏（重要）：
  *   LVGL 的 lv_timer_handler() 与心跳已由 ESP 官方 esp_lvgl_port 的内部任务
  *   驱动（见 middleware/lvgl_port 组件），本任务**不再自行调用** lv_timer_handler()，
- *   只负责：① 启动画面计时与进度更新；② 每 200ms 刷新一次数据（稳定 5Hz）；
- *   ③ 消费按键队列。所有 LVGL 访问仍在 lvgl_port_lock() 保护下进行。
+ *   只负责：① 启动画面计时与进度更新；② 按页面节奏刷新数据（测量页 1~30Hz
+ *   可设、波形页 25Hz、状态栏/设置页 5Hz）；③ 消费按键队列。
+ *   所有 LVGL 访问仍在 lvgl_port_lock() 保护下进行。
  *
  * @param arg FreeRTOS 任务入口参数（未使用）
  */
@@ -500,6 +523,41 @@ static void task_ui(void *arg)
             if (have_data) {
                 latest = s_hist[(s_hist_pos - 1 + SNAP_HIST) % SNAP_HIST];
             }
+
+            /* ②b 告警上升沿检测（v0.2.0 仪器功能批 F3）：
+             * alert_mask 上升沿弹窗一次；恢复到 0 时关闭在开的弹窗。
+             * 每轮都查（不设周期）：弹窗是安全相关，200ms 内必须有反馈。 */
+            if (have_data) {
+                const uint32_t cur = latest.alert_mask;
+                if (cur != 0 && cur != s_alert_shown_mask) {
+                    /* 上升沿（或越限项变化）：弹窗（替换旧弹窗，不堆叠） */
+                    alert_box_close();
+                    char msg[96] = "";
+                    if (cur & DATA_ALERT_OVP) {
+                        snprintf(msg + strlen(msg), sizeof(msg) - strlen(msg), "过压 %.2fV\n",
+                                 (double)latest.voltage_v);
+                    }
+                    if (cur & DATA_ALERT_OCP) {
+                        snprintf(msg + strlen(msg), sizeof(msg) - strlen(msg), "过流 %.2fA\n",
+                                 (double)latest.current_a);
+                    }
+                    if (cur & DATA_ALERT_OPP) {
+                        snprintf(msg + strlen(msg), sizeof(msg) - strlen(msg), "过功率 %.2fW\n",
+                                 (double)latest.power_w);
+                    }
+                    lv_obj_t *box = lv_msgbox_create(NULL);
+                    lv_msgbox_add_title(box, "⚠ 测量告警");
+                    lv_msgbox_add_text(box, msg);
+                    lv_obj_t *ok = lv_msgbox_add_footer_button(box, "确认");
+                    lv_obj_add_event_cb(ok, alert_ok_cb, LV_EVENT_CLICKED, NULL);
+                    s_alert_box = box;
+                } else if (cur == 0 && s_alert_box != NULL) {
+                    /* 恢复正常：自动关闭在开的告警弹窗 */
+                    alert_box_close();
+                }
+                s_alert_shown_mask = cur;
+            }
+
             if (have_data && now_us - s_last_bar_us >= UI_STATUSBAR_PERIOD_US) {
                 s_last_bar_us = now_us;
                 ui_nav_refresh_statusbar(&latest); /* 刷时间/电量/页码点（任何页面都刷） */
@@ -554,61 +612,6 @@ static void task_ui(void *arg)
                     screen_settings_refresh(&latest);
                 }
             }
-
-#if UI_SELFTEST
-            /* ---- 临时诊断：UI 压力自测（每约 1s 一步，循环往复）----
-             * 每步打印当前页/菜单状态，便于从日志还原"卡死前最后一步"。 */
-            {
-                static int64_t s_st_us = 0;
-                static int s_step = 0;
-                if (now_us - s_st_us >= 1000000) {
-                    s_st_us = now_us;
-                    ESP_LOGW(TAG, "[自测] step=%d 页=%d 菜单=%d", s_step, (int)ui_nav_current_page(),
-                             (int)screen_measure_menu_is_open());
-                    switch (s_step % 12) {
-                    case 0: /* 开测量快速菜单 */
-                        ui_nav_handle_key(BUTTON_ID_USER, BUTTON_EVENT_LONG_PRESS_START);
-                        break;
-                    case 1: /* 焦点下移 */
-                        ui_nav_handle_key(BUTTON_ID_USER, BUTTON_EVENT_SINGLE_CLICK);
-                        break;
-                    case 2: /* 激活（切刷新率档） */
-                        ui_nav_handle_key(BUTTON_ID_USER, BUTTON_EVENT_DOUBLE_CLICK);
-                        break;
-                    case 3: /* 关菜单 */
-                        ui_nav_handle_key(BUTTON_ID_BOOT, BUTTON_EVENT_LONG_PRESS_START);
-                        break;
-                    case 4: /* → 波形页 */
-                        ui_nav_handle_key(BUTTON_ID_USER, BUTTON_EVENT_SINGLE_CLICK);
-                        break;
-                    case 5: /* → 设置页 */
-                        ui_nav_handle_key(BUTTON_ID_USER, BUTTON_EVENT_SINGLE_CLICK);
-                        break;
-                    case 6: /* 旋转 90°（竖屏，触发整树重建） */
-                        lvgl_port_set_rotation_angle(90);
-                        break;
-                    case 7: /* 旋转回 0° */
-                        lvgl_port_set_rotation_angle(0);
-                        break;
-                    case 8: /* ← 波形页 */
-                        ui_nav_handle_key(BUTTON_ID_BOOT, BUTTON_EVENT_SINGLE_CLICK);
-                        break;
-                    case 9: /* ← 测量页 */
-                        ui_nav_handle_key(BUTTON_ID_BOOT, BUTTON_EVENT_SINGLE_CLICK);
-                        break;
-                    case 10: /* 再次开菜单 */
-                        screen_measure_open_menu();
-                        break;
-                    case 11: /* 旋转 90°（菜单开着时旋转） */
-                        lvgl_port_set_rotation_angle(90);
-                        break;
-                    default:
-                        break;
-                    }
-                    s_step++;
-                }
-            }
-#endif
 
             lvgl_port_unlock();
         }

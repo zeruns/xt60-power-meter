@@ -1,6 +1,6 @@
 /**
  * @file screen_settings.c
- * @brief 设置页：2×3 功能网格入口 + 五个功能二级页（v0.2.0 设置全可用）
+ * @brief 设置页：2×4 功能网格入口 + 六个功能二级页（v0.2.0 设置全可用）
  *
  * ────────────────────────────────────────────────────────────
  * 版式（284×240；顶部 22px 状态栏由 ui_nav 共享，不在本页职责内）
@@ -9,14 +9,17 @@
  *   ┌ x=14 ──────────────────── x=270 ┐
  *   │ 设置                              │ y≈28 标题（Bold 20）
  *   │ ┌──────────┐ ┌──────────┐        │ y=52
- *   │ │ 测量设置  │ │ 显示设置  │        │ 每格 122×48
+ *   │ │ 测量设置  │ │ 显示设置  │        │ 每格约 122×40
  *   │ └──────────┘ └──────────┘        │
- *   │ ┌──────────┐ ┌──────────┐        │ y=108
+ *   │ ┌──────────┐ ┌──────────┐        │ y=98
  *   │ │ 蜂鸣器    │ │ WiFi     │        │
  *   │ └──────────┘ └──────────┘        │
- *   │ ┌──────────┐ ┌──────────┐        │ y=164
- *   │ │ 电能统计  │ │ 关于本机  │        │
+ *   │ ┌──────────┐ ┌──────────┐        │ y=144
+ *   │ │ 电能统计  │ │ 告警设置  │        │
  *   │ └──────────┘ └──────────┘        │
+ *   │ ┌──────────┐                    │ y=190
+ *   │ │ 关于本机  │        （空位）     │ 第 8 格留空（功能 7 项）
+ *   │ └──────────┘                    │
  *   └──────────────────────────────────┘
  *
  * 二级页：覆盖整个 tile 的浮层（随 tile 一起被横向滑动，不跨页），
@@ -30,17 +33,20 @@
  *   · 标定：power_measure_get/set_calibration（单点增益校准，
  *     修正"读数 × 增益 = 标准值"的增益系数；零点 offset 保持原值）；
  *   · 电能清零：power_measure_reset_energy（测量核在块边界执行，防跨核撕裂）；
+ *   · 告警阈值：settings_get/set_alarm（v_en/i_en/p_en 使能 + V/A/W 三阈值，
+ *     判定在测量核做，本页只管持久化用户设定）；
  *   · WiFi：v0.5.0 才提供联网能力，本页为路线图说明（诚实预期管理）。
  *
  * ────────────────────────────────────────────────────────────
  * 页面结构（各子页一览）
  * ────────────────────────────────────────────────────────────
- *   首页 2×3 网格 → 点击进入对应二级页：
+ *   首页 2×4 网格 → 点击进入对应二级页：
  *   · 测量设置  → 校准向导（通道选择 → 标准值输入 → 完成提示，三级）
  *   · 显示设置  → 亮度滑条 + 自动旋转开关 + 0/90/180/270° 角度按钮
  *   · 蜂鸣器    → 响度滑条 + 试听按钮
  *   · WiFi      → 路线图说明页（联网能力 v0.5.0 才有，本页不提供开关）
  *   · 电能统计  → 累计电能/运行时间 + 确认框清零
+ *   · 告警设置  → 过压/过流/过功率三阈值（＋/－ 步进）+ 三项使能开关
  *   · 关于本机  → 信息对话框（无二级页）
  *
  * ────────────────────────────────────────────────────────────
@@ -108,9 +114,10 @@
 /* ---- 首页网格几何 ---- */
 #define GRID_SIDE_PAD 14 /**< 左右内缩（避开面板圆角） */
 #define GRID_TOP_Y    52 /**< 网格起始 y */
-#define CELL_HEIGHT   48 /**< 单格高度（≥40px 触摸目标标准） */
+#define CELL_HEIGHT   40 /**< 单格高度（40px 仍达触摸目标下限；4 行后压到此高度
+                          *   才能一屏放下 7 个功能格） */
 #define CELL_GAP_X    10 /**< 网格两列之间的间距 */
-#define CELL_GAP_Y    8  /**< 网格三行之间的间距 */
+#define CELL_GAP_Y    8  /**< 网格四行之间的间距 */
 
 /* ---- 二级页 ---- */
 #define SUB_TOPBAR_H 36 /**< 二级页顶部标题栏高度（含"返回"按钮） */
@@ -135,6 +142,7 @@ typedef enum {
     SUB_BUZZER,     /**< 蜂鸣器响度 */
     SUB_WIFI,       /**< WiFi 路线图说明 */
     SUB_ENERGY,     /**< 电能统计与清零 */
+    SUB_ALARM,      /**< 告警设置：过压/过流/过功率阈值 + 使能 */
 } sub_kind_t;
 
 static lv_obj_t *s_tile = NULL;      /**< 设置页 tile（二级页浮层的父级） */
@@ -155,6 +163,10 @@ static lv_obj_t *s_energy_wh_label = NULL;    /**< 电能统计：累计电能 *
 static lv_obj_t *s_energy_rt_label = NULL;    /**< 电能统计：运行时间 */
 static lv_obj_t *s_bright_value_label = NULL; /**< 显示设置：亮度数值 */
 static lv_obj_t *s_vol_value_label = NULL;    /**< 蜂鸣器：响度数值 */
+static lv_obj_t *s_alarm_value_labels[3] = { 0 }; /**< 告警设置：三阈值数值标签（V/A/W） */
+
+/** 告警设置页：当前编辑中的配置（改完即 settings_set_alarm，防抖落盘） */
+static settings_alarm_t s_alarm_cfg;
 
 /* 校准向导状态 */
 static bool s_cal_is_voltage = true; /**< true=电压通道，false=电流通道 */
@@ -171,15 +183,16 @@ static lv_obj_t *s_angle_btns[4] = { 0 }; /**< 0/90/180/270 度按钮 */
 static lv_obj_t *s_auto_switch = NULL;    /**< 重力自动旋转开关 */
 static const uint16_t s_angle_vals[4] = { 0, 90, 180, 270 };
 
-#define GRID_CELL_COUNT 6 /**< 设置首页网格功能格数 */
+#define GRID_CELL_COUNT 8 /**< 设置首页网格功能格数（7 个功能 + 1 个留空位） */
 
 /* ---- 设置首页网格焦点（二级页全关时由长按 K2 进入） ---- */
-static lv_obj_t *s_grid_cells[GRID_CELL_COUNT] = { 0 }; /**< 六格按钮（登记顺序＝焦点顺序） */
+static lv_obj_t *s_grid_cells[GRID_CELL_COUNT] = { 0 }; /**< 各格按钮（登记顺序＝焦点顺序） */
 static bool s_grid_focus_on = false; /**< true = 网格焦点模式（单击移焦点/长按 K2 打开焦点格） */
 static int s_grid_idx = 0;           /**< 网格焦点格下标（跨子页往返保持，返回后接着来） */
 
 /** 校准完成 1.4s 自动关页定时器（句柄管理：关页/切页时显式删除，防误关新页面） */
 static lv_timer_t *s_close_timer = NULL;
+static lv_timer_t *s_zero_timer = NULL; /**< 清零采样定时器（40ms 轮询；声明在此因 subpage_close 等需提前引用） */
 
 /* ============================================================
  * 对话框（lv_msgbox + 顶层图层可点击技巧，沿用原实现）
@@ -553,7 +566,7 @@ static lv_obj_t *plain_button(lv_obj_t *parent, const char *text, int32_t w, int
  * 按键反馈鸣叫由 ui_nav_handle_key 统一播放，本文件不重复响。
  * ============================================================ */
 
-#define FOCUS_MAX 8   /**< 焦点链容量（最长子页 6 控件，留余量） */
+#define FOCUS_MAX 10  /**< 焦点链容量（最长子页 9 控件：告警页 3×2± + 3 开关） */
 #define SLIDER_STEP 5 /**< 滑条按键步进（百分点：10~100 档 20 步走完） */
 
 static lv_obj_t *s_focus_widgets[FOCUS_MAX]; /**< 焦点链：当前子页可操作控件 */
@@ -602,6 +615,21 @@ static void grid_paint(void)
         lv_obj_set_style_outline_color(w, COL_PRIMARY, 0);
         lv_obj_set_style_outline_pad(w, 2, 0);
     }
+}
+
+/**
+ * @brief 网格焦点环形移动（跳过留空格，见 make_cell_dispatch 的 cb=NULL 分支）
+ * @param dir +1=下一格 / -1=上一格（负数取模先加长度防溢出）
+ */
+static void grid_focus_move(int dir)
+{
+    for (int n = 0; n < GRID_CELL_COUNT; n++) {
+        s_grid_idx = (s_grid_idx + dir + GRID_CELL_COUNT) % GRID_CELL_COUNT;
+        if (s_grid_cells[s_grid_idx] != NULL) {
+            break; /* 落在功能格上即停（留空格自动略过） */
+        }
+    }
+    grid_paint();
 }
 
 /**
@@ -766,9 +794,20 @@ static void subpage_close(void)
         lv_timer_delete(s_close_timer); /* lv_timer_delete：从 LVGL 定时器链表摘除并释放 */
         s_close_timer = NULL;           /* 置 NULL 防悬空：删完的句柄绝不能再 delete */
     }
+    /* 【B12 修复】清零采样定时器同样必须随页失效：否则 1 秒窗口结束后回调会在
+     * 已关闭的页面上弹"已清零"浮层（与 s_close_timer 同型悬空 bug）。 */
+    if (s_zero_timer != NULL) {
+        lv_timer_delete(s_zero_timer);
+        s_zero_timer = NULL;
+    }
     if (s_subpage != NULL) {
         /* lv_obj_delete()：删除对象并连带删除其所有子对象（标题栏/内容区在内） */
         lv_obj_delete(s_subpage);
+    }
+    /* 告警设置页：离开时立即落盘（settings_set_alarm 是防抖落盘，
+     * 这里补一次 settings_save_now 保证退出即写入，掉电不丢）。 */
+    if (s_sub_kind == SUB_ALARM) {
+        (void)settings_save_now();
     }
     s_subpage = NULL;
     s_sub_content = NULL;
@@ -780,6 +819,7 @@ static void subpage_close(void)
     s_energy_rt_label = NULL;
     s_bright_value_label = NULL;
     s_vol_value_label = NULL;
+    memset(s_alarm_value_labels, 0, sizeof(s_alarm_value_labels));
     memset(s_angle_btns, 0, sizeof(s_angle_btns));
     s_auto_switch = NULL;
 }
@@ -1113,7 +1153,7 @@ static void calib_apply_cb(lv_event_t *e)
  *
  * @param e LVGL 点击事件（未使用）
  */
-static lv_timer_t *s_zero_timer = NULL;  /**< 清零采样定时器（40ms 轮询） */
+/* 清零采样定时器声明见文件前部（s_close_timer 旁） */
 static float s_zero_sum = 0.0f;          /**< 清零采样电流累计（A） */
 static uint32_t s_zero_n = 0;            /**< 清零采样帧数 */
 static int64_t s_zero_start_us = 0;      /**< 清零采样起点（µs） */
@@ -1689,6 +1729,282 @@ static void energy_open_cb(void)
 }
 
 /* ============================================================
+ * 二级页：告警设置（过压/过流/过功率阈值 + 使能开关）
+ * ============================================================ */
+
+/** 三行告警项下标 */
+#define ALARM_ROW_V 0 /**< 过压（V） */
+#define ALARM_ROW_I 1 /**< 过流（A） */
+#define ALARM_ROW_P 2 /**< 过功率（W） */
+#define ALARM_ROW_CNT 3
+
+/** 阈值范围与步进（settings_set_alarm 要求阈值 >0，故下限取最小步进而非 0） */
+#define ALARM_V_MIN 0.1f
+#define ALARM_V_MAX 30.0f
+#define ALARM_V_STEP 0.1f
+#define ALARM_I_MIN 0.1f
+#define ALARM_I_MAX 20.0f
+#define ALARM_I_STEP 0.1f
+#define ALARM_P_MIN 1.0f
+#define ALARM_P_MAX 200.0f
+#define ALARM_P_STEP 1.0f
+
+/**
+ * @brief 取某行阈值的范围/步进（集中一张表，避免三个回调各写一套）
+ * @param row 行下标（ALARM_ROW_*）
+ * @param min,max,step [out] 下限/上限/步进
+ */
+static void alarm_row_range(int row, float *min, float *max, float *step)
+{
+    switch (row) {
+    case ALARM_ROW_V:
+        *min = ALARM_V_MIN;
+        *max = ALARM_V_MAX;
+        *step = ALARM_V_STEP;
+        break;
+    case ALARM_ROW_I:
+        *min = ALARM_I_MIN;
+        *max = ALARM_I_MAX;
+        *step = ALARM_I_STEP;
+        break;
+    default:
+        *min = ALARM_P_MIN;
+        *max = ALARM_P_MAX;
+        *step = ALARM_P_STEP;
+        break;
+    }
+}
+
+/**
+ * @brief 取某行当前阈值的指针（直接指向 s_alarm_cfg 内对应字段）
+ * @param row 行下标（ALARM_ROW_*）
+ * @return 阈值字段地址
+ */
+static float *alarm_row_value(int row)
+{
+    switch (row) {
+    case ALARM_ROW_V:
+        return &s_alarm_cfg.v_limit;
+    case ALARM_ROW_I:
+        return &s_alarm_cfg.i_limit;
+    default:
+        return &s_alarm_cfg.p_limit;
+    }
+}
+
+/**
+ * @brief 刷新某行阈值数值标签（"14.10 V" / "2.05 A" / "28.9 W"）
+ * @param row 行下标（ALARM_ROW_*）
+ */
+static void alarm_update_label(int row)
+{
+    lv_obj_t *lbl = s_alarm_value_labels[row];
+    if (lbl == NULL) {
+        return;
+    }
+    char buf[24];
+    snprintf(buf, sizeof(buf), "%.2f %s", (double)(*alarm_row_value(row)),
+             row == ALARM_ROW_V ? "V" : (row == ALARM_ROW_I ? "A" : "W"));
+    lv_label_set_text(lbl, buf);
+}
+
+/**
+ * @brief 把当前编辑中的 s_alarm_cfg 应用到 settings（防抖落盘）
+ *
+ * 阈值已由 alarm_step_cb 钳到合法范围（>0），这里再兜一次底：
+ * 任一项 ≤0（异常场景）则整体不写，保持原值不变。
+ */
+static void alarm_apply(void)
+{
+    if (!(s_alarm_cfg.v_limit > 0.0f) || !(s_alarm_cfg.i_limit > 0.0f) ||
+        !(s_alarm_cfg.p_limit > 0.0f)) {
+        return;
+    }
+    (void)settings_set_alarm(&s_alarm_cfg);
+}
+
+/**
+ * @brief 阈值 ± 步进回调（"－"/"＋"按钮共用；user_data 编码行号与方向）
+ *
+ * user_data = row*2 + (dir>0 ? 1 : 0)：两个按钮共用一个回调，
+ * 从 user_data 解出"哪一行、加还是减"（与校准向导的 ± 回调同思路）。
+ * 步进后钳制到 [min,max]，越界即停（不回绕），随后刷新标签并落盘。
+ *
+ * @param e LVGL 点击事件
+ */
+static void alarm_step_cb(lv_event_t *e)
+{
+    int code = (int)(intptr_t)lv_event_get_user_data(e);
+    int row = code / 2;
+    int dir = (code & 1) ? +1 : -1;
+    if (row < 0 || row >= ALARM_ROW_CNT) {
+        return;
+    }
+    float lo, hi, step;
+    alarm_row_range(row, &lo, &hi, &step);
+    float *v = alarm_row_value(row);
+    float nv = *v + (float)dir * step;
+    if (nv < lo) {
+        nv = lo;
+    }
+    if (nv > hi) {
+        nv = hi;
+    }
+    *v = nv;
+    alarm_update_label(row);
+    alarm_apply();
+    (void)buzzer_play(BUZZER_TONE_CLICK); /* 步进反馈音（触屏/按键路径统一） */
+}
+
+/**
+ * @brief 使能开关回调（翻转对应 v_en/i_en/p_en 并落盘）
+ * @param e LVGL 值变化事件；user_data 携带行号（ALARM_ROW_*）
+ */
+static void alarm_switch_cb(lv_event_t *e)
+{
+    lv_obj_t *sw = lv_event_get_target(e);
+    int row = (int)(intptr_t)lv_event_get_user_data(e);
+    if (row < 0 || row >= ALARM_ROW_CNT) {
+        return;
+    }
+    bool on = lv_obj_has_state(sw, LV_STATE_CHECKED);
+    switch (row) {
+    case ALARM_ROW_V:
+        s_alarm_cfg.v_en = on ? 1u : 0u;
+        break;
+    case ALARM_ROW_I:
+        s_alarm_cfg.i_en = on ? 1u : 0u;
+        break;
+    default:
+        s_alarm_cfg.p_en = on ? 1u : 0u;
+        break;
+    }
+    alarm_apply();
+    (void)buzzer_play(BUZZER_TONE_CLICK);
+}
+
+/**
+ * @brief 构造一行"阈值 ± 调节"（名称 + － + 数值 + ＋），并登记焦点链
+ *
+ * 行内 flex 横排：名称左对齐，± 与数值靠右成组。
+ * 焦点链按"－ → ＋"逐行登记，纯按键路径就是 K1/K2 移焦点、长按 K2 点按钮。
+ *
+ * @param c    二级页内容容器
+ * @param row  行下标（ALARM_ROW_*）
+ * @param name 行名称（"过压" 等）
+ * @return 行容器（未用，便于将来扩展）
+ */
+static lv_obj_t *alarm_add_limit_row(lv_obj_t *c, int row, const char *name)
+{
+    lv_obj_t *r = plain_container(c);
+    lv_obj_set_size(r, LV_PCT(100), 36);
+    lv_obj_set_flex_flow(r, LV_FLEX_FLOW_ROW);
+    lv_obj_set_flex_align(r, LV_FLEX_ALIGN_SPACE_BETWEEN, LV_FLEX_ALIGN_CENTER,
+                          LV_FLEX_ALIGN_CENTER);
+    plain_label(r, name, LVGL_PORT_FONT_16, COL_INK, false);
+
+    /* 右侧调节组：－ 数值 ＋ */
+    lv_obj_t *grp = plain_container(r);
+    lv_obj_set_size(grp, LV_SIZE_CONTENT, 36);
+    lv_obj_set_flex_flow(grp, LV_FLEX_FLOW_ROW);
+    lv_obj_set_flex_align(grp, LV_FLEX_ALIGN_END, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    lv_obj_set_style_pad_column(grp, 4, 0);
+
+    /* 注意：用全角"－/＋"（GB2312 子集内），不用 U+2212 数学减号（字库无字形）。
+     * user_data = row*2 + 方向位，两个按钮共用 alarm_step_cb。 */
+    lv_obj_t *minus = plain_button(grp, "－", 36, 32);
+    lv_obj_add_event_cb(minus, alarm_step_cb, LV_EVENT_CLICKED, (void *)(intptr_t)(row * 2));
+
+    s_alarm_value_labels[row] = plain_label(grp, "--", LVGL_PORT_FONT_16, COL_PRIMARY, true);
+    lv_obj_set_width(s_alarm_value_labels[row], 72);
+    lv_obj_set_style_text_align(s_alarm_value_labels[row], LV_TEXT_ALIGN_CENTER, 0);
+    alarm_update_label(row);
+
+    lv_obj_t *plus = plain_button(grp, "＋", 36, 32);
+    lv_obj_add_event_cb(plus, alarm_step_cb, LV_EVENT_CLICKED, (void *)(intptr_t)(row * 2 + 1));
+
+    focus_add(minus); /* 焦点链：－ → ＋（三行依次，见 alarm_open_cb 末尾说明） */
+    focus_add(plus);
+    return r;
+}
+
+/**
+ * @brief 构造一行"使能开关"（名称 + lv_switch），并登记焦点链
+ * @param c    二级页内容容器
+ * @param row  行下标（ALARM_ROW_*）
+ * @param name 行名称
+ * @param on   初始开关态
+ */
+static void alarm_add_switch_row(lv_obj_t *c, int row, const char *name, bool on)
+{
+    lv_obj_t *r = plain_container(c);
+    lv_obj_set_size(r, LV_PCT(100), 32);
+    lv_obj_set_flex_flow(r, LV_FLEX_FLOW_ROW);
+    lv_obj_set_flex_align(r, LV_FLEX_ALIGN_SPACE_BETWEEN, LV_FLEX_ALIGN_CENTER,
+                          LV_FLEX_ALIGN_CENTER);
+    plain_label(r, name, LVGL_PORT_FONT_16, COL_INK, false);
+
+    /* 开关样式与"显示设置"的自动旋转开关一致（白旋钮+深灰描边） */
+    lv_obj_t *sw = lv_switch_create(r);
+    lv_obj_set_size(sw, 46, 24);
+    lv_obj_set_style_bg_color(sw, COL_BORDER, 0);
+    lv_obj_set_style_bg_opa(sw, LV_OPA_COVER, 0);
+    lv_obj_set_style_bg_color(sw, COL_PRIMARY, LV_STATE_CHECKED);
+    lv_obj_set_style_bg_opa(sw, LV_OPA_COVER, LV_STATE_CHECKED);
+    lv_obj_set_style_bg_color(sw, lv_color_white(), LV_PART_KNOB);
+    lv_obj_set_style_bg_opa(sw, LV_OPA_COVER, LV_PART_KNOB);
+    lv_obj_set_style_border_color(sw, COL_GRAY, LV_PART_KNOB);
+    lv_obj_set_style_border_width(sw, 1, LV_PART_KNOB);
+    lv_obj_set_style_pad_all(sw, 3, LV_PART_KNOB);
+    lv_obj_set_style_radius(sw, LV_RADIUS_CIRCLE, LV_PART_KNOB);
+    if (on) {
+        lv_obj_add_state(sw, LV_STATE_CHECKED); /* lv_obj_add_state：恢复持久化开关态 */
+    }
+    lv_obj_add_event_cb(sw, alarm_switch_cb, LV_EVENT_VALUE_CHANGED, (void *)(intptr_t)row);
+    focus_add(sw); /* 焦点链：三开关（长按 K2 切换） */
+}
+
+/**
+ * @brief 打开"告警设置"二级页（三阈值 ± 调节 + 三使能开关）
+ *
+ * 初值从 settings_get_alarm 读；读失败用安全默认（三阈值 50% 量程、全使能）。
+ * 任一改动经 alarm_apply 写回 settings_set_alarm（防抖落盘），
+ * 子页关闭时 subpage_close 还会 settings_save_now 一次兜底。
+ */
+static void alarm_open_cb(void)
+{
+    lv_obj_t *c = subpage_open(SUB_ALARM, "告警设置");
+
+    if (settings_get_alarm(&s_alarm_cfg) != ESP_OK) {
+        /* 读失败（未初始化等）：给一份安全默认值，页仍可用 */
+        s_alarm_cfg.v_en = 1u;
+        s_alarm_cfg.i_en = 1u;
+        s_alarm_cfg.p_en = 1u;
+        s_alarm_cfg.v_limit = 15.0f;
+        s_alarm_cfg.i_limit = 10.0f;
+        s_alarm_cfg.p_limit = 100.0f;
+    }
+
+    lv_obj_t *hint = plain_label(c, "阈值越限时测量页弹出告警；关掉开关即停用该项。",
+                                 LVGL_PORT_FONT_12, COL_GRAY, false);
+    lv_obj_set_width(hint, LV_PCT(100));
+    lv_label_set_long_mode(hint, LV_LABEL_LONG_WRAP);
+
+    /* 阈值三行：过压 → 过流 → 过功率 */
+    alarm_add_limit_row(c, ALARM_ROW_V, "过压");
+    alarm_add_limit_row(c, ALARM_ROW_I, "过流");
+    alarm_add_limit_row(c, ALARM_ROW_P, "过功率");
+
+    /* 使能三行：与阈值同序，方便"调完阈值顺手开关" */
+    alarm_add_switch_row(c, ALARM_ROW_V, "过压使能", s_alarm_cfg.v_en != 0);
+    alarm_add_switch_row(c, ALARM_ROW_I, "过流使能", s_alarm_cfg.i_en != 0);
+    alarm_add_switch_row(c, ALARM_ROW_P, "过功率使能", s_alarm_cfg.p_en != 0);
+
+    /* 焦点链顺序：过压－/＋ → 过流－/＋ → 过功率－/＋ → 三开关
+     * （登记顺序即 K1/K2 遍历顺序，见 focus_add）。 */
+}
+
+/* ============================================================
  * 二级页：关于本机（对话框）
  * ============================================================ */
 
@@ -1736,8 +2052,8 @@ static void cell_clicked_cb(lv_event_t *e)
  * @param row   行容器（一行两格）
  * @param icon  LVGL 内置符号（LV_SYMBOL_*）
  * @param name  功能名称文本
- * @param cb    点击后打开对应二级页的函数
- * @return 创建好的单元格按钮
+ * @param cb    点击后打开对应二级页的函数（NULL=留空位，不可点）
+ * @return 创建好的单元格按钮（留空位返回 NULL，网格焦点据此跳过）
  */
 static lv_obj_t *make_cell_dispatch(lv_obj_t *row, const char *icon, const char *name,
                                     cell_cb_t cb)
@@ -1758,12 +2074,17 @@ static lv_obj_t *make_cell_dispatch(lv_obj_t *row, const char *icon, const char 
     lv_obj_set_style_translate_y(icon_lbl, -1, 0);
     plain_label(btn, name, LVGL_PORT_FONT_16, COL_INK, false);
 
+    /* 留空位（cb=NULL）：不可点、不登记回调，返回 NULL 让网格焦点跳过它 */
+    if (cb == NULL) {
+        lv_obj_set_clickable(btn, false); /* LVGL：不参与触摸命中测试 */
+        return NULL;
+    }
     lv_obj_add_event_cb(btn, cell_clicked_cb, LV_EVENT_CLICKED, (void *)cb);
     return btn;
 }
 
 /**
- * @brief 在设置 tile 上构建设置首页（2×3 功能网格）
+ * @brief 在设置 tile 上构建设置首页（2×4 功能网格）
  *
  * 由 ui_nav 初始化时调用一次；二级页浮层以 tile 为父级，随 tile 一起被
  * 横向滑动（不跨页）。
@@ -1780,6 +2101,11 @@ void screen_settings_create(lv_obj_t *tile)
         lv_timer_delete(s_close_timer);
         s_close_timer = NULL;
     }
+    /* 【B12 修复】清零采样定时器随重建作废（见 subpage_close 同名注释） */
+    if (s_zero_timer != NULL) {
+        lv_timer_delete(s_zero_timer);
+        s_zero_timer = NULL;
+    }
     focus_end();
     s_subpage = NULL;
     s_sub_content = NULL;
@@ -1793,11 +2119,10 @@ void screen_settings_create(lv_obj_t *tile)
     lv_obj_t *title = plain_label(tile, "设置", LVGL_PORT_FONT_20, COL_INK, true);
     lv_obj_set_pos(title, GRID_SIDE_PAD, 24);
 
-    /* 2×3 网格 */
+    /* 2×4 网格（7 个功能格 + 1 个留空位）：高度精确等于 4 行 + 3 行距，不给滚动留余地 */
     lv_obj_t *grid = lv_obj_create(tile);
     lv_obj_remove_style_all(grid);
-    /* 网格一屏尽收：高度精确等于 3 行 + 2 行距，不给滚动留任何余地 */
-    lv_obj_set_size(grid, LV_PCT(100), 3 * CELL_HEIGHT + 2 * CELL_GAP_Y);
+    lv_obj_set_size(grid, LV_PCT(100), 4 * CELL_HEIGHT + 3 * CELL_GAP_Y);
     lv_obj_set_pos(grid, 0, GRID_TOP_Y);
     lv_obj_set_style_pad_left(grid, GRID_SIDE_PAD, 0);
     lv_obj_set_style_pad_right(grid, GRID_SIDE_PAD, 0);
@@ -1805,22 +2130,25 @@ void screen_settings_create(lv_obj_t *tile)
     lv_obj_set_flex_flow(grid, LV_FLEX_FLOW_COLUMN);
     lv_obj_set_scrollable(grid, false);
 
-    /* 六格功能表：图标 + 名称 + 打开函数，按行序 r*2 / r*2+1 两两成行。
-     * 2×3 网格恰好 6 格；替换某格功能只改这一行，排版代码不用动。 */
+    /* 功能格表：图标 + 名称 + 打开函数，按行序 r*2 / r*2+1 两两成行。
+     * 7 个功能占满前 3.5 行，第 8 格留空（cb=NULL，不可点也不进焦点链）。
+     * 替换某格功能只改这一行，排版代码不用动。 */
     static const struct {
         const char *icon;
         const char *name;
         cell_cb_t cb;
-    } cells[6] = {
+    } cells[GRID_CELL_COUNT] = {
         { LV_SYMBOL_SETTINGS, "测量设置", calib_ui_menu },
         { LV_SYMBOL_IMAGE, "显示设置", display_open_cb },
         { LV_SYMBOL_AUDIO, "蜂鸣器", buzzer_open_cb },
         { LV_SYMBOL_WIFI, "WiFi 与热点", wifi_open_cb },
         { LV_SYMBOL_REFRESH, "电能统计", energy_open_cb },
+        { LV_SYMBOL_WARNING, "告警设置", alarm_open_cb },
         { LV_SYMBOL_LIST, "关于本机", about_open_cb },
+        { "", "", NULL }, /* 留空位：网格凑满 2 列 4 行 */
     };
 
-    for (int r = 0; r < 3; r++) {
+    for (int r = 0; r < 4; r++) {
         lv_obj_t *row = plain_container(grid);
         lv_obj_set_size(row, LV_PCT(100), CELL_HEIGHT);
         lv_obj_set_flex_flow(row, LV_FLEX_FLOW_ROW);
@@ -2029,16 +2357,17 @@ bool screen_settings_key(button_id_t id, button_event_t ev)
     }
     switch (ev) {
     case BUTTON_EVENT_SINGLE_CLICK:
-        /* 焦点上下移动（环形）：K1=上一格、K2=下一格 */
-        s_grid_idx = (s_grid_idx + (id == BUTTON_ID_BOOT ? -1 : 1) + GRID_CELL_COUNT) %
-                     GRID_CELL_COUNT;
-        grid_paint();
+        /* 焦点上下移动（环形，跳过留空格）：K1=上一格、K2=下一格 */
+        grid_focus_move(id == BUTTON_ID_BOOT ? -1 : +1);
         return true;
     case BUTTON_EVENT_LONG_PRESS_START:
         if (id == BUTTON_ID_USER) {
             /* 打开焦点功能格：合成 CLICKED 复用格子的打开回调（cell_clicked_cb），
-             * 子页/弹窗随即接管按键（上面的 ①② 层） */
-            lv_obj_send_event(s_grid_cells[s_grid_idx], LV_EVENT_CLICKED, NULL);
+             * 子页/弹窗随即接管按键（上面的 ①② 层）。
+             * 留空格（NULL）正常不可达（grid_focus_move 已跳过），这里再兜一次。 */
+            if (s_grid_cells[s_grid_idx] != NULL) {
+                lv_obj_send_event(s_grid_cells[s_grid_idx], LV_EVENT_CLICKED, NULL);
+            }
             return true;
         }
         /* 长按 K1 = 退出网格模式；返回 false 让 ui_nav 继续"设置页长按 K1=回测量页"，

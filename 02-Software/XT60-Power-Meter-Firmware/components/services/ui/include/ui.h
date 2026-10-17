@@ -11,6 +11,8 @@
  */
 #pragma once
 
+#include <stdbool.h>
+
 #include "esp_err.h"
 
 /**
@@ -21,6 +23,17 @@
  * @return ESP_OK 成功；ESP_ERR_NO_MEM 任务创建失败
  */
 esp_err_t ui_init(void);
+
+/**
+ * @brief 告警弹窗是否正打开（模态中）
+ *
+ * 供 ui_nav 的滑动识别抑制手势：告警弹窗期间不允许横滑环形翻页/
+ * 上滑开快速菜单（弹窗挂在顶层图层，翻页会把承载页抽走）。
+ * 模拟器无 ui.c，由 stubs.c 返回 false。
+ *
+ * @return true=告警弹窗在屏上
+ */
+bool ui_alert_modal_is_open(void);
 
 /**
  * @brief 取首页数据刷新率（Hz）

@@ -15,10 +15,12 @@
  *   ││ 0.37683                     W││ 功率：红底
  *   │└──────────────────────────────┘│
  *   │┌──────────────────────────────┐│ y=160
- *   ││ 0.11800                    Wh││ 电能：紫底
+ *   ││ 0.11800                    Wh││ 电能：紫底（容量 Ah 见小字第 2 行）
  *   │└──────────────────────────────┘│
- *   │          32.5℃  30%RH          │ 环境温湿度（底部居中）
+ *   │   V 14.10/13.88  I 2.05/0.12   │ 峰谷小字行 1（V/I，斜杠前峰后谷）
+ *   │  P 28.9/1.6  12.34Ah  32.5℃…  │ 小字行 2：P 峰谷+容量+温湿度
  *   └────────────────────────────────┘
+ *   （告警横幅：alert_mask 非 0 时顶部红条 "⚠ 过压 过流"，覆盖状态栏下沿）
  *
  * 设计说明：
  *   · 数字用 36px Bold 白字填满 44px 行高（"贴近容器大小"，远看可读）；
@@ -64,6 +66,7 @@
 #define COL_P  lv_color_hex(0xD0392B) /* 功率 红 */
 #define COL_E  lv_color_hex(0x7D3CB5) /* 电能 紫 */
 #define COL_ENV lv_color_hex(0x6B7280) /**< 环境行灰字 */
+#define COL_ALERT lv_color_hex(0xD0392B) /**< 告警横幅红底（与功率红同色系） */
 /* 快速菜单用色（与设置页同语义） */
 #define COL_PRIMARY lv_color_hex(0x0066CC) /**< 品牌蓝：焦点边框 / 当前档位 */
 #define COL_INK     lv_color_hex(0x1A1A1A) /**< 近黑正文 */
@@ -90,7 +93,7 @@ typedef struct {
     int32_t row_top;      /**< 第一行顶部 y */
     int32_t row_h;        /**< 数据行高 */
     int32_t row_gap;      /**< 行间距 */
-    int32_t env_y;        /**< 环境温湿度行 y */
+    int32_t peak_y;       /**< 底部两行小字（峰值/容量 + 环境）起始 y */
     int32_t rate_btn_w;   /**< 快速菜单刷新率档位按钮宽 */
     lvgl_port_font_size_t val_font; /**< 大数字字号 */
 } measure_geom_t;
@@ -117,18 +120,21 @@ static measure_geom_t measure_geom(void)
         g.row_top = 22;
         g.row_h = 44;
         g.row_gap = ROW_GAP;
-        g.env_y = 214;
+        /* 底部两行小字（12px，行高约 16px 共 32px）：四行数据条底在 204
+         * （22+4×44+3×2），206..238 两行正好落进底部空档，不压数据条。 */
+        g.peak_y = 206;
         g.rate_btn_w = 48;
         g.val_font = LVGL_PORT_FONT_36;
     } else {
-        /* 竖屏 240×284（90°/270°）：行高 44→54、数字 36→40px，
-         * 四行占满多出的垂直空间（4×54+3×4=228，y=30..258），
-         * 环境行沉到底部 262。40px Bold 下最宽 8 字符≈182px，
-         * 加单位/箭头 ≤207px < 行内可用 212px，不溢出。 */
+        /* 竖屏 240×284（90°/270°）：行高 44→54、数字 36→40px。
+         * 40px Bold 下最宽 8 字符≈182px，加单位/箭头 ≤207px < 行内可用
+         * 212px，不溢出。行间距由 4 收到 2：四行底 30+4×54+3×2=252，
+         * 底部空档 252..284=32px 恰好放下两行 16px 小字（252/268），
+         * 既不压数据条也不贴出屏底。 */
         g.row_top = 30;
         g.row_h = 54;
-        g.row_gap = 4;
-        g.env_y = 262;
+        g.row_gap = 2;
+        g.peak_y = 252;
         g.rate_btn_w = 38;
         g.val_font = LVGL_PORT_FONT_40;
     }
@@ -149,7 +155,9 @@ typedef struct {
 } metric_t;
 
 static metric_t s_v, s_i, s_p, s_e; /**< 电压/电流/功率/电能四行控件集 */
-static lv_obj_t *s_lbl_env;         /**< 底部环境温湿度标签 */
+static lv_obj_t *s_lbl_env;         /**< 底部小字第 2 行：P 峰谷+容量+温湿度 */
+static lv_obj_t *s_lbl_peak;        /**< 底部小字第 1 行：V/I 峰谷对 */
+static lv_obj_t *s_lbl_alert;       /**< 顶部告警横幅（alert_mask 非 0 时显示） */
 
 static void create_quick_menu(lv_obj_t *tile); /* 定义见文件末尾 */
 
@@ -249,14 +257,44 @@ void screen_measure_create(lv_obj_t *tile)
     create_row(tile, (int)g.row_top + 2 * row_pitch, row_w, row_h, g.val_font, COL_P, &s_p, false);
     create_row(tile, (int)g.row_top + 3 * row_pitch, row_w, row_h, g.val_font, COL_E, &s_e, false);
 
-    /* 环境温湿度：底部居中（页码点已移到状态栏，底部整条留给它） */
+    /* 底部两行小字（见 measure_geom 的 peak_y）：单行装不下示例文本
+     * （272px 宽仅容约 40 字符 @12px，示例约 60 字符），按"峰值行与环境行
+     * 合并为两行小字"处理。格式约定：斜杠前=峰（max）后=谷（min）。
+     * 行 1 = V/I 峰谷对；行 2 = P 峰谷 + 累计容量 Ah + 温湿度。 */
+    s_lbl_peak = lv_label_create(tile);
+    lv_label_set_text(s_lbl_peak, "V ----/----  I ----/----");
+    lv_obj_set_style_text_font(s_lbl_peak, lvgl_port_get_font(LVGL_PORT_FONT_12), 0);
+    lv_obj_set_style_text_color(s_lbl_peak, COL_ENV, 0);
+    lv_obj_set_width(s_lbl_peak, g.w); /* 宽度撑满整屏，靠文本居中实现水平居中 */
+    lv_obj_set_style_text_align(s_lbl_peak, LV_TEXT_ALIGN_CENTER, 0);
+    lv_obj_set_pos(s_lbl_peak, 0, g.peak_y);
+
+    /* 行 2：P 峰谷 + 容量 + 环境温湿度（原独立环境行并入，节省一行空间） */
     s_lbl_env = lv_label_create(tile);
-    lv_label_set_text(s_lbl_env, "--.-℃  --%RH"); /* 占位符：没读到数据前不显示 0 */
-    lv_obj_set_style_text_font(s_lbl_env, lvgl_port_get_font(LVGL_PORT_FONT_16), 0);
+    lv_label_set_text(s_lbl_env, "P ----/----  ----Ah  --.-℃  --%RH"); /* 占位符：没读到数据前不显示 0 */
+    lv_obj_set_style_text_font(s_lbl_env, lvgl_port_get_font(LVGL_PORT_FONT_12), 0);
     lv_obj_set_style_text_color(s_lbl_env, COL_ENV, 0);
-    lv_obj_set_width(s_lbl_env, g.w); /* 宽度撑满整屏，靠文本居中实现水平居中 */
+    lv_obj_set_width(s_lbl_env, g.w);
     lv_obj_set_style_text_align(s_lbl_env, LV_TEXT_ALIGN_CENTER, 0); /* LVGL：文本居中对齐 */
-    lv_obj_set_pos(s_lbl_env, 0, g.env_y);
+    lv_obj_set_pos(s_lbl_env, 0, g.peak_y + 16); /* 行高约 16px，紧接行 1 */
+
+    /* 告警横幅：顶部红条（覆盖在状态栏区域上层），alert_mask 为 0 时隐藏。
+     * 用绝对定位压在 row_top 之上，不挤动四行数据条布局。 */
+    s_lbl_alert = lv_label_create(tile);
+    lv_label_set_text(s_lbl_alert, "⚠ 告警");
+    lv_obj_set_style_text_font(s_lbl_alert, lvgl_port_get_font_bold(LVGL_PORT_FONT_14), 0);
+    lv_obj_set_style_text_color(s_lbl_alert, lv_color_white(), 0);
+    lv_obj_set_style_bg_color(s_lbl_alert, COL_ALERT, 0);
+    lv_obj_set_style_bg_opa(s_lbl_alert, LV_OPA_COVER, 0);
+    lv_obj_set_style_radius(s_lbl_alert, 4, 0);
+    lv_obj_set_style_pad_hor(s_lbl_alert, 4, 0);
+    /* 宽度撑满内容区、高 16px：贴着 row_top 上沿（横屏 4..20，竖屏 12..28），
+     * 与状态栏共享浮层轻微交叠可接受（安全相关提示优先可见）。 */
+    lv_obj_set_width(s_lbl_alert, g.w - 2 * SAFE_X);
+    lv_obj_set_style_text_align(s_lbl_alert, LV_TEXT_ALIGN_CENTER, 0);
+    lv_obj_set_pos(s_lbl_alert, SAFE_X, (int)g.row_top - 18);
+    /* 初始无告警：隐藏（refresh 里按 alert_mask 显隐） */
+    lv_obj_add_flag(s_lbl_alert, LV_OBJ_FLAG_HIDDEN);
 
     create_quick_menu(tile);
 }
@@ -302,11 +340,13 @@ static void fmt_val(char *dst, size_t n, float v)
 }
 
 /**
- * @brief 用最新测量快照刷新四行数字与环境行
+ * @brief 用最新测量快照刷新四行数字、峰值行、告警横幅与环境行
  *
  * 由 ui.c 的 UI 循环按用户设定的刷新率（1~30Hz）调用；低档位时
  * 传入的 snap 已由 ui.c 做过滑动平均，本函数只负责"贴到屏上"。
  * 只更新文本不动控件结构，所以刷新本身不会引起布局跳动。
+ * 峰值行显示本次上电的 V/I/P 峰谷值与累计容量 Ah；告警横幅按
+ * snap->alert_mask 显隐（安全相关，每次刷新都判）。
  *
  * @param snap 最新数据快照（NULL 时直接返回）
  */
@@ -345,12 +385,45 @@ void screen_measure_refresh(const data_store_snapshot_t *snap)
     lv_label_set_text(s_e.value, buf);
     lv_label_set_text(s_e.unit, "Wh");
 
-    /* AHT20 尚未读出有效值时（两路都是 0）显示占位符，而不是误导性的 0 */
-    char env[40];
-    if (snap->temperature_c == 0.0f && snap->humidity_pct == 0.0f) {
-        snprintf(env, sizeof(env), "--.-℃  --%%RH"); /* %% 才输出一个字面 % */
+    /* 底部两行小字：行 1 = V/I 峰谷对，行 2 = P 峰谷 + 容量 + 温湿度。
+     * 峰谷值用 fmt_val（NaN 显示 "----"，与大数字同规），斜杠前=峰、后=谷。 */
+    char sv_max[12], sv_min[12], si_max[12], si_min[12];
+    char sp_max[12], sp_min[12], sah[12];
+    char peak[64], env[80]; /* fmt_val 输出 ≤9 字符，缓冲区按最坏 11 字节/字段预留 */
+    fmt_val(sv_max, sizeof(sv_max), snap->v_max);
+    fmt_val(sv_min, sizeof(sv_min), snap->v_min);
+    fmt_val(si_max, sizeof(si_max), snap->i_max);
+    fmt_val(si_min, sizeof(si_min), snap->i_min);
+    fmt_val(sp_max, sizeof(sp_max), snap->p_max);
+    fmt_val(sp_min, sizeof(sp_min), snap->p_min);
+    fmt_val(sah, sizeof(sah), snap->capacity_ah);
+    snprintf(peak, sizeof(peak), "V %s/%s  I %s/%s", sv_max, sv_min, si_max, si_min);
+    lv_label_set_text(s_lbl_peak, peak);
+
+    /* 告警横幅：alert_mask 非 0 时显示顶部红条（文字按位拼），为 0 隐藏。
+     * 显隐只改 flag 不重建控件，不影响四行数据条布局。 */
+    if (s_lbl_alert != NULL) {
+        if (snap->alert_mask != 0) {
+            char alert[48];
+            snprintf(alert, sizeof(alert), "⚠%s%s%s",
+                     (snap->alert_mask & DATA_ALERT_OVP) ? " 过压" : "",
+                     (snap->alert_mask & DATA_ALERT_OCP) ? " 过流" : "",
+                     (snap->alert_mask & DATA_ALERT_OPP) ? " 过功率" : "");
+            lv_label_set_text(s_lbl_alert, alert);
+            lv_obj_clear_flag(s_lbl_alert, LV_OBJ_FLAG_HIDDEN); /* LVGL：取消隐藏 */
+        } else {
+            lv_obj_add_flag(s_lbl_alert, LV_OBJ_FLAG_HIDDEN); /* LVGL：隐藏 */
+        }
+    }
+
+    /* AHT20 尚未读出有效值时（测量核写 NaN，见 power_measure.c）显示占位符；
+     * 【B19 修复】真实 0℃/0%RH 不再被误判为"无数据"（原双零启发式已废） */
+    if (isnan(snap->temperature_c) || isnan(snap->humidity_pct)) {
+        snprintf(env, sizeof(env), "P %s/%s  %sAh  --.-℃  --%%RH",
+                 sp_max, sp_min, sah); /* %% 才输出一个字面 % */
     } else {
-        snprintf(env, sizeof(env), "%.1f℃  %.0f%%RH", (double)snap->temperature_c,
+        snprintf(env, sizeof(env), "P %s/%s  %sAh  %.1f℃  %.0f%%RH",
+                 sp_max, sp_min, sah, (double)snap->temperature_c,
                  (double)snap->humidity_pct);
     }
     lv_label_set_text(s_lbl_env, env);
