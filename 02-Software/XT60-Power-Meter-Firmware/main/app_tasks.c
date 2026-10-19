@@ -4,6 +4,8 @@
  */
 #include "app_tasks.h"
 
+#include <math.h> /* isfinite：判断 SOC 温度是否有效（NaN=未就绪） */
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -167,8 +169,17 @@ static void task_sys_monitor(void *arg)
          * 这是"测量核还没开始工作"的正常表现，不算故障。 */
         data_store_snapshot_t snapshot;
         if (data_store_get(&snapshot) == ESP_OK) {
-            ESP_LOGI(TAG, "测量: %.3f V / %.3f A / %.3f W（累计更新 %u 次）", snapshot.voltage_v,
-                     snapshot.current_a, snapshot.power_w, (unsigned)data_store_update_count());
+            /* SOC 结温用 %.1f 输出；NaN（传感器未就绪）时显示 --，便于长跑观测
+             * 主控发热情况（v0.5.1 新增，来源为芯片内部温度传感器）。 */
+            char soc[16];
+            if (isfinite(snapshot.soc_temp_c)) {
+                snprintf(soc, sizeof(soc), "%.1f", (double)snapshot.soc_temp_c);
+            } else {
+                snprintf(soc, sizeof(soc), "--");
+            }
+            ESP_LOGI(TAG, "测量: %.3f V / %.3f A / %.3f W  SOC=%s℃（累计更新 %u 次）",
+                     snapshot.voltage_v, snapshot.current_a, snapshot.power_w, soc,
+                     (unsigned)data_store_update_count());
         } else {
             ESP_LOGD(TAG, "测量数据尚未就绪（data_store 更新计数 %u）",
                      (unsigned)data_store_update_count());

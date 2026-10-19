@@ -15,10 +15,10 @@
  *   ││ 0.37683                     W││ 功率：红底
  *   │└──────────────────────────────┘│
  *   │┌──────────────────────────────┐│ y=160
- *   ││ 0.11800                    Wh││ 电能：紫底（容量 Ah 见小字第 2 行）
+ *   ││ 0.11800                    Wh││ 电能：紫底（点击此行在 Wh/Ah 间切换）
  *   │└──────────────────────────────┘│
  *   │   V 14.10/13.88  I 2.05/0.12   │ 峰谷小字行 1（V/I，斜杠前峰后谷）
- *   │  P 28.9/1.6  12.34Ah  32.5℃…  │ 小字行 2：P 峰谷+容量+温湿度
+ *   │  P 28.9/1.6  32.5℃ 45%RH      │ 小字行 2：P 峰谷 + 温湿度
  *   └────────────────────────────────┘
  *   （告警横幅：alert_mask 非 0 时顶部红条 "⚠ 过压 过流"，覆盖状态栏下沿）
  *
@@ -155,11 +155,19 @@ typedef struct {
 } metric_t;
 
 static metric_t s_v, s_i, s_p, s_e; /**< 电压/电流/功率/电能四行控件集 */
-static lv_obj_t *s_lbl_env;         /**< 底部小字第 2 行：P 峰谷+容量+温湿度 */
+static lv_obj_t *s_lbl_env;         /**< 底部小字第 2 行：P 峰谷 + 温湿度 */
 static lv_obj_t *s_lbl_peak;        /**< 底部小字第 1 行：V/I 峰谷对 */
 static lv_obj_t *s_lbl_alert;       /**< 顶部告警横幅（alert_mask 非 0 时显示） */
 
+/** 电能行显示模式：false=Wh（默认）/ true=Ah。点击电能数据条在两者间切换。
+ *  需求（2026-10）：底部不再恒显 Ah，改由点击 Wh 数据条切换。 */
+static bool s_energy_show_ah = false;
+/** 电能行最近一次数值缓存：点击切换时用它立即重绘，免再取快照 */
+static float s_last_energy_wh = 0.0f;
+static float s_last_capacity_ah = 0.0f;
+
 static void create_quick_menu(lv_obj_t *tile); /* 定义见文件末尾 */
+static void energy_row_click_cb(lv_event_t *e); /* 电能行点击：Wh/Ah 切换 */
 
 /**
  * @brief 创建一行数据条（彩色底 + 左大数字 + 右侧箭头/单位）
@@ -256,11 +264,15 @@ void screen_measure_create(lv_obj_t *tile)
     create_row(tile, (int)g.row_top + row_pitch, row_w, row_h, g.val_font, COL_I, &s_i, true);
     create_row(tile, (int)g.row_top + 2 * row_pitch, row_w, row_h, g.val_font, COL_P, &s_p, false);
     create_row(tile, (int)g.row_top + 3 * row_pitch, row_w, row_h, g.val_font, COL_E, &s_e, false);
+    /* 电能数据条可点击：在 Wh / Ah 之间切换显示（需求 2026-10：底部取消恒显 Ah）。
+     * create_row 里对象默认不响应点击，此处显式加 CLICKABLE 并挂点击回调。 */
+    lv_obj_add_flag(s_e.row, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_add_event_cb(s_e.row, energy_row_click_cb, LV_EVENT_CLICKED, NULL);
 
     /* 底部两行小字（见 measure_geom 的 peak_y）：单行装不下示例文本
      * （272px 宽仅容约 40 字符 @12px，示例约 60 字符），按"峰值行与环境行
      * 合并为两行小字"处理。格式约定：斜杠前=峰（max）后=谷（min）。
-     * 行 1 = V/I 峰谷对；行 2 = P 峰谷 + 累计容量 Ah + 温湿度。 */
+     * 行 1 = V/I 峰谷对；行 2 = P 峰谷 + 温湿度。 */
     s_lbl_peak = lv_label_create(tile);
     lv_label_set_text(s_lbl_peak, "V ----/----  I ----/----");
     lv_obj_set_style_text_font(s_lbl_peak, lvgl_port_get_font(LVGL_PORT_FONT_12), 0);
@@ -269,9 +281,9 @@ void screen_measure_create(lv_obj_t *tile)
     lv_obj_set_style_text_align(s_lbl_peak, LV_TEXT_ALIGN_CENTER, 0);
     lv_obj_set_pos(s_lbl_peak, 0, g.peak_y);
 
-    /* 行 2：P 峰谷 + 容量 + 环境温湿度（原独立环境行并入，节省一行空间） */
+    /* 行 2：P 峰谷 + 环境温湿度（原独立环境行并入，节省一行空间；容量 Ah 见电能行点击切换） */
     s_lbl_env = lv_label_create(tile);
-    lv_label_set_text(s_lbl_env, "P ----/----  ----Ah  --.-℃  --%RH"); /* 占位符：没读到数据前不显示 0 */
+    lv_label_set_text(s_lbl_env, "P ----/----  --.-℃  --%RH"); /* 占位符：没读到数据前不显示 0 */
     lv_obj_set_style_text_font(s_lbl_env, lvgl_port_get_font(LVGL_PORT_FONT_12), 0);
     lv_obj_set_style_text_color(s_lbl_env, COL_ENV, 0);
     lv_obj_set_width(s_lbl_env, g.w);
@@ -340,13 +352,47 @@ static void fmt_val(char *dst, size_t n, float v)
 }
 
 /**
+ * @brief 重绘电能行：按当前显示模式渲染 Wh 或 Ah
+ *
+ * 值取 s_last_* 缓存（由 screen_measure_refresh 每次刷新更新），
+ * 这样点击切换时无需再取快照即可立即重绘。
+ */
+static void render_energy_row(void)
+{
+    char buf[16]; /* fmt_val 输出 ≤9 字符，留足余量 */
+    if (s_energy_show_ah) {
+        fmt_val(buf, sizeof(buf), s_last_capacity_ah);
+        lv_label_set_text(s_e.value, buf);
+        lv_label_set_text(s_e.unit, "Ah");
+    } else {
+        fmt_val(buf, sizeof(buf), s_last_energy_wh);
+        lv_label_set_text(s_e.value, buf);
+        lv_label_set_text(s_e.unit, "Wh");
+    }
+}
+
+/**
+ * @brief 电能数据条点击回调：Wh / Ah 显示切换 + 点击反馈音
+ *
+ * 点击后立即重绘该行（不等下次周期刷新），并给一声短鸣作操作反馈。
+ */
+static void energy_row_click_cb(lv_event_t *e)
+{
+    (void)e;
+    s_energy_show_ah = !s_energy_show_ah;
+    render_energy_row();
+    (void)buzzer_play(BUZZER_TONE_CLICK);
+}
+
+/**
  * @brief 用最新测量快照刷新四行数字、峰值行、告警横幅与环境行
  *
  * 由 ui.c 的 UI 循环按用户设定的刷新率（1~30Hz）调用；低档位时
  * 传入的 snap 已由 ui.c 做过滑动平均，本函数只负责"贴到屏上"。
  * 只更新文本不动控件结构，所以刷新本身不会引起布局跳动。
- * 峰值行显示本次上电的 V/I/P 峰谷值与累计容量 Ah；告警横幅按
- * snap->alert_mask 显隐（安全相关，每次刷新都判）。
+ * 峰值行显示本次上电的 V/I/P 峰谷值；电能行按 s_energy_show_ah 显示
+ * Wh 或 Ah（点击切换）；告警横幅按 snap->alert_mask 显隐（安全相关，
+ * 每次刷新都判）。
  *
  * @param snap 最新数据快照（NULL 时直接返回）
  */
@@ -381,14 +427,16 @@ void screen_measure_refresh(const data_store_snapshot_t *snap)
     lv_label_set_text(s_p.value, buf);
     lv_label_set_text(s_p.unit, "W");
 
-    fmt_val(buf, sizeof(buf), snap->energy_wh);
-    lv_label_set_text(s_e.value, buf);
-    lv_label_set_text(s_e.unit, "Wh");
+    /* 电能行：缓存原始值后按当前模式（Wh/Ah）渲染（点击切换，见点击回调） */
+    s_last_energy_wh = snap->energy_wh;
+    s_last_capacity_ah = snap->capacity_ah;
+    render_energy_row();
 
-    /* 底部两行小字：行 1 = V/I 峰谷对，行 2 = P 峰谷 + 容量 + 温湿度。
-     * 峰谷值用 fmt_val（NaN 显示 "----"，与大数字同规），斜杠前=峰、后=谷。 */
+    /* 底部两行小字：行 1 = V/I 峰谷对，行 2 = P 峰谷 + 温湿度。
+     * 峰谷值用 fmt_val（NaN 显示 "----"，与大数字同规），斜杠前=峰、后=谷。
+     * 【2026-10 需求】累计容量 Ah 不再常驻此行，改由点击电能数据条切换显示。 */
     char sv_max[12], sv_min[12], si_max[12], si_min[12];
-    char sp_max[12], sp_min[12], sah[12];
+    char sp_max[12], sp_min[12];
     char peak[64], env[80]; /* fmt_val 输出 ≤9 字符，缓冲区按最坏 11 字节/字段预留 */
     fmt_val(sv_max, sizeof(sv_max), snap->v_max);
     fmt_val(sv_min, sizeof(sv_min), snap->v_min);
@@ -396,7 +444,6 @@ void screen_measure_refresh(const data_store_snapshot_t *snap)
     fmt_val(si_min, sizeof(si_min), snap->i_min);
     fmt_val(sp_max, sizeof(sp_max), snap->p_max);
     fmt_val(sp_min, sizeof(sp_min), snap->p_min);
-    fmt_val(sah, sizeof(sah), snap->capacity_ah);
     snprintf(peak, sizeof(peak), "V %s/%s  I %s/%s", sv_max, sv_min, si_max, si_min);
     lv_label_set_text(s_lbl_peak, peak);
 
@@ -419,11 +466,11 @@ void screen_measure_refresh(const data_store_snapshot_t *snap)
     /* AHT20 尚未读出有效值时（测量核写 NaN，见 power_measure.c）显示占位符；
      * 【B19 修复】真实 0℃/0%RH 不再被误判为"无数据"（原双零启发式已废） */
     if (isnan(snap->temperature_c) || isnan(snap->humidity_pct)) {
-        snprintf(env, sizeof(env), "P %s/%s  %sAh  --.-℃  --%%RH",
-                 sp_max, sp_min, sah); /* %% 才输出一个字面 % */
+        snprintf(env, sizeof(env), "P %s/%s  --.-℃  --%%RH",
+                 sp_max, sp_min); /* %% 才输出一个字面 % */
     } else {
-        snprintf(env, sizeof(env), "P %s/%s  %sAh  %.1f℃  %.0f%%RH",
-                 sp_max, sp_min, sah, (double)snap->temperature_c,
+        snprintf(env, sizeof(env), "P %s/%s  %.1f℃  %.0f%%RH",
+                 sp_max, sp_min, (double)snap->temperature_c,
                  (double)snap->humidity_pct);
     }
     lv_label_set_text(s_lbl_env, env);

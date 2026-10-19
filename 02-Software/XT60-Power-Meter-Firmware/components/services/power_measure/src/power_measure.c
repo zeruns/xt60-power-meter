@@ -87,6 +87,8 @@
 #include "settings.h"
 #include "system_state.h"
 
+#include "driver/temperature_sensor.h" /* 芯片内部温度传感器（SOC 结温）驱动 */
+
 #include "esp_heap_caps.h"
 #include "esp_log.h"
 #include "esp_timer.h"
@@ -240,7 +242,16 @@ static struct {
     float humidity_pct;        /**< 相对湿度（%） */
     uint32_t battery_mv;       /**< 电池电压（mV） */
     bool temp_valid;           /**< 温湿度是否读到过有效值 */
+    float soc_temp_c;          /**< ESP32-S3 芯片 SOC 结温（℃，v0.5.1 新增） */
+    bool soc_temp_valid;       /**< SOC 温度是否读到过有效值 */
 } s_aux_data;
+
+/** 芯片内部温度传感器句柄（v0.5.1 新增：网页端展示主控发热情况）
+ *
+ * 与 AHT20 的 s_aux_data.temp_c（机内**环境**温度）区分：本传感器在 SOC
+ * 硅片内部，读数通常比环境温度高若干度，反映主控自身发热。
+ * 安装/使能失败时保持 NULL，UI 与网页端按"无数据"（NaN）显示，不影响测量。 */
+static temperature_sensor_handle_t s_soc_tsens = NULL;
 
 /** 环形缓冲描述（单写者 task_sample + 受 s_ring_lock 保护的读者 pm_wave_copy） */
 typedef struct {
@@ -967,6 +978,8 @@ static void task_sample(void *arg)
             qsnap.temperature_c = s_aux_data.temp_valid ? s_aux_data.temp_c : NAN;
             qsnap.humidity_pct = s_aux_data.temp_valid ? s_aux_data.humidity_pct : NAN;
             qsnap.battery_mv = s_aux_data.battery_mv;
+            /* SOC 结温：与温湿度同样用 NaN 表示"暂无数据"（v0.5.1） */
+            qsnap.soc_temp_c = s_aux_data.soc_temp_valid ? s_aux_data.soc_temp_c : NAN;
             xSemaphoreGive(s_aux_data.mutex);
             qsnap.runtime_s = runtime_base;
             /* data_store_update：写 UI 读取的显示快照（本任务是唯一写者） */
@@ -1202,6 +1215,24 @@ static void task_aux(void *arg)
             xSemaphoreGive(s_aux_data.mutex);
         }
 
+        /* SOC 结温（v0.5.1）：读芯片内部温度传感器，经 aux 互斥锁写入。
+         * temperature_sensor_get_celsius 内部是短暂的寄存器读+换算（微秒级），
+         * 放在本任务（Core0，2s 周期）足够，且**不得在中断中调用**。
+         * 句柄为 NULL（安装失败）时跳过，保持 soc_temp_valid=false →
+         * 快照写 NaN，上层按"无数据"显示，不影响其他功能。 */
+        if (s_soc_tsens != NULL) {
+            float soc_t = 0.0f;
+            if (temperature_sensor_get_celsius(s_soc_tsens, &soc_t) == ESP_OK) {
+                xSemaphoreTake(s_aux_data.mutex, portMAX_DELAY);
+                s_aux_data.soc_temp_c = soc_t;
+                s_aux_data.soc_temp_valid = true;
+                xSemaphoreGive(s_aux_data.mutex);
+            } else {
+                /* 超量程等情况按普通日志记录（2s 一次不会刷屏） */
+                ESP_LOGW(TAG, "SOC 温度读取失败（超出传感器量程？）");
+            }
+        }
+
         /* 落盘节拍：每 30s（15 周期）**或**有「待落盘」改动时写一次 NVS。
          * 写 flash 有寿命与耗时成本（nvs_commit 可达数百 ms），所以：
          *   · 周期落盘——电能/运行时间持续在涨，需要定期持久化，
@@ -1254,6 +1285,28 @@ esp_err_t power_measure_init(void)
     }
 
     load_persist_and_calib();
+
+    /* ---- 芯片内部温度传感器（SOC 结温，v0.5.1）----
+     * 容错策略：安装/使能失败不致命——本功能只是"锦上添花"的信息展示，
+     * 不影响测量主链路；失败后句柄保持 NULL，上层按 NaN 显示"无数据"。
+     * TEMPERATURE_SENSOR_CONFIG_DEFAULT(min, max)：给出期望量程，
+     * 驱动据此选内部换算曲线；-10~80℃ 覆盖本设备的实际工作范围。 */
+    {
+        temperature_sensor_config_t ts_cfg = TEMPERATURE_SENSOR_CONFIG_DEFAULT(-10, 80);
+        esp_err_t terr = temperature_sensor_install(&ts_cfg, &s_soc_tsens);
+        if (terr != ESP_OK) {
+            ESP_LOGW(TAG, "SOC 温度传感器安装失败: %s（不影响测量，网页端将显示无数据）",
+                     esp_err_to_name(terr));
+            s_soc_tsens = NULL;
+        } else if ((terr = temperature_sensor_enable(s_soc_tsens)) != ESP_OK) {
+            ESP_LOGW(TAG, "SOC 温度传感器使能失败: %s（不影响测量，网页端将显示无数据）",
+                     esp_err_to_name(terr));
+            (void)temperature_sensor_uninstall(s_soc_tsens);
+            s_soc_tsens = NULL;
+        } else {
+            ESP_LOGI(TAG, "SOC 温度传感器已启用（量程 -10~80℃）");
+        }
+    }
 
     /* 三级波形缓冲：容量大（合计约 1.5MB），必须放 PSRAM
      * （heap_caps_malloc + MALLOC_CAP_SPIRAM 只从外部 SPI RAM 分配，

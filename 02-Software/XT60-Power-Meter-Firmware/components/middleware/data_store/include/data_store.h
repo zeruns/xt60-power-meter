@@ -66,6 +66,11 @@ typedef struct {
     float i_max, i_min;  /**< 本次上电电流峰/谷值（A） */
     float p_max, p_min;  /**< 本次上电功率峰/谷值（W） */
     uint32_t alert_mask; /**< 当前越限状态位图（DATA_ALERT_*），0=无告警 */
+    /* ---- 以下为 v0.5.1 新增（追加在尾部保持 seqlock 语义）---- */
+    float soc_temp_c;    /**< 芯片 SOC 结温（℃）；NaN 表示尚未读到有效值。
+                         *   与 temperature_c（AHT20 机内环境温度）区分：
+                         *   本值反映 ESP32-S3 芯片内部温度传感器读数，
+                         *   用于了解主控发热情况，网页端单独展示。 */
 } data_store_snapshot_t;
 
 /** 越限告警位（alert_mask） */
