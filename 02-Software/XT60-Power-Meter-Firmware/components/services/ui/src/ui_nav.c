@@ -10,25 +10,20 @@
  *   页码点原先放在屏幕底部中央，现移到状态栏中间——因为测量页要把环境
  *   温湿度显示移到底部居中，两者会重叠。
  *
- * 【核心机制：三页循环滑动为什么在 RELEASED 用总位移判定】
- *   需求：测量页继续右滑 → 跳到设置页；设置页继续左滑 → 跳回测量页（环形）。
+ * 【核心机制：滑动方向判定为什么在 RELEASED 用总位移】
+ *   需求：测量页/波形页上滑或下滑 → 呼出各自的快速菜单；左右滑翻页。
  *
  *   为什么不能用 LV_EVENT_SCROLL 的单帧增量（vect）判定方向：
- *     tileview 开了 LVGL 的滚动弹性（scroll elastic）——在第一页继续右拖时
- *     对象仍会被拖出边界（scroll_x 变成负数），松手瞬间 LVGL 启动弹性回弹
- *     动画把 scroll_x 拉回 0。回弹期间每帧的位移增量符号与用户手势方向
- *     相反且抖动剧烈，用单帧增量判方向就会出现"轻滑跳第三页、甩动跳回
- *     第一页"的误环回。
+ *     tileview 开了 LVGL 的滚动弹性（scroll elastic）——拖到边界时对象仍会
+ *     被拖出边界，松手瞬间 LVGL 启动弹性回弹动画把位置拉回。回弹期间每帧的
+ *     位移增量符号与用户手势方向相反且抖动剧烈，用单帧增量判方向会误判。
  *
  *   正确做法（本文件实现）：
  *     ① indev 级 LV_EVENT_PRESSED 记录按下起点，LV_EVENT_RELEASED 时用
  *        "抬起点 − 起点"的**总位移**判方向——总位移不受回弹动画影响，
  *        因为回弹发生在松手之后，不再改变抬起点坐标；
- *     ② 判定为环形翻页后不立即跳页，而是 lv_async_call 延迟到下一帧再
- *        lv_obj_scroll_to_x 目标页——避开 indev 释放逻辑紧随其后的回弹
- *        动画覆盖我们设的目标位置（详见 wrap_goto_async）；
- *     ③ 中间页的正常滑动完全交给 tileview 自身处理，只有"端页朝外滑"
- *        才触发环形跳页。
+ *     ② 垂直为主 → 报上下滑呼出快速菜单；水平为主 → 交给 tileview 自身
+ *        翻页（首末页到头即止，**不再环形翻页**，2026-10 需求调整）。
  *
  *   另注：LVGL 的 LV_EVENT_GESTURE 在本场景不可用（被 tileview 滚动抑制且
  *   要求瞬时速度阈值），故滑动识别全部走 indev 事件 + 手动向量计算。
@@ -65,7 +60,7 @@
 #define BAT_COLOR_MID  lv_color_hex(0xE8A00C) /* 20~49 黄 */
 #define BAT_COLOR_LOW  lv_color_hex(0xD0392B) /* 0~19 红 */
 #define BAT_COLOR_NONE lv_color_hex(0xB9BFC7) /* 无数据 灰 */
-#define BAT_FULL_MV 4200u  /**< 满电电压（mV，单节锂电 4.2V） */
+#define BAT_FULL_MV 4150u  /**< 满电电压（mV，TP4057 充电截止约 4.15V） */
 #define BAT_EMPTY_MV 3300u /**< 空电电压（mV，3.3V 以下视为没电） */
 
 static lv_obj_t *s_tileview = NULL;           /**< 三页容器（lv_tileview 实例） */
@@ -78,7 +73,10 @@ static lv_obj_t *s_lbl_bat;     /**< 状态栏右侧"电池图标+百分比"labe
 static ui_page_t s_current = UI_PAGE_MEASURE; /**< 当前页（scroll_event_cb 跟踪滚动实时更新） */
 
 /**
- * @brief 电池电压（mV）→ 电量百分比（线性映射 3.3V~4.2V → 0~100）
+ * @brief 电池电压（mV）→ 电量百分比（线性映射 3.3V~4.15V → 0~100）
+ *
+ * 满电取 4.15V：本机充电 IC 为 TP4057，充电截止电压约 4.15V，用 4.2V
+ * 作满档会让充满后长期显示不满 100%（2026-10 实测）。
  *
  * @param mv 电池电压（mV）；0 表示无电池数据
  * @return 电量百分比（0~100）
@@ -268,11 +266,11 @@ static void update_dots(void)
  * return（被 tileview 滚动抑制），且要求瞬时速度 ≥ gesture_min_velocity，
  * 慢速上下滑永远收不到——实机"上滑/下滑无反应"根因。
  * 改为按下记起点、抬起算总位移：垂直为主 → 报上下滑（快速菜单）；
- * 水平为主且越过阈值、当前在端页且方向朝外 → 环形翻页（替代原
- * LV_EVENT_SCROLL 内 hack——vect 是单帧增量，抖动/弹性期符号随机，
- * 造成"轻滑跳第三页、甩动跳回第一页"误环回）。 */
+ * 水平为主 → 交给 tileview 自身翻页（已取消端页环形翻页，首末页到头即止）。
+ * 用总位移而非 LV_EVENT_SCROLL 内 hack——vect 是单帧增量，抖动/弹性期符号
+ * 随机，判方向不可靠。 */
 #define SWIPE_MIN_DIST 30   /**< 垂直判定最小位移（px） */
-#define WRAP_MIN_DIST 60    /**< 水平环回最小位移（px，≈20% 页宽） */
+#define SWIPE_HS_MIN_DIST 60 /**< "显著水平位移"判定阈值（px，≈20% 页宽），用于断触续接判据③ */
 /* ---- 断触续接吞没（防"一次长滑被拆成两段 → 连翻两页"）----
  * 实机问题：长距离快速滑动时电容触摸偶发断触（触点丢失又立即重现），
  * LVGL 把它切成 PRESSED-RELEASED-PRESSED-RELEASED 两段独立手势；
@@ -303,39 +301,7 @@ static bool s_swallow = false; /**< 本次手势为断触续接段，水平拖�
 static void goto_page(ui_page_t page); /* 前向声明 */
 
 /**
- * @brief 环形翻页的异步执行体（延迟到下一帧）
- *
- * 为什么不能在 indev RELEASED 回调里直接翻页：
- *   用户在端页朝外滑时，tileview 被拖出边界（scroll_x 为负/超宽），
- *   松手瞬间 LVGL 的 indev 释放逻辑会启动**弹性回弹动画**把 scroll_x
- *   拉回合法范围。若此时在回调里直接 lv_obj_scroll_to_view/scroll_to_x，
- *   我们设置的目标位置会被紧随其后的回弹动画覆盖——表现为"端页朝外
- *   滑没反应"（环形翻页失效）。
- *   用 lv_async_call 把翻页推到下一帧：此时 indev 事件派发已结束，
- *   弹性回弹要么已完成、要么被我们的 scroll_to_x 直接接管（同时设置
- *   scroll_x 会中止正在进行的滚动动画）。
- *
- * @param arg 目标页码（以 intptr_t 传入，避免堆分配）
- */
-static void wrap_goto_async(void *arg)
-{
-    ui_page_t page = (ui_page_t)(intptr_t)arg;
-    if (s_tileview == NULL || page < 0 || page >= UI_PAGE_MAX) {
-        return;
-    }
-    /* 直接操作 tileview 的水平滚动：比 scroll_to_view 更直接，
-     * 不会被子对象位置计算干扰；LV_ANIM_ON 让翻页有过渡动画。 */
-    int32_t w = lv_obj_get_width(s_tileview);
-    if (w > 0) {
-        /* lv_obj_get_width：取对象当前宽度（px）；page*w = 目标页的横向滚动偏移。
-         * lv_obj_scroll_to_x：平滑滚动（LV_ANIM_ON）到指定横向位置，且会
-         * 中止正在进行的滚动动画——正好接管/覆盖弹性回弹。 */
-        lv_obj_scroll_to_x(s_tileview, (int32_t)page * w, LV_ANIM_ON);
-    }
-}
-
-/**
- * @brief indev（输入设备）级滑动识别：垂直滑 → 快速菜单；端页水平外滑 → 环形翻页
+ * @brief indev（输入设备）级滑动识别：垂直滑 → 快速菜单；水平滑交给 tileview 翻页
  *
  * 挂在触摸屏 indev 的 PRESSED/RELEASED 事件上。方向判定只用**总位移**
  * （RELEASED 坐标 − PRESSED 坐标），不用 LV_EVENT_SCROLL 的单帧增量——
@@ -401,7 +367,7 @@ static void indev_swipe_event_cb(lv_event_t *e)
         s_last_release_ms = lv_tick_get();
         s_last_release_pt = p;
         s_last_release_hscroll =
-            (LV_ABS(dx) >= WRAP_MIN_DIST && LV_ABS(dx) > LV_ABS(dy));
+            (LV_ABS(dx) >= SWIPE_HS_MIN_DIST && LV_ABS(dx) > LV_ABS(dy));
 
         /* 垂直为主：上下滑 → 快速菜单（测量页/波形页都支持）。
          * 菜单开/关走各自的动画，不需要延迟（不涉及 tileview 滚动冲突）。
@@ -416,27 +382,15 @@ static void indev_swipe_event_cb(lv_event_t *e)
             return;
         }
 
-        /* 水平为主且越阈值：仅端页朝外滑时环形翻页（中间页交给 tileview）。
-         * 延迟到下一帧执行，避免与 tileview 弹性回弹冲突（见 wrap_goto_async）。
-         * lv_async_call：把函数挂到 LVGL 下一轮 timer 处理时执行（事件派发结束后）。
-         * 【模态抑制】设置页有二级页/弹窗打开时禁用环形翻页：浮层挂在设置 tile
-         * 上，环回会把 tile 整个翻走而浮层悬空，连带按键路由错乱
-         * （screen_settings_modal_is_open，见 screen_settings.c 说明）。 */
-        if (LV_ABS(dx) >= WRAP_MIN_DIST && LV_ABS(dx) > LV_ABS(dy) &&
-            !screen_settings_modal_is_open()) {
-            if (s_current == UI_PAGE_MEASURE && dx > 0) {
-                /* 测量页右滑（dx>0）→ 环到设置页（尾页） */
-                lv_async_call(wrap_goto_async, (void *)(intptr_t)UI_PAGE_SETTINGS);
-            } else if (s_current == UI_PAGE_SETTINGS && dx < 0) {
-                /* 设置页左滑（dx<0）→ 环回测量页（首页） */
-                lv_async_call(wrap_goto_async, (void *)(intptr_t)UI_PAGE_MEASURE);
-            }
-        }
+        /* 水平为主：不做任何额外处理——完全交给 tileview 自身滚动手势翻页。
+         * 【取消环形翻页，2026-10 需求调整】原先"端页朝外滑 → 环到另一端页"的
+         * 逻辑（wrap_goto_async）已移除：超出一页范围的翻页对用户是意外行为，
+         * 首末页滑到头即止（tileview 弹性回弹）更符合直觉。 */
     }
 }
 
 /**
- * @brief tileview 滚动跟踪当前页（不再做环回——环回由 indev_swipe_event_cb 负责）
+ * @brief tileview 滚动跟踪当前页（仅跟踪，不做环回）
  *
  * 挂在 tileview 的 LV_EVENT_SCROLL 上，滚动过程中实时算出"哪一页占屏幕
  * 多数"并更新 s_current 与指示点，让 ui.c 能按当前页决定刷新哪一屏。
@@ -605,7 +559,7 @@ void ui_nav_build(void)
     create_topbar(scr);
     update_dots();
 
-    /* indev 级滑动识别（垂直=快速菜单 / 端页水平=环形翻页）。
+    /* indev 级滑动识别（垂直=快速菜单 / 水平=交给 tileview 自身翻页）。
      * indev 生命周期与三页无关，只注册一次（s_swipe_hooked 保证旋转重建不重复挂）。 */
     static bool s_swipe_hooked = false;
     if (!s_swipe_hooked) {
@@ -710,14 +664,22 @@ void ui_nav_handle_key(button_id_t id, button_event_t ev)
     } else if (screen_wave_menu_is_open() && screen_wave_menu_key(id, ev)) {
         handled = true;
     } else if (ev == BUTTON_EVENT_SINGLE_CLICK) {
-        /* 按键翻页循环（三页环形）：K1 从首页环到设置页，K2 从设置页环回。
-         * 取模实现环形：(s_current ± 1 + MAX) % MAX，加 MAX 防负数取模。 */
+        /* 按键翻页（线性，不环回）：K1=上一页、K2=下一页，到头停止。
+         * 【取消循环切换，2026-10 需求调整】原用取模实现三页环形
+         * （(s_current ± 1 + MAX) % MAX），现改为直加减并在边界判断——
+         * 到首/末页再按不再跳回另一端（用户期望"到头即止"）。
+         * 到头时不算 handled，避免"无动作却响一声"的困惑反馈。 */
         if (id == BUTTON_ID_BOOT) {
-            goto_page((ui_page_t)((s_current - 1 + UI_PAGE_MAX) % UI_PAGE_MAX));
+            if (s_current > UI_PAGE_MEASURE) {
+                goto_page((ui_page_t)(s_current - 1));
+                handled = true;
+            }
         } else {
-            goto_page((ui_page_t)((s_current + 1) % UI_PAGE_MAX));
+            if ((int)s_current < (UI_PAGE_MAX - 1)) {
+                goto_page((ui_page_t)(s_current + 1));
+                handled = true;
+            }
         }
-        handled = true;
     } else if (ev == BUTTON_EVENT_LONG_PRESS_START) {
         /* 长按 K2=开本页快速菜单（测量/波形页）；设置页长按 K1=直接回测量页 */
         if (s_current == UI_PAGE_MEASURE && id == BUTTON_ID_USER) {

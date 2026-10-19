@@ -642,10 +642,13 @@ static void handle_got_ip(void)
     uint32_t addr = s_ip_info.ip.addr;
     portEXIT_CRITICAL(&s_lock);
 
-    /* esp_netif 的 IPv4 地址为网络字节序：数值最高字节是点分第一段 */
-    ESP_LOGI(TAG, "已连接并获取 IP: %u.%u.%u.%u", (unsigned)((addr >> 24) & 0xff),
-             (unsigned)((addr >> 16) & 0xff), (unsigned)((addr >> 8) & 0xff),
-             (unsigned)(addr & 0xff));
+    /* esp_netif 的 IPv4 地址是网络字节序（大端）存进 uint32，但主机是小端，
+     * 故 uint32 的**最低字节**才是点分第一段——与标准宏 IP2STR 一致
+     * （esp_ip4_addr1_16 = addr & 0xff）。此前按最高字节取，显示顺序整个
+     * 反了（192.168.1.12 → 12.1.168.192，2026-10 上板实测）。 */
+    ESP_LOGI(TAG, "已连接并获取 IP: %u.%u.%u.%u", (unsigned)(addr & 0xff),
+             (unsigned)((addr >> 8) & 0xff), (unsigned)((addr >> 16) & 0xff),
+             (unsigned)((addr >> 24) & 0xff));
 }
 
 /**
@@ -1269,9 +1272,10 @@ esp_err_t wifi_manager_get_ip(char *out, size_t out_len)
         return ESP_ERR_INVALID_STATE;
     }
 
-    snprintf(out, out_len, "%u.%u.%u.%u", (unsigned)((addr >> 24) & 0xff),
-             (unsigned)((addr >> 16) & 0xff), (unsigned)((addr >> 8) & 0xff),
-             (unsigned)(addr & 0xff));
+    /* 低字节在前（网络字节序 + 小端主机，与 IP2STR 同语义）：修复显示反序 */
+    snprintf(out, out_len, "%u.%u.%u.%u", (unsigned)(addr & 0xff),
+             (unsigned)((addr >> 8) & 0xff), (unsigned)((addr >> 16) & 0xff),
+             (unsigned)((addr >> 24) & 0xff));
     return ESP_OK;
 }
 
