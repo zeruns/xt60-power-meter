@@ -54,12 +54,18 @@ CONFIG_SPIRAM_BOOT_INIT=y
 # 对量产与售后排查很有价值。
 CONFIG_SPIRAM_MEMTEST=y
 CONFIG_SPIRAM_USE_MALLOC=y
-# 小于 512B 的分配走内部 RAM；更大的走 PSRAM。
-# ⚠ 阈值必须低于 WiFi beacon 缓冲（752B）：曾用 16KB/8KB/1KB 三档，均把
-# 752B beacon 缓冲强制推入内部 RAM →「alloc eb len=752 type=4 fail」→
-# beacon 发不出（配网热点扫不到）+ WiFi 驱动任务 NULL 解引用崩溃
-# （LoadProhibited @ wifi 任务，2026-10 上板实测）。降到 512 后该池走 PSRAM。
-CONFIG_SPIRAM_MALLOC_ALWAYSINTERNAL=512
+# 小于该值的分配才强制内部 RAM；设 0 = 不按大小强制，malloc 先内部、
+# 内部不足自动溢出到 PSRAM（分配永不因该阈值失败）。
+# 演进史（三次实测调整，每档都有真实的上板故障背书）：
+#   16KB/8KB/1KB → 752B WiFi beacon 缓冲被强制推入内部 RAM →
+#     「alloc eb len=752 type=4 fail」+ WiFi 驱动任务 NULL 解引用崩溃；
+#   512 → v0.6.0 后 LVGL（clib malloc）高频小分配（建对象/每秒数十次
+#     label set_text 的 strdup）+ WS 10Hz 每客户端 350B 发送缓冲全部
+#     挤在仅剩 ~19KB 的内部 RAM，碎片化后耗尽 → lv_malloc 得到 NULL →
+#     渲染/布局解引用崩溃 abort 复位（v0.6.0 实测「设置页概率卡死、
+#     卡几秒自动复位」的根因）→ 设 0，小分配允许溢出到 PSRAM。
+# WiFi beacon 池不受影响：它由驱动显式按能力分配，不走普通 malloc。
+CONFIG_SPIRAM_MALLOC_ALWAYSINTERNAL=0
 # 预留 8KB 内部 RAM 专供"必须从内部 RAM 分配"的场景（DMA 描述符等）
 # （32KB→16KB→8KB：WiFi 内存实测调优；大任务栈已移 PSRAM，预留可收窄）
 CONFIG_SPIRAM_MALLOC_RESERVE_INTERNAL=8192
@@ -180,8 +186,10 @@ CONFIG_LV_MEM_SIZE=131072
 # 内存分配器：改用系统堆（malloc/free）而非内建池。
 # 实机 coredump 定位：内建池被"字形缓存 + 二级页对象"逐步耗尽，
 # 渲染新字形时 stb_truetype 临时缓冲分配失败（stbtt__new_active 断言）→ panic 复位。
-# 系统堆下：小块分配仍优先内部 RAM（< CONFIG_SPIRAM_MALLOC_ALWAYSINTERNAL），
-# 大块自动走 PSRAM（8MB），彻底解除 128KB 上限；渲染结果与内建池完全一致。
+# 系统堆下：分配先内部 RAM、不足自动溢出 PSRAM（ALWAYSINTERNAL=0，见上文），
+# 彻底解除 128KB 上限；渲染结果与内建池完全一致。
+# ⚠ 内部 RAM 余量必须盯紧：LVGL 对象生命周期短、分配频率高，配合
+#   RESERVE_INTERNAL=8KB 保底，实测稳态内部空闲 19KB+ 时不枯竭。
 # ⚠ Kconfig 是 choice：必须同时翻"成员行"，只改序号会被 Kconfig 按成员覆盖回
 #   BUILTIN（本工程踩过：序号改了、成员没改 → 配置静默回退）。
 CONFIG_LV_USE_CLIB_MALLOC=y

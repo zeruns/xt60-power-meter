@@ -323,6 +323,11 @@ static void net_services_start(void)
     }
 
     /* WiFi 管理：有凭据走 STA，无凭据进 AP 配网模式 */
+    /* 【v0.6.1 日志降噪】esp_wifi 驱动的 I/W 级日志刷屏非常凶：热点模式下
+     * 手机每 ~120ms 探测一次就是一条 W（"m f probe req"），STA 重试时状态机
+     * 迁移也是一条 I——同步 UART 输出会持续占用 Core0，加剧 UI 卡顿感。
+     * 压到 ERROR 级：连接排障靠 wifi_manager 自己的 I 级日志（重试/结果都有）。 */
+    esp_log_level_set("wifi", ESP_LOG_ERROR);
     esp_err_t werr = wifi_manager_start();
     if (werr != ESP_OK) {
         ESP_LOGW(TAG, "WiFi 启动失败（降级为离线运行）: %s", esp_err_to_name(werr));

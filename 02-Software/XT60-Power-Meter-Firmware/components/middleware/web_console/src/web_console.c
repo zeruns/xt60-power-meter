@@ -861,7 +861,11 @@ static void ws_broadcast(const char *json)
             continue; /* 只推 WS 会话，普通 HTTP 会话跳过 */
         }
 
-        char *copy = (char *)malloc(len + 1);
+        /* 【v0.6.1 内存修复】发送缓冲放 PSRAM：socket 写发生在 httpd 任务
+         * （非 ISR），PSRAM 安全；若用普通 malloc，350B 级缓冲会被
+         * 「内部优先」策略反复 churn 本就紧张的内部 RAM（旧 ALWAYSINTERNAL=512
+         * 时甚至被强制内部，是 v0.6.0 概率复位的帮凶之一）。 */
+        char *copy = (char *)heap_caps_malloc(len + 1, MALLOC_CAP_SPIRAM);
         if (copy == NULL) {
             continue; /* 内存紧张就少推一帧，下一个周期自会补上 */
         }
