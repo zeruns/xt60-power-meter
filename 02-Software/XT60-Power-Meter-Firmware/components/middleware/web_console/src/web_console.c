@@ -46,18 +46,25 @@
  *
  * 快照 JSON 字段（与 data_store_snapshot_t 一一对应）：
  *   {"ok":true,
- *    "voltage_v":12.34,      电压（V，2 位小数）
- *    "current_a":1.234,      电流（A，3 位小数）
- *    "power_w":15.23,        功率（W，2 位小数）
- *    "energy_wh":4.56,       累计电能（Wh，2 位小数）
- *    "temperature_c":25.3,   机内温度（℃，1 位小数）
- *    "humidity_pct":48.2,    机内湿度（%，1 位小数）
+ *    "voltage_v":12.345678,  电压（V，v0.5.1 起下发 6 位小数全精度）
+ *    "current_a":1.234567,   电流（A，6 位小数）
+ *    "power_w":15.234567,    功率（W，6 位小数）
+ *    "energy_wh":4.567890,   累计电能（Wh，6 位小数）
+ *    "capacity_ah":1.234567, 累计容量（Ah，6 位小数，v0.5.1 新增）
+ *    "temperature_c":25.30,  机内温度（℃，2 位小数；null = 尚未读到）
+ *    "humidity_pct":48.20,   机内湿度（%，2 位小数；null = 尚未读到）
+ *    "soc_temp_c":42.10,     SOC 结温（℃，2 位小数，v0.5.1 新增；null = 无数据）
  *    "battery_mv":3980,      电池电压（mV，整数，0 = 尚未采集）
- *    "runtime_s":3600}       运行时间（秒，整数）
+ *    "runtime_s":3600,       运行时间（秒，整数）
+ *    "alert_mask":0}         越限告警位图（DATA_ALERT_*，v0.5.1 新增，0=无告警）
+ *
+ *   说明：设备端屏幕用「动态小数位」（fmt_val）显示；JSON 下发全精度，
+ *   由网页 JS 用同一规则（fmtVal）截取，保证两边显示位数一致。
  */
 #include "web_console.h"
 
 #include <ctype.h>
+#include <math.h> /* isfinite：判断浮点是否有效（NaN=传感器无数据） */
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -89,8 +96,9 @@ static const char *TAG = "web_console";
 #define WEB_CONSOLE_MAX_CLIENTS 8
 /** POST /api/config 请求体上限（字节）：参数都是短键值对，1KB 绰绰有余 */
 #define WEB_CONSOLE_CFG_BODY_MAX 1024
-/** JSON 快照缓冲（字节）：实测约 170 字节，留一倍余量 */
-#define WEB_CONSOLE_JSON_BUF_LEN 256
+/** JSON 快照缓冲（字节）：v0.5.1 起字段增多且浮点精度提高到 6 位小数
+ *  （满足"网页端小数位与设备一致"的显示需求），实测约 300 字节，留足余量 */
+#define WEB_CONSOLE_JSON_BUF_LEN 512
 /** 参数键长度上限（字节，含结尾 '\0'） */
 #define WEB_CONSOLE_KEY_MAX 48
 /** 参数值长度上限（字节，含结尾 '\0'） */
@@ -117,10 +125,38 @@ extern const char web_console_page_html[];
 /* ============================ JSON 构建 ============================ */
 
 /**
+ * @brief 把浮点值渲染成 JSON 数字，NaN 输出 null
+ *
+ * 设备端用 NaN 表示"传感器暂无有效数据"（见 data_store.h 的 soc_temp_c /
+ * temperature_c 注释）。JSON 标准没有 NaN 字面量，前端 JSON.parse 会
+ * 直接报错，因此统一映射为 null，前端用 `x === null` 判断"无数据"。
+ *
+ * @param v   待渲染的值
+ * @param out 输出缓冲（写入数字或 "null"）
+ * @param n   缓冲长度
+ * @param fmt 数字格式（如 "%.6f"）
+ * @return 写入的字符数（与 snprintf 一致）
+ */
+static int json_fmt_float(double v, char *out, size_t n, const char *fmt)
+{
+    if (!isfinite(v)) {
+        return snprintf(out, n, "null");
+    }
+    return snprintf(out, n, fmt, v);
+}
+
+/**
  * @brief 把 data_store 快照拼成 JSON
  *
  * 键名固定、值全是数字，直接 snprintf 即可，无需通用序列化器。
- * 浮点统一转 double 传入（变参提升规则），输出用固定小数位，方便前端解析。
+ * 浮点统一转 double 传入（变参提升规则）。
+ *
+ * 【v0.5.1 精度调整】测量值统一输出 6 位小数、环境量 2 位：
+ * 设备端屏幕用"动态小数位"（fmt_val：<1 五位 / <100 四位 / <10000 两位…）
+ * 让有效数字尽量多；JSON 无法预知前端要几位，故下发**全精度**，
+ * 由网页 JS 按与设备相同的规则 (fmtVal) 截取显示——两边显示位数对齐。
+ *
+ * 新增字段：capacity_ah（累计容量）、soc_temp_c（SOC 结温，NaN→null）。
  *
  * @param buf     输出缓冲
  * @param buf_len 缓冲长度
@@ -136,15 +172,28 @@ static esp_err_t build_state_json(char *buf, size_t buf_len)
         return err; /* 通常是 ESP_ERR_INVALID_STATE：测量核还没写过数据 */
     }
 
+    /* 三个可为 NaN 的量先各自格式化（NaN→null），避免在 snprintf 里
+     * 用 %f 输出 "nan" 破坏 JSON 语法 */
+    char s_temp[16];
+    char s_humi[16];
+    char s_soc[16];
+    json_fmt_float((double)snap.temperature_c, s_temp, sizeof(s_temp), "%.2f");
+    json_fmt_float((double)snap.humidity_pct, s_humi, sizeof(s_humi), "%.2f");
+    json_fmt_float((double)snap.soc_temp_c, s_soc, sizeof(s_soc), "%.2f");
+
     int n = snprintf(buf, buf_len,
                      "{\"ok\":true,"
-                     "\"voltage_v\":%.2f,\"current_a\":%.3f,\"power_w\":%.2f,"
-                     "\"energy_wh\":%.2f,\"temperature_c\":%.1f,\"humidity_pct\":%.1f,"
-                     "\"battery_mv\":%u,\"runtime_s\":%u}",
+                     "\"voltage_v\":%.6f,\"current_a\":%.6f,\"power_w\":%.6f,"
+                     "\"energy_wh\":%.6f,\"capacity_ah\":%.6f,"
+                     "\"temperature_c\":%s,\"humidity_pct\":%s,\"soc_temp_c\":%s,"
+                     "\"battery_mv\":%u,\"runtime_s\":%u,"
+                     "\"alert_mask\":%u}",
                      (double)snap.voltage_v, (double)snap.current_a,
                      (double)snap.power_w, (double)snap.energy_wh,
-                     (double)snap.temperature_c, (double)snap.humidity_pct,
-                     (unsigned)snap.battery_mv, (unsigned)snap.runtime_s);
+                     (double)snap.capacity_ah,
+                     s_temp, s_humi, s_soc,
+                     (unsigned)snap.battery_mv, (unsigned)snap.runtime_s,
+                     (unsigned)snap.alert_mask);
     if (n <= 0 || (size_t)n >= buf_len) {
         return ESP_ERR_INVALID_SIZE;
     }
@@ -547,7 +596,7 @@ static esp_err_t api_export_csv_handler(httpd_req_t *req)
     char line[160];
     snprintf(line, sizeof(line),
              "t_min,voltage_v,current_a,power_w,energy_wh,capacity_ah,temp_c,humidity_pct,"
-             "battery_mv,runtime_s\r\n");
+             "soc_temp_c,battery_mv,runtime_s\r\n");
     if (httpd_resp_send_chunk(req, line, HTTPD_RESP_USE_STRLEN) != ESP_OK) {
         return ESP_FAIL;
     }
@@ -556,10 +605,19 @@ static esp_err_t api_export_csv_handler(httpd_req_t *req)
     for (int k = 0; k < s_hist_count; k++) {
         const hist_point_t *h = &s_hist[(base_idx + k) % HIST_POINTS];
         const double t_min = (double)(h->ts_us - base) / 60000000.0;
-        snprintf(line, sizeof(line), "%.2f,%.3f,%.4f,%.3f,%.4f,%.4f,%.1f,%.0f,%u,%u\r\n",
+        /* soc_temp_c 由 v0.5.1 增列；温湿度/SOC 温度无数据（NaN）时
+         * 该字段输出空串（CSV 惯例），便于 Excel 识别为空单元格 */
+        char s_t[12], s_h[12], s_soc[12];
+        if (isfinite(h->snap.temperature_c)) snprintf(s_t, sizeof(s_t), "%.1f", (double)h->snap.temperature_c);
+        else s_t[0] = '\0';
+        if (isfinite(h->snap.humidity_pct)) snprintf(s_h, sizeof(s_h), "%.0f", (double)h->snap.humidity_pct);
+        else s_h[0] = '\0';
+        if (isfinite(h->snap.soc_temp_c)) snprintf(s_soc, sizeof(s_soc), "%.1f", (double)h->snap.soc_temp_c);
+        else s_soc[0] = '\0';
+        snprintf(line, sizeof(line), "%.2f,%.3f,%.4f,%.3f,%.4f,%.4f,%s,%s,%s,%u,%u\r\n",
                  t_min, (double)h->snap.voltage_v, (double)h->snap.current_a,
                  (double)h->snap.power_w, (double)h->snap.energy_wh, (double)h->snap.capacity_ah,
-                 (double)h->snap.temperature_c, (double)h->snap.humidity_pct,
+                 s_t, s_h, s_soc,
                  (unsigned)h->snap.battery_mv, (unsigned)h->snap.runtime_s);
         if (httpd_resp_send_chunk(req, line, HTTPD_RESP_USE_STRLEN) != ESP_OK) {
             return ESP_FAIL;
