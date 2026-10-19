@@ -19,13 +19,20 @@
   - 时间窗 1s / 10s / 30s / 60s / 120s / 10min，三级降采样环形缓冲
   - 黑底亮线配色、min/max 包络渲染（防混叠丢峰）、量程滞回（防跳变）
   - 底部实时 / 平均数据行：定宽列布局，数值跳动不移位
-- **UI**：测量 / 波形 / 设置三页循环滑动，触屏 + 纯按键双操作，快捷设置面板
+- **UI**：测量 / 波形 / 设置三页滑动（首末页到头即止，不循环），触屏 + 纯按键双操作，快捷设置面板
+  - 首页电能数据条可点击，在 Wh / Ah 之间切换显示
   - 支持横屏 0° + 90° / 180° / 270° 四方向（重力自动旋转 + 手动角度）
   - 启动页进度条 + 外设自检，故障弹窗提示
-- **其他外设**：温湿度（AHT20）、电池电压监测、加速度计自动转屏（SC7A20H）、
-  蜂鸣器（按键音 / 提示音）、状态指示灯（分级故障指示）
-- **工程化**：双 OTA 分区已就绪（A/B 升级回滚通道**规划中**，wifi_manager / web_console
-  目前为接口骨架）、崩溃转储（coredump）取证、
+- **联网与网页控制台**（v0.5.0 起）：
+  - WiFi STA / AP 双模：设备热点配网 → 连上路由器后以 IP 提供 HTTP 服务；凭据写入 NVS 掉电保留
+  - 网页控制台四页签：**实时数据 / 波形图 / 设置 / 日志**，数值小数位与设备屏显完全一致
+  - 网页波形图（Canvas 2D）：V / I / P 三通道叠加、1s~10min 时间窗、暂停、拖动回看历史、
+    十字光标读数、锁定量程、波形 CSV 导出——比设备端波形页更完善
+  - 接口：`/api/state`（快照）+ WebSocket `/ws`（5Hz 推送）、`/api/config`（参数下发）、
+    `/api/export.csv`（分钟级历史导出）、HTTP OTA 升级
+- **其他外设**：温湿度（AHT20）、电池电压监测、芯片内部温度传感器（SOC 结温）、
+  加速度计自动转屏（SC7A20H）、蜂鸣器（按键音 / 提示音）、状态指示灯（分级故障指示）
+- **工程化**：双 OTA 分区 + A/B 升级回滚（HTTP 上传 + 启动回滚检查）、崩溃转储（coredump）取证、
   PC 端 LVGL UI 模拟器（烧录前走查 / 回归截图）、主机端纯逻辑单元测试
 
 ## 硬件概要
@@ -100,7 +107,8 @@ components/
 │   ├── touch_cst816d/    电容触摸（I2C）
 │   ├── aht20/ imu_sc7a20h/ battery_adc/ buzzer/ status_led/ key_button/
 ├── middleware/           中间件：event_bus、data_store（seqlock）、lvgl_port、
-│                         fs_storage（SPIFFS 字体）、wifi_manager / web_console（接口骨架，规划中）
+│                         fs_storage（SPIFFS 字体）、wifi_manager（STA/AP 配网）、
+│                         web_console（内嵌网页控制台：HTTP + WebSocket + OTA）
 └── services/             业务服务：power_measure（4kSPS 测量链路）、system_state、
                           settings（NVS 持久化）、orientation（自动转屏）、ui（三页界面）
 managed_components/       组件管理器托管依赖（不入库，由 lock 复现）
