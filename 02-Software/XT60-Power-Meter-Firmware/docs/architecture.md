@@ -333,7 +333,7 @@ gcc -std=c11 -Wall -Wextra -I components/services/power_measure/include \
 |---|---|---|
 | 模组 | ESP32-S3-WROOM-1-**N16R8** | N16 = 16MB 四线 Flash；R8 = 8MB **八线** PSRAM（占用 IO33~37） |
 | Flash 模式 | **QIO @ 80MHz** | 四线读，带宽约为 DIO 的 2 倍；QIO 只与「八线 Flash」互斥，与八线 PSRAM 不冲突 |
-| PSRAM | Octal @ 80MHz，开内存自检 | 小分配走内部 RAM（<16KB），WiFi/LWIP 缓冲放 PSRAM |
+| PSRAM | Octal @ 80MHz，开内存自检 | 小分配先内部、不足溢出 PSRAM（ALWAYSINTERNAL=0）；WiFi/LWIP 缓冲放 PSRAM |
 | CPU 主频 | **240 MHz** | S3 最高主频 |
 | 缓存 | 指令 32KB + 数据 64KB | S3 推荐配置，影响 LVGL 与 PSRAM 访问速度 |
 | 编译优化 | **-O2（PERF）** | 仪器项目性能优先；调试汇编时可临时改回 -Og |
@@ -349,6 +349,14 @@ gcc -std=c11 -Wall -Wextra -I components/services/power_measure/include \
 它允许把任务栈放进 PSRAM 以节省内部 RAM。但**中断服务程序运行在当前任务栈上，
 且中断期间不能访问 PSRAM**，因此凡可能被中断打断时正在使用的任务
 （尤其测量采样任务），其栈必须在内部 RAM —— 创建时不要传 `MALLOC_CAP_SPIRAM`。
+
+**小分配内存策略（v0.6.1 根因修复）**：`CONFIG_SPIRAM_MALLOC_ALWAYSINTERNAL=0`
+——普通 `malloc` 先从内部 RAM 分配、不足时自动溢出到 PSRAM，分配不会因阈值失败。
+演进史：16KB/8KB/1KB 档曾把 752B WiFi beacon 缓冲强制推入内部 RAM 导致驱动崩溃，
+降到 512 后又把 LVGL（clib malloc）高频小分配（建对象 / label 刷新 strdup）与
+WS 10Hz 推送缓冲压进仅剩 ~19KB 的内部 RAM，碎片化耗尽后 `lv_malloc` 返回 NULL、
+渲染路径解引用崩溃（表现为"设置页概率卡死、卡几秒自动复位"）。显式
+`MALLOC_CAP_INTERNAL` 的分配（ISR 相关、DMA）不受该开关影响。
 
 ---
 
@@ -524,8 +532,9 @@ version.txt               固件版本号
 
 ## 12. 后续里程碑（当前已知缺口）
 
-测量链路、三页正式 UI、自动转屏均已实现；`wifi_manager`（STA / AP 配网）与
-`web_console`（内嵌网页控制台，v0.5.1 起为实时数据 / 波形图 / 设置 / 日志四页签）已于 v0.5.0/v0.5.1 落地。
+测量链路、三页正式 UI、自动转屏均已实现；`wifi_manager`（STA / AP 配网 + 模式三档 +
+扫描 + RSSI，v0.6.0/0.6.1）与 `web_console`（内嵌网页控制台，v0.6.0 起为
+实时数据 / 波形图 / 设置 / API / 日志五页签，10Hz 推送 + WiFi 扫描配网）已落地。
 以下为**尚未实现**的缺口：
 
 | 缺口 | 现状 | 影响 |
