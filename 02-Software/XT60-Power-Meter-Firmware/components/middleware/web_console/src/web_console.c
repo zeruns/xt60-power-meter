@@ -77,6 +77,7 @@
 #include "esp_log.h"
 
 #include "data_store.h"
+#include "wifi_manager.h" /* v0.6.0：/api/state 增 WiFi 状态/RSSI，/api/wifi/scan 封装扫描 */
 
 /** 日志标签 */
 static const char *TAG = "web_console";
@@ -85,8 +86,10 @@ static const char *TAG = "web_console";
 
 /** HTTP 服务端口 */
 #define WEB_CONSOLE_PORT 80
-/** WS 快照推送周期（ms），200ms ≈ 5Hz */
-#define WEB_CONSOLE_PUSH_PERIOD_MS 200
+/** WS 快照推送周期（ms）。【v0.6.0】200ms(5Hz) → 100ms(10Hz)：网页波形更细腻。
+ *  代价是 WS 带宽与 CPU 略增，但单帧 JSON 仅约 350 字节，10Hz 下不足 4KB/s，
+ *  对局域网与双核 CPU 都毫无压力（推送任务优先级最低且栈在 PSRAM）。 */
+#define WEB_CONSOLE_PUSH_PERIOD_MS 100
 /** WS 推送任务栈（字节）：只做 snprintf + 异步排发送，4KB 足够 */
 #define WEB_CONSOLE_PUSH_TASK_STACK 4096
 /** WS 推送任务优先级：略高于 idle，不与测量/显示任务抢 CPU */
@@ -181,19 +184,34 @@ static esp_err_t build_state_json(char *buf, size_t buf_len)
     json_fmt_float((double)snap.humidity_pct, s_humi, sizeof(s_humi), "%.2f");
     json_fmt_float((double)snap.soc_temp_c, s_soc, sizeof(s_soc), "%.2f");
 
+    /* 【v0.6.0】WiFi 状态 / 模式 / 信号强度（RSSI）：网页端实时数据页要显示
+     * 链路质量，设置页要回显当前模式。未连接时 RSSI 输出 null（不是 -127，
+     * 避免前端画出一个"极弱信号"的假读数）。 */
+    const int wst = (int)wifi_manager_get_state();
+    const int wmd = (int)wifi_manager_get_mode();
+    int8_t rssi = 0;
+    char s_rssi[16];
+    if (wifi_manager_get_rssi(&rssi) == ESP_OK) {
+        snprintf(s_rssi, sizeof(s_rssi), "%d", (int)rssi);
+    } else {
+        snprintf(s_rssi, sizeof(s_rssi), "null");
+    }
+
     int n = snprintf(buf, buf_len,
                      "{\"ok\":true,"
                      "\"voltage_v\":%.6f,\"current_a\":%.6f,\"power_w\":%.6f,"
                      "\"energy_wh\":%.6f,\"capacity_ah\":%.6f,"
                      "\"temperature_c\":%s,\"humidity_pct\":%s,\"soc_temp_c\":%s,"
                      "\"battery_mv\":%u,\"runtime_s\":%u,"
-                     "\"alert_mask\":%u}",
+                     "\"alert_mask\":%u,"
+                     "\"wifi_state\":%d,\"wifi_mode\":%d,\"wifi_rssi\":%s}",
                      (double)snap.voltage_v, (double)snap.current_a,
                      (double)snap.power_w, (double)snap.energy_wh,
                      (double)snap.capacity_ah,
                      s_temp, s_humi, s_soc,
                      (unsigned)snap.battery_mv, (unsigned)snap.runtime_s,
-                     (unsigned)snap.alert_mask);
+                     (unsigned)snap.alert_mask,
+                     wst, wmd, s_rssi);
     if (n <= 0 || (size_t)n >= buf_len) {
         return ESP_ERR_INVALID_SIZE;
     }
@@ -626,6 +644,116 @@ static esp_err_t api_export_csv_handler(httpd_req_t *req)
     return httpd_resp_send_chunk(req, NULL, 0); /* 结束块 */
 }
 
+/* ============================ WiFi 扫描（v0.6.0） ============================
+ * 需求：网页设置页要能「搜索 WiFi → 选点 → 输密码连接」，与设备端设置页一致。
+ * 设计：
+ *   · 扫描由 GET /api/wifi/scan?go=1 触发（wifi_manager_scan_start 是非阻塞的），
+ *     结果由同路径的后续 GET 轮询取回——页面每 1.5s 轮询一次，running 变 false
+ *     即拿到列表，符合「异步扫描 + 轮询」的 WiFi 特性，HTTP 请求不会久挂。
+ *   · 列表直接透传 wifi_manager 的 wifi_ap_record_t（SSID/RSSI/加密方式），
+ *     只做最小 JSON 转义：SSID 允许任意字节，必须转义 " 与 \ 才能安全内嵌。
+ *   · 缓冲用堆分配（最大 16 个热点 × 约 100 字节 ≈ 1.6KB），不占 httpd 栈。 */
+
+/** 扫描接口最多返回的热点数（与 wifi_manager 内部缓存一致） */
+#define WEB_CONSOLE_SCAN_MAX_AP 16
+/** 扫描结果 JSON 缓冲（堆分配，见上） */
+#define WEB_CONSOLE_SCAN_JSON_MAX 2048
+
+/**
+ * @brief 把 SSID 逐个字符转义后追加到 JSON 缓冲（不写结尾 '\0' 之外的内容）
+ *
+ * @param buf  输出缓冲
+ * @param cap  缓冲容量（含结尾 '\0' 的 1 字节）
+ * @param len  当前已写入长度（函数返回新的长度）
+ * @param ssid 待转义的 SSID（'\0' 结尾）
+ * @return 追加后的长度
+ */
+static size_t json_append_ssid(char *buf, size_t cap, size_t len, const char *ssid)
+{
+    for (size_t i = 0; ssid[i] != '\0' && (len + 8u) < cap; i++) {
+        char c = ssid[i];
+        if (c == '"' || c == '\\') {
+            buf[len++] = '\\';
+            buf[len++] = c;
+        } else if ((unsigned char)c < 0x20) {
+            buf[len++] = '?'; /* 控制字符替换，避免破坏 JSON 语法 */
+        } else {
+            buf[len++] = c;
+        }
+    }
+    buf[len] = '\0';
+    return len;
+}
+
+/** GET /api/wifi/scan：读取扫描结果；带 ?go=1 时先触发一次扫描 */
+static esp_err_t api_wifi_scan_handler(httpd_req_t *req)
+{
+    /* ① 可选触发扫描：httpd_req_get_url_query_str 取查询串，
+     *    httpd_query_key_value 取某个键的值（都是 esp_http_server 提供的工具） */
+    char query[24];
+    if (httpd_req_get_url_query_str(req, query, sizeof(query)) == ESP_OK) {
+        char val[8];
+        if (httpd_query_key_value(query, "go", val, sizeof(val)) == ESP_OK && val[0] == '1') {
+            esp_err_t serr = wifi_manager_scan_start();
+            ESP_LOGI(TAG, "网页端触发 WiFi 扫描：%s", esp_err_to_name(serr));
+        }
+    }
+
+    const bool running = wifi_manager_scan_is_running();
+    uint16_t count = WEB_CONSOLE_SCAN_MAX_AP;
+    wifi_ap_record_t *aps = NULL;
+    char *buf = NULL;
+    esp_err_t resp = ESP_FAIL;
+
+    aps = malloc(sizeof(wifi_ap_record_t) * WEB_CONSOLE_SCAN_MAX_AP);
+    buf = malloc(WEB_CONSOLE_SCAN_JSON_MAX);
+    if (aps == NULL || buf == NULL) {
+        goto out; /* 内存不足：统一走 out 释放并回 500 */
+    }
+
+    esp_err_t err = wifi_manager_scan_get_ap_list(aps, &count);
+    if (err != ESP_OK) {
+        /* 扫描尚未完成时部分驱动会返回 "no result"，此时按"正在扫描"回给前端，
+         * 让页面继续轮询而不是报错 */
+        resp = send_json(req, HTTPD_200,
+                         "{\"ok\":true,\"running\":true,\"count\":0,\"aps\":[]}");
+        goto out;
+    }
+    if (count > WEB_CONSOLE_SCAN_MAX_AP) {
+        count = WEB_CONSOLE_SCAN_MAX_AP;
+    }
+
+    size_t len = (size_t)snprintf(buf, WEB_CONSOLE_SCAN_JSON_MAX,
+                                  "{\"ok\":true,\"running\":%s,\"count\":%u,\"aps\":[",
+                                  running ? "true" : "false", (unsigned)count);
+    for (uint16_t i = 0; i < count; i++) {
+        if ((len + 96u) >= WEB_CONSOLE_SCAN_JSON_MAX) {
+            break; /* 缓冲将满：截断列表，避免越界 */
+        }
+        len += (size_t)snprintf(buf + len, WEB_CONSOLE_SCAN_JSON_MAX - len, "%s{\"ssid\":\"",
+                                (i == 0) ? "" : ",");
+        len = json_append_ssid(buf, WEB_CONSOLE_SCAN_JSON_MAX, len, (const char *)aps[i].ssid);
+        len += (size_t)snprintf(buf + len, WEB_CONSOLE_SCAN_JSON_MAX - len,
+                                "\",\"rssi\":%d,\"auth\":%d}", (int)aps[i].rssi,
+                                (int)aps[i].authmode);
+    }
+    if ((len + 4u) < WEB_CONSOLE_SCAN_JSON_MAX) {
+        buf[len++] = ']';
+        buf[len++] = '}';
+        buf[len] = '\0';
+    }
+    resp = send_json(req, HTTPD_200, buf);
+
+out:
+    free(aps);
+    free(buf);
+    if (resp == ESP_FAIL) {
+        return send_json(req, HTTPD_500,
+                         "{\"ok\":false,\"code\":\"internal\",\"msg\":\"scan failed\"}");
+    }
+    return resp;
+}
+
 /** POST /api/config：JSON 键值对 → 注册的回调 */
 static esp_err_t api_config_post_handler(httpd_req_t *req)
 {
@@ -914,7 +1042,7 @@ esp_err_t web_console_start(void)
     httpd_config_t config = HTTPD_DEFAULT_CONFIG();
     config.server_port = WEB_CONSOLE_PORT;
     config.max_open_sockets = WEB_CONSOLE_MAX_CLIENTS;
-    config.max_uri_handlers = 5; /* / 、/ws 、/api/state 、/api/config 、/api/export.csv */
+    config.max_uri_handlers = 6; /* / 、/ws 、/api/state 、/api/config 、/api/export.csv 、/api/wifi/scan */
     config.max_resp_headers = 4;
     config.stack_size = 6144;    /* URI 处理器要拼 JSON + 回调上层写 NVS，比默认 4096 留宽些 */
     config.lru_purge_enable = true; /* 连接满时淘汰最久未用的，避免僵尸会话占坑 */
@@ -949,6 +1077,12 @@ esp_err_t web_console_start(void)
         .method = HTTP_POST,
         .handler = api_config_post_handler,
     };
+    /* v0.6.0：WiFi 扫描（网页设置页的「搜索 WiFi」用它） */
+    static const httpd_uri_t uri_wifi_scan = {
+        .uri = "/api/wifi/scan",
+        .method = HTTP_GET,
+        .handler = api_wifi_scan_handler,
+    };
 #if CONFIG_HTTPD_WS_SUPPORT
     static const httpd_uri_t uri_ws = {
         .uri = "/ws",
@@ -968,7 +1102,8 @@ esp_err_t web_console_start(void)
         httpd_register_uri_handler(server, &uri_ws) != ESP_OK ||
         httpd_register_uri_handler(server, &uri_state) != ESP_OK ||
         httpd_register_uri_handler(server, &uri_config) != ESP_OK ||
-        httpd_register_uri_handler(server, &uri_export) != ESP_OK) {
+        httpd_register_uri_handler(server, &uri_export) != ESP_OK ||
+        httpd_register_uri_handler(server, &uri_wifi_scan) != ESP_OK) {
         ESP_LOGE(TAG, "URI 注册失败");
         httpd_stop(server);
         return ESP_FAIL;

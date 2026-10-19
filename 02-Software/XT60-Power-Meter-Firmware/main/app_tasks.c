@@ -16,6 +16,9 @@
 #include "settings.h"
 #include "system_state.h"
 #include "ui.h"
+/* screen_settings：取"当前打开的二级页名"——渲染停滞告警里要一并打出
+ * 卡在哪一页（v0.6.0 新增的诊断口径，见 screen_settings.h 的说明） */
+#include "screen_settings.h"
 
 #include "esp_heap_caps.h"
 #include "esp_log.h"
@@ -141,10 +144,15 @@ static void task_sys_monitor(void *arg)
                          (drdy_now - s_prev_drdy) / 5.0,
                          state, lock_ok ? "可得" : "被占", (unsigned)ui_age_ms,
                          (unsigned)uxTaskGetStackHighWaterMark(s_lvgl_task), 16384);
-                /* 渲染停滞告警：flush 在 5s 内零增长 = taskLVGL 出不了帧 */
+                /* 渲染停滞告警：flush 在 5s 内零增长 = taskLVGL 出不了帧。
+                 * 【v0.6.0】一并打出"设置页当前二级页名"，把"卡在哪一页"
+                 * 直接落到串口——否则只有 flush=0 无法定位触发页面。 */
                 if (flush_now == s_prev_flush) {
-                    ESP_LOGE(TAG, "!! 渲染停滞：5s 内 flush 零增长（LVGL态=%d 锁=%s UI心跳龄=%ums）",
-                             state, lock_ok ? "可得" : "被占", (unsigned)ui_age_ms);
+                    ESP_LOGE(TAG,
+                             "!! 渲染停滞：5s 内 flush 零增长（LVGL态=%d 锁=%s UI心跳龄=%ums "
+                             "当前设置页=%s）",
+                             state, lock_ok ? "可得" : "被占", (unsigned)ui_age_ms,
+                             screen_settings_current_subpage_name());
                 }
                 s_prev_flush = flush_now;
                 s_prev_data = data_now;
@@ -234,6 +242,24 @@ static esp_err_t web_config_handler(const char *key, const char *value)
         if (wifi_touched) {
             return ESP_OK; /* 只到齐一半，等另一半 */
         }
+    }
+
+    /* ---- v0.6.0：WiFi 工作模式切换与忘记网络 ----
+     * wifi_mode：0=自动（默认）、1=仅 STA、2=强制配网热点。与设备端设置页的
+     *   模式按钮同源，网页端也能切换；写入偏好由 wifi_manager 落到 NVS（键 wifi/mode）。
+     * wifi_forget：非 0 时清除凭据（回到配网热点模式），用于「忘记网络」。 */
+    if (strcmp(key, "wifi_mode") == 0) {
+        int m = atoi(value);
+        if (m < 0 || m > 2) {
+            return ESP_ERR_INVALID_ARG;
+        }
+        return wifi_manager_set_mode((wifi_manager_mode_t)m);
+    }
+    if (strcmp(key, "wifi_forget") == 0) {
+        if (atoi(value) == 0) {
+            return ESP_OK; /* 0 = 不做任何事 */
+        }
+        return wifi_manager_forget();
     }
 
     if (strcmp(key, "alarm_v_en") == 0 || strcmp(key, "alarm_i_en") == 0 ||
