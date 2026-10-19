@@ -155,6 +155,7 @@ typedef enum {
     SUB_DISPLAY,    /**< 显示设置：亮度 + 方向 */
     SUB_BUZZER,     /**< 蜂鸣器响度 */
     SUB_WIFI,       /**< WiFi 状态与配网（F7 真实状态页） */
+    SUB_WIFI_SCAN,  /**< WiFi 扫描结果（独立页，v0.6.1 需求 3） */
     SUB_ENERGY,     /**< 电能统计与清零 */
     SUB_ALARM,      /**< 告警设置：过压/过流/过功率阈值 + 使能 */
 } sub_kind_t;
@@ -1943,6 +1944,10 @@ static void wifi_scan_timer_cb(lv_timer_t *t)
     s_wifi_scan_timer = NULL;
     if (s_wifi_scan_btn != NULL) {
         lv_obj_remove_state(s_wifi_scan_btn, LV_STATE_DISABLED); /* 恢复可点 */
+        lv_obj_t *l = lv_obj_get_child(s_wifi_scan_btn, 0);
+        if (l != NULL) {
+            lv_label_set_text(l, "重新扫描"); /* 从"扫描中…"恢复 */
+        }
     }
     wifi_render_ap_list();
     if (s_wifi_hint_label != NULL) {
@@ -1952,16 +1957,13 @@ static void wifi_scan_timer_cb(lv_timer_t *t)
 }
 
 /**
- * @brief "搜索 Wi-Fi"按钮点击 → 发起扫描并开始轮询
+ * @brief 发起一次扫描并进入"扫描中"状态（按钮置灰 + 300ms 轮询定时器）
  *
- * 注意 esp_wifi 的限制：STA 正在连接时不允许扫描（会返回 WIFI_STATE），
- * 此时给出明确提示而不是静默失败。
- *
- * @param e LVGL 点击事件（未使用）
+ * 扫描由 wifi_manager 内部任务执行（esp_wifi_scan_start 异步），UI 只轮询
+ * 结果；不会阻塞 LVGL。
  */
-static void wifi_scan_btn_clicked_cb(lv_event_t *e)
+static void wifi_scan_begin(void)
 {
-    (void)e;
     if (s_wifi_scan_timer != NULL) {
         return; /* 已在扫描中 */
     }
@@ -1978,11 +1980,105 @@ static void wifi_scan_btn_clicked_cb(lv_event_t *e)
     (void)buzzer_play(BUZZER_TONE_CLICK);
     if (s_wifi_scan_btn != NULL) {
         lv_obj_add_state(s_wifi_scan_btn, LV_STATE_DISABLED);
+        lv_obj_t *l = lv_obj_get_child(s_wifi_scan_btn, 0);
+        if (l != NULL) {
+            lv_label_set_text(l, "扫描中…");
+        }
     }
     if (s_wifi_hint_label != NULL) {
         lv_label_set_text(s_wifi_hint_label, "正在扫描附近热点…（约 3 秒）");
     }
     s_wifi_scan_timer = lv_timer_create(wifi_scan_timer_cb, 300, NULL);
+}
+
+/**
+ * @brief "重新扫描"按钮（扫描子页内）：直接复用发起逻辑
+ *
+ * @param e LVGL 点击事件（未使用）
+ */
+static void wifi_rescan_clicked_cb(lv_event_t *e)
+{
+    (void)e;
+    wifi_scan_begin();
+}
+
+/**
+ * @brief 打开"WiFi 扫描"独立二级页（v0.6.1 需求 3）
+ *
+ * 【为什么从 WiFi 主页拆出来】旧版把 12 行结果列表内嵌在主页里，一页同时
+ * 装下「状态 + 模式三档 + 两个操作按钮 + 12 行列表」：行对象一次创建约
+ * 百个，LVGL 内存压力大（v0.6.0 概率卡死的帮凶之一），且主页信息密度
+ * 过高。独立页给列表完整的高度（可滚动），扫描状态与结果展示更清晰。
+ *
+ * @param auto_start true = 打开后立即发起扫描（从主页按钮进入的常态）
+ */
+static void wifi_scan_page_open(bool auto_start)
+{
+    lv_obj_t *c = subpage_open(SUB_WIFI_SCAN, "WiFi 扫描");
+
+    /* ① 状态/提示行（扫描中 → 结果摘要），复用 s_wifi_hint_label */
+    s_wifi_hint_label = plain_label(c, auto_start ? "正在扫描附近热点…（约 3 秒）"
+                                                  : "点「重新扫描」列出附近热点。",
+                                    LVGL_PORT_FONT_12, COL_GRAY, false);
+    lv_obj_set_width(s_wifi_hint_label, LV_PCT(100));
+    lv_obj_set_style_text_align(s_wifi_hint_label, LV_TEXT_ALIGN_CENTER, 0);
+
+    /* ② 重新扫描按钮（主动态，品牌蓝） */
+    s_wifi_scan_btn = plain_button(c, "重新扫描", LV_PCT(60), 34);
+    lv_obj_set_style_bg_color(s_wifi_scan_btn, COL_PRIMARY, 0);
+    lv_obj_set_style_border_color(s_wifi_scan_btn, COL_PRIMARY, 0);
+    {
+        lv_obj_t *l = lv_obj_get_child(s_wifi_scan_btn, 0);
+        if (l != NULL) {
+            lv_obj_set_style_text_color(l, lv_color_white(), 0);
+            lv_obj_set_style_text_font(l, lvgl_port_get_font_bold(LVGL_PORT_FONT_14), 0);
+        }
+    }
+    lv_obj_add_event_cb(s_wifi_scan_btn, wifi_rescan_clicked_cb, LV_EVENT_CLICKED, NULL);
+    focus_add(s_wifi_scan_btn);
+
+    /* ③ 结果列表（占满剩余高度，行内滚动；行由 wifi_render_ap_list 动态建） */
+    s_wifi_list = plain_container(c);
+    lv_obj_set_width(s_wifi_list, LV_PCT(100));
+    lv_obj_set_height(s_wifi_list, 0);
+    lv_obj_set_flex_grow(s_wifi_list, 1);
+    lv_obj_set_flex_flow(s_wifi_list, LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_style_pad_all(s_wifi_list, 2, 0);
+    lv_obj_set_style_pad_row(s_wifi_list, 4, 0);
+    lv_obj_set_scroll_dir(s_wifi_list, LV_DIR_VER);
+    lv_obj_set_scrollbar_mode(s_wifi_list, LV_SCROLLBAR_MODE_AUTO);
+
+    s_wifi_ap_copy_n = 0;
+    if (auto_start) {
+        wifi_scan_begin();
+    } else if (!wifi_manager_scan_is_running()) {
+        /* 非自动发起且没有在扫：把上一次缓存的结果直接显示出来（若有） */
+        wifi_render_ap_list();
+        if (s_wifi_hint_label != NULL && s_wifi_ap_copy_n > 0) {
+            lv_label_set_text(s_wifi_hint_label, "点选热点后输入密码即可连接。");
+        }
+    } else {
+        /* 打开时已有扫描在跑：接上轮询（按钮置灰复用 wifi_scan_begin 的视觉） */
+        if (s_wifi_scan_btn != NULL) {
+            lv_obj_add_state(s_wifi_scan_btn, LV_STATE_DISABLED);
+            lv_obj_t *l = lv_obj_get_child(s_wifi_scan_btn, 0);
+            if (l != NULL) {
+                lv_label_set_text(l, "扫描中…");
+            }
+        }
+        s_wifi_scan_timer = lv_timer_create(wifi_scan_timer_cb, 300, NULL);
+    }
+}
+
+/**
+ * @brief "搜索 Wi-Fi"按钮（WiFi 主页）：跳转到独立扫描页并自动发起
+ *
+ * @param e LVGL 点击事件（未使用）
+ */
+static void wifi_scan_btn_clicked_cb(lv_event_t *e)
+{
+    (void)e;
+    wifi_scan_page_open(true);
 }
 
 /* ---- 密码输入浮层（全屏 + 文字键盘） ---- */
@@ -2387,23 +2483,8 @@ static void wifi_open_cb(void)
     lv_obj_add_event_cb(fbtn, wifi_forget_clicked_cb, LV_EVENT_CLICKED, NULL);
     focus_add(fbtn);
 
-    /* ---- ④ 扫描结果列表（flex_grow 占满剩余高度，行内滚动） ----
-     * 行在扫描完成后由 wifi_render_ap_list 动态创建（每行登记焦点链）。 */
-    s_wifi_list = plain_container(c);
-    lv_obj_set_width(s_wifi_list, LV_PCT(100));
-    lv_obj_set_height(s_wifi_list, 0);
-    lv_obj_set_flex_grow(s_wifi_list, 1);
-    lv_obj_set_flex_flow(s_wifi_list, LV_FLEX_FLOW_COLUMN);
-    lv_obj_set_style_pad_all(s_wifi_list, 2, 0);
-    lv_obj_set_style_pad_row(s_wifi_list, 4, 0);
-    lv_obj_set_scroll_dir(s_wifi_list, LV_DIR_VER); /* 内容多时纵向滚动 */
-    lv_obj_set_scrollbar_mode(s_wifi_list, LV_SCROLLBAR_MODE_AUTO);
-    {
-        lv_obj_t *ph = plain_label(s_wifi_list, "点「搜索 Wi-Fi」列出附近热点。",
-                                   LVGL_PORT_FONT_12, COL_GRAY, false);
-        lv_obj_set_width(ph, LV_PCT(100));
-        lv_obj_set_style_text_align(ph, LV_TEXT_ALIGN_CENTER, 0);
-    }
+    /* ---- ④ 扫描结果改为独立二级页（v0.6.1 需求 3）：主页只留入口按钮，
+     * 12 行列表不再内嵌本页——降低本页对象密度，列表也有完整可滚高度。 ---- */
 
     /* ---- ⑤ 提示行：随状态切换（配网指引 / 忘记网络说明） ---- */
     s_wifi_hint_label = plain_label(c, "", LVGL_PORT_FONT_12, COL_GRAY, false);
@@ -3325,6 +3406,7 @@ const char *screen_settings_current_subpage_name(void)
     case SUB_DISPLAY:    return "显示设置";
     case SUB_BUZZER:     return "蜂鸣器";
     case SUB_WIFI:       return "WiFi 与热点";
+    case SUB_WIFI_SCAN:  return "WiFi 扫描";
     case SUB_ENERGY:     return "电能统计";
     case SUB_ALARM:      return "告警设置";
     default:             return "未知";

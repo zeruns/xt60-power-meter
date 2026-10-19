@@ -3,14 +3,19 @@
  * @brief 启动画面实现（参考 RD/UM34 类桌面功率计的简洁风格）
  *
  * 版式（白底，横屏 284×240 / 竖屏 240×284 自适应）：
- *   ┌──────────────────────────────┐  ← 顶部品牌色通栏（4px）
+ *   ┌──────────────────────────────┐
  *   │                              │
  *   │        XT60 功率计           │  Bold 40px，近黑
+ *   │    ────────────              │  标题下品牌色短分隔线（40px 宽）
  *   │      作者博客：blog.zeruns    │  16px 中灰
  *   │        固件版本 v0.1.0        │  14px 浅灰
  *   │       ▓▓▓▓▓▓▓░░░░░            │  加载条（品牌色，屏宽 80%）
  *   │      正在初始化传感器…         │  阶段文字（14px 中灰）
  *   └──────────────────────────────┘
+ *
+ * 【v0.6.1 版式调整】去掉旧版"顶部 4px 品牌蓝通栏"——用户反馈观感突兀
+ * （像系统残留的状态条）；品牌色改由「英文小标识 + 标题下短分隔线 +
+ * 加载条填充段」三处呼应，整体更简洁。
  *
  * 布局策略：文字块 + 加载条全部放进同一 flex 列、整体居中。
  * 加载条是列内最后一个子项，天然水平居中且恒在版本行下方——
@@ -84,14 +89,8 @@ void splash_build(lv_obj_t *scr)
     /* LVGL：读逻辑宽度，旋转后会变（284/240），加载条宽度据此算而非写死 */
     const int32_t w = (d != NULL) ? lv_display_get_horizontal_resolution(d) : 284;
 
-    /* ① 顶部品牌色通栏 */
-    lv_obj_t *topbar = lv_obj_create(scr); /* LVGL：新建通用对象当色条 */
-    lv_obj_remove_style_all(topbar); /* LVGL：清掉主题默认样式，自己从零设置 */
-    lv_obj_set_size(topbar, LV_PCT(100), 4); /* LVGL：LV_PCT(100)=父容器内容宽的 100% */
-    lv_obj_set_pos(topbar, 0, 0);
-    lv_obj_set_style_bg_color(topbar, COLOR_ACCENT, 0);
-    lv_obj_set_style_bg_opa(topbar, LV_OPA_COVER, 0); /* 背景不透明 */
-    lv_obj_set_scrollable(topbar, false);
+    /* ① 顶部通栏已移除（v0.6.1）：品牌色改由小标识/分隔线/加载条承担，
+     *    此处不再创建 topbar 对象。 */
 
     /* ② 纵向布局：小标识 + 标题 + 副标题 + 版本 + 加载条（整体居中）。
      * 容器铺满整屏、flex 三轴居中：内容高度变化时（横竖屏不同）自动保持
@@ -113,6 +112,16 @@ void splash_build(lv_obj_t *scr)
 
     /* 主标题：Bold 40px（字体文件不含时自动回退常规字重，不会方框） */
     make_label(cont, "XT60 功率计", lvgl_port_get_font_bold(LVGL_PORT_FONT_40), COLOR_TITLE);
+
+    /* 标题下品牌色短分隔线（40×3px 圆头）：替代旧顶部通栏的品牌识别职责，
+     * 居中由父容器 flex 交叉轴居中保证。 */
+    lv_obj_t *rule = lv_obj_create(cont);
+    lv_obj_remove_style_all(rule);
+    lv_obj_set_size(rule, 40, 3);
+    lv_obj_set_style_bg_color(rule, COLOR_ACCENT, 0);
+    lv_obj_set_style_bg_opa(rule, LV_OPA_COVER, 0);
+    lv_obj_set_style_radius(rule, 2, 0);
+    lv_obj_set_scrollable(rule, false);
 
     make_label(cont, "作者博客：blog.zeruns.com", lvgl_port_get_font(LVGL_PORT_FONT_16),
                COLOR_SUB);
