@@ -79,6 +79,8 @@ static const char *TAG = "wifi_manager";
 #define WIFI_MANAGER_NVS_NAMESPACE "wifi"
 #define WIFI_MANAGER_NVS_KEY_SSID  "ssid"
 #define WIFI_MANAGER_NVS_KEY_PASS  "pass"
+/** 工作模式偏好键（v0.6.0 新增）：u8 类型，取值见 wifi_manager_mode_t */
+#define WIFI_MANAGER_NVS_KEY_MODE  "mode"
 
 /** 连接失败后的最大重试次数（不含首次尝试）；耗尽即进入 FAILED */
 #define WIFI_MANAGER_RETRY_MAX 5
@@ -134,6 +136,7 @@ static const char *TAG = "wifi_manager";
 typedef enum {
     WIFI_MANAGER_CMD_CONNECT = 0, /**< 保存凭据并切换到 STA 连接 */
     WIFI_MANAGER_CMD_FORGET,      /**< 清除凭据并回到 AP 配网模式 */
+    WIFI_MANAGER_CMD_SET_MODE,    /**< 设置工作模式偏好（v0.6.0）：写 NVS + 切换模式 */
 } wifi_manager_cmd_type_t;
 
 /** 命令载荷（经队列整体拷贝，带足额缓冲避免悬垂指针） */
@@ -141,6 +144,7 @@ typedef struct {
     wifi_manager_cmd_type_t type;
     char ssid[WIFI_MANAGER_SSID_MAX_LEN + 1]; /**< 热点名（含结尾 0） */
     char pass[WIFI_MANAGER_PASS_MAX_LEN];     /**< 密码（含结尾 0，空串=开放热点） */
+    uint8_t mode;                             /**< 目标模式（仅 SET_MODE 使用） */
 } wifi_manager_cmd_t;
 
 /* ============================================================
@@ -170,6 +174,10 @@ static bool s_have_creds = false;
 /** 配网热点名（"XT60-Meter-XXXX"） */
 static char s_ap_ssid[WIFI_MANAGER_AP_SSID_MAX_LEN];
 
+/** 工作模式偏好（v0.6.0）：内存快照，内部任务写、任意调用方读（经自旋锁）。
+ *  初值 AUTO 与"NVS 中还没有 mode 键"的语义一致（新设备/未设置过）。 */
+static wifi_manager_mode_t s_mode = WIFI_MANAGER_MODE_AUTO;
+
 /** STA 获取到的 IP 信息与有效标记 */
 static esp_netif_ip_info_t s_ip_info;
 static bool s_has_ip = false;
@@ -177,6 +185,11 @@ static bool s_has_ip = false;
 /** 扫描结果缓存（内部任务写、调用方读） */
 static wifi_ap_record_t s_scan_list[WIFI_MANAGER_SCAN_MAX_AP];
 static uint16_t s_scan_count = 0;
+
+/** 扫描进行中标记（v0.6.0）：配网 UI 轮询它来判断"扫完了没有"。
+ *  esp_wifi 没有公开的"是否在扫描"查询，故由本组件自己记账：
+ *  scan_start() 置位，SCAN_DONE 处理完清零。 */
+static volatile bool s_scan_busy = false;
 
 /** 扫描取数暂存区（仅内部任务使用；先取到暂存再拷进缓存，避免读者撕裂） */
 static wifi_ap_record_t s_scan_scratch[WIFI_MANAGER_SCAN_MAX_AP];
@@ -363,9 +376,64 @@ static esp_err_t nvs_erase_creds(void)
 }
 
 /* ============================================================
- * 内部小工具
+ * NVS 工作模式偏好读写（只允许在 start() 与内部任务上下文调用）
  * ============================================================ */
 
+/**
+ * @brief 从 NVS 读取工作模式偏好（v0.6.0）
+ *
+ * 键不存在（新设备 / 恢复出厂后）返回 ESP_ERR_NVS_NOT_FOUND，
+ * 调用方按 WIFI_MANAGER_MODE_AUTO 处理即可。
+ *
+ * @param out 输出模式，不可为 NULL
+ * @return ESP_OK 读到；ESP_ERR_NVS_NOT_FOUND 尚未设置过；其他值读取失败
+ */
+static esp_err_t nvs_load_mode(wifi_manager_mode_t *out)
+{
+    nvs_handle_t handle;
+    esp_err_t err = nvs_open(WIFI_MANAGER_NVS_NAMESPACE, NVS_READONLY, &handle);
+    if (err != ESP_OK) {
+        return err;
+    }
+    uint8_t v = (uint8_t)WIFI_MANAGER_MODE_AUTO;
+    err = nvs_get_u8(handle, WIFI_MANAGER_NVS_KEY_MODE, &v);
+    if (err == ESP_OK && v > (uint8_t)WIFI_MANAGER_MODE_AP) {
+        /* 越界值（旧固件写入/数据损坏）：按自动模式处理，不信任脏数据 */
+        ESP_LOGW(TAG, "NVS 中的 WiFi 模式值异常(%u)，按自动模式处理", (unsigned)v);
+        v = (uint8_t)WIFI_MANAGER_MODE_AUTO;
+        err = ESP_ERR_NVS_NOT_FOUND;
+    }
+    nvs_close(handle);
+    if (err == ESP_OK) {
+        *out = (wifi_manager_mode_t)v;
+    }
+    return err;
+}
+
+/**
+ * @brief 把工作模式偏好写入 NVS（仅内部任务调用）
+ *
+ * @param mode 目标模式
+ * @return ESP_OK 写入成功；其他值 NVS 错误（此时只影响掉电保持，当前运行不受影响）
+ */
+static esp_err_t nvs_save_mode(wifi_manager_mode_t mode)
+{
+    nvs_handle_t handle;
+    esp_err_t err = nvs_open(WIFI_MANAGER_NVS_NAMESPACE, NVS_READWRITE, &handle);
+    if (err != ESP_OK) {
+        return err;
+    }
+    err = nvs_set_u8(handle, WIFI_MANAGER_NVS_KEY_MODE, (uint8_t)mode);
+    if (err == ESP_OK) {
+        err = nvs_commit(handle); /* 缺 nvs_commit 等于没写（只改了 RAM 缓冲） */
+    }
+    nvs_close(handle);
+    return err;
+}
+
+/* ============================================================
+ * 内部小工具
+ * ============================================================ */
 /**
  * @brief 迁移状态（内部任务调用；经自旋锁保证读方一致）
  */
@@ -671,6 +739,7 @@ static void handle_scan_done(void)
 {
     uint16_t count = WIFI_MANAGER_SCAN_MAX_AP;
     esp_err_t err = esp_wifi_scan_get_ap_records(&count, s_scan_scratch);
+    s_scan_busy = false; /* 无论取数成功与否，扫描都结束了（UI 轮询据此收尾） */
     if (err != ESP_OK) {
         ESP_LOGW(TAG, "读取扫描结果失败: %s", esp_err_to_name(err));
         return;
@@ -685,6 +754,60 @@ static void handle_scan_done(void)
     portEXIT_CRITICAL(&s_lock);
 
     ESP_LOGI(TAG, "扫描完成，共 %u 个热点", (unsigned)count);
+}
+
+/**
+ * @brief 切到 STA 模式并用给定凭据发起连接（handle_cmd_connect / handle_cmd_set_mode 共用）
+ *
+ * 只做"切模式 + 下发 STA 配置 + 发起连接"，不含 NVS 写入与凭据缓存
+ * （那两件事由各自的调用方负责，避免职责重叠）。
+ *
+ * @param ssid 热点名（调用方已保证非空且长度合法）
+ * @param pass 密码（空串 = 开放热点）
+ * @return ESP_OK 已发起连接（能否连上由状态机后续推进）；其他值 esp_wifi 错误码
+ */
+static esp_err_t start_sta_connect(const char *ssid, const char *pass)
+{
+    /* 若已有 STA 活动（已连接/连接中），先断开再连新热点。
+     * esp_wifi_connect() 在已连接状态下会失败，必须先断。
+     * 这次主动断开产生的 DISCONNECTED 事件用 s_ignore_disconnect 吞掉，
+     * 免得被重试逻辑误当成"连接失败"多计一次数。 */
+    wifi_manager_state_t state = get_state_raw();
+    if (state == WIFI_MANAGER_STATE_CONNECTED || state == WIFI_MANAGER_STATE_CONNECTING) {
+        if (esp_wifi_disconnect() == ESP_OK) {
+            s_ignore_disconnect++;
+        }
+    }
+
+    wifi_config_t sta_cfg;
+    memset(&sta_cfg, 0, sizeof(sta_cfg));
+    memcpy(sta_cfg.sta.ssid, ssid, strlen(ssid));
+    memcpy(sta_cfg.sta.password, pass, strlen(pass));
+
+    esp_err_t err = esp_wifi_set_mode(WIFI_MODE_STA);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "切换 STA 模式失败: %s", esp_err_to_name(err));
+        return err;
+    }
+    err = esp_wifi_set_config(WIFI_IF_STA, &sta_cfg);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "设置 STA 配置失败: %s", esp_err_to_name(err));
+        return err;
+    }
+
+    /* 发起连接（新一轮，重试计数清零） */
+    s_retry_count = 0;
+    s_retry_pending = false;
+    set_state(WIFI_MANAGER_STATE_CONNECTING);
+
+    if (s_sta_started) {
+        s_connect_pending = false;
+        issue_connect("命令下发");
+    } else {
+        /* STA 接口尚未启动（极端时序）：挂起，等 STA_START 补发 */
+        s_connect_pending = true;
+    }
+    return ESP_OK;
 }
 
 /**
@@ -708,50 +831,99 @@ static esp_err_t handle_cmd_connect(const wifi_manager_cmd_t *cmd)
 
     cache_creds(cmd->ssid, cmd->pass);
 
-    /* 2. 若已有 STA 活动（已连接/连接中），先断开再连新热点。
-     *    esp_wifi_connect() 在已连接状态下会失败，必须先断。
-     *    这次主动断开产生的 DISCONNECTED 事件用 s_ignore_disconnect 吞掉，
-     *    免得被重试逻辑误当成“连接失败”多计一次数。 */
-    wifi_manager_state_t state = get_state_raw();
-    if (state == WIFI_MANAGER_STATE_CONNECTED || state == WIFI_MANAGER_STATE_CONNECTING) {
-        if (esp_wifi_disconnect() == ESP_OK) {
-            s_ignore_disconnect++;
-        }
-    }
-
-    wifi_config_t sta_cfg;
-    memset(&sta_cfg, 0, sizeof(sta_cfg));
-    memcpy(sta_cfg.sta.ssid, cmd->ssid, strlen(cmd->ssid));
-    memcpy(sta_cfg.sta.password, cmd->pass, strlen(cmd->pass));
-
-    esp_err_t err = esp_wifi_set_mode(WIFI_MODE_STA);
+    /* 2. 切 STA 并连接（NVS/缓存已就绪，余下动作与模式切换路径共用） */
+    esp_err_t err = start_sta_connect(cmd->ssid, cmd->pass);
     if (err != ESP_OK) {
-        ESP_LOGE(TAG, "切换 STA 模式失败: %s", esp_err_to_name(err));
         return err;
-    }
-    err = esp_wifi_set_config(WIFI_IF_STA, &sta_cfg);
-    if (err != ESP_OK) {
-        ESP_LOGE(TAG, "设置 STA 配置失败: %s", esp_err_to_name(err));
-        return err;
-    }
-
-    /* 3. 发起连接（新一轮，重试计数清零） */
-    s_retry_count = 0;
-    s_retry_pending = false;
-    set_state(WIFI_MANAGER_STATE_CONNECTING);
-
-    if (s_sta_started) {
-        s_connect_pending = false;
-        issue_connect("命令下发");
-    } else {
-        /* STA 接口尚未启动（极端时序）：挂起，等 STA_START 补发 */
-        s_connect_pending = true;
     }
 
     ESP_LOGI(TAG, "已发起连接（SSID=%s）", cmd->ssid);
 
     /* 凭据写失败时把错误码带回给调用方，但连接动作已按要求发起 */
     return save_err;
+}
+
+/**
+ * @brief 命令处理：设置工作模式偏好（v0.6.0）
+ *
+ * 顺序：写 NVS（失败只降级）→ 更新内存快照 → 按目标模式落地。
+ * 落地动作与 start() 的"进入 STA 或 AP"分支同语义，但**不能复用** start()
+ * （它含 netif/驱动初始化，这里驱动已在运行）。
+ *
+ * @param mode_raw 目标模式（已由 set_mode 校验过范围，这里再兜一次底）
+ * @return ESP_OK 或 esp_wifi 错误码；NVS 写失败也返回 ESP_OK（仅掉电不保留）
+ */
+static esp_err_t handle_cmd_set_mode(uint8_t mode_raw)
+{
+    if (mode_raw > (uint8_t)WIFI_MANAGER_MODE_AP) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    const wifi_manager_mode_t mode = (wifi_manager_mode_t)mode_raw;
+
+    /* 1. 持久化偏好（失败不阻断本次切换，只影响掉电后的默认值） */
+    esp_err_t nvs_err = ESP_OK;
+    if (s_nvs_ok) {
+        nvs_err = nvs_save_mode(mode);
+        if (nvs_err != ESP_OK) {
+            ESP_LOGW(TAG, "模式偏好保存失败: %s（本次切换仍生效，掉电后回到旧模式）",
+                     esp_err_to_name(nvs_err));
+        }
+    }
+    portENTER_CRITICAL(&s_lock);
+    s_mode = mode;
+    portEXIT_CRITICAL(&s_lock);
+
+    /* 2. 取消一切挂起的连接动作：切模式＝重新决定"怎么工作" */
+    s_retry_count = 0;
+    s_retry_pending = false;
+    s_connect_pending = false;
+
+    /* 3. 取一份凭据快照（s_ssid/s_pass 受自旋锁保护，不能直接传出去用） */
+    char ssid[WIFI_MANAGER_SSID_MAX_LEN + 1] = {0};
+    char pass[WIFI_MANAGER_PASS_MAX_LEN] = {0};
+    bool have_creds = false;
+    portENTER_CRITICAL(&s_lock);
+    have_creds = s_have_creds;
+    if (have_creds) {
+        memcpy(ssid, s_ssid, sizeof(ssid));
+        memcpy(pass, s_pass, sizeof(pass));
+    }
+    portEXIT_CRITICAL(&s_lock);
+
+    /* 4. 落地 */
+    if (mode == WIFI_MANAGER_MODE_AP) {
+        /* 强制配网热点：先断开 STA（吞掉 DISCONNECTED），再进 AP 模式 */
+        wifi_manager_state_t st = get_state_raw();
+        if (st == WIFI_MANAGER_STATE_CONNECTED || st == WIFI_MANAGER_STATE_CONNECTING) {
+            if (esp_wifi_disconnect() == ESP_OK) {
+                s_ignore_disconnect++;
+            }
+        }
+        esp_err_t err = enter_ap_mode();
+        ESP_LOGI(TAG, "WiFi 模式 → 强制配网热点（%s）", err == ESP_OK ? "已切换" : "切换失败");
+        return err;
+    }
+
+    if (!have_creds) {
+        if (mode == WIFI_MANAGER_MODE_STA) {
+            /* 仅 STA 且无凭据：关掉配网热点，停在 FAILED 等配网下发。
+             * 此时设备不可通过热点访问，UI 会提示"请先配网"。 */
+            esp_err_t err = esp_wifi_set_mode(WIFI_MODE_STA);
+            set_state(WIFI_MANAGER_STATE_FAILED);
+            ESP_LOGW(TAG, "WiFi 模式 → 仅 STA，但尚无凭据：已关闭配网热点，等待配网下发");
+            return err;
+        }
+        /* AUTO 且无凭据：与既有行为一致，回到配网热点 */
+        esp_err_t err = enter_ap_mode();
+        ESP_LOGI(TAG, "WiFi 模式 → 自动（无凭据，进入配网热点）");
+        return err;
+    }
+
+    /* 有凭据的 STA / AUTO：直接连路由器 */
+    esp_err_t err = start_sta_connect(ssid, pass);
+    ESP_LOGI(TAG, "WiFi 模式 → %s（有凭据，发起连接 SSID=%s）",
+             (mode == WIFI_MANAGER_MODE_STA) ? "仅 STA" : "自动", ssid);
+    return err;
 }
 
 /**
@@ -781,7 +953,20 @@ static esp_err_t handle_cmd_forget(void)
         }
     }
 
-    /* 3. 回 AP 配网模式 */
+    /* 3. 按模式偏好决定"忘记之后去哪"（v0.6.0）：
+     *   · 自动 / 强制热点 → 回配网热点（旧行为）；
+     *   · 仅 STA          → 不起热点，停在 FAILED 等配网下发，
+     *                       否则会违背用户"只做 STA 客户端"的选择。 */
+    portENTER_CRITICAL(&s_lock);
+    wifi_manager_mode_t mode = s_mode;
+    portEXIT_CRITICAL(&s_lock);
+    if (mode == WIFI_MANAGER_MODE_STA) {
+        esp_err_t err = esp_wifi_set_mode(WIFI_MODE_STA);
+        set_state(WIFI_MANAGER_STATE_FAILED);
+        ESP_LOGW(TAG, "凭据已清除；模式偏好=仅 STA，保持 STA 等待重新配网");
+        return (err == ESP_OK) ? erase_err : err;
+    }
+
     esp_err_t err = enter_ap_mode();
     if (err != ESP_OK) {
         return err;
@@ -836,6 +1021,8 @@ static void wifi_manager_task(void *arg)
                 result = handle_cmd_connect(&cmd);
             } else if (cmd.type == WIFI_MANAGER_CMD_FORGET) {
                 result = handle_cmd_forget();
+            } else if (cmd.type == WIFI_MANAGER_CMD_SET_MODE) {
+                result = handle_cmd_set_mode(cmd.mode);
             } else {
                 result = ESP_ERR_INVALID_ARG;
             }
@@ -1094,12 +1281,34 @@ esp_err_t wifi_manager_start(void)
         return ESP_ERR_NO_MEM;
     }
 
-    /* ---- 7. 进入 STA 或 AP ----
+    /* ---- 7. 按「模式偏好 + 是否有凭据」进入 STA 或 AP（v0.6.0 扩展）----
+     * 决策表：
+     *   AUTO + 有凭据 → STA 连接（与旧行为一致）
+     *   AUTO + 无凭据 → 配网热点（与旧行为一致）
+     *   STA  + 有凭据 → STA 连接
+     *   STA  + 无凭据 → 只起 STA 接口（不起热点），等配网下发
+     *   AP            → 强制配网热点（即使有凭据也不连）
      * s_started 必须在 esp_wifi_start() 之前置位：
      * STA_START 事件会立刻到来，内部任务/命令通道要能工作。 */
     s_started = true;
 
-    if (have_creds) {
+    wifi_manager_mode_t mode = WIFI_MANAGER_MODE_AUTO;
+    if (s_nvs_ok) {
+        esp_err_t merr = nvs_load_mode(&mode);
+        if (merr != ESP_OK && merr != ESP_ERR_NVS_NOT_FOUND) {
+            ESP_LOGW(TAG, "读取模式偏好失败: %s，按自动模式处理", esp_err_to_name(merr));
+        }
+    }
+    portENTER_CRITICAL(&s_lock);
+    s_mode = mode;
+    portEXIT_CRITICAL(&s_lock);
+
+    /* want_ap：只有"强制 AP"或"自动且无凭据"才起配网热点；
+     * 仅 STA 模式无凭据时刻意不起热点（用户明确要求只做 STA 客户端）。 */
+    const bool want_ap =
+        (mode == WIFI_MANAGER_MODE_AP) || ((mode == WIFI_MANAGER_MODE_AUTO) && !have_creds);
+
+    if (!want_ap && have_creds) {
         cache_creds(ssid, pass);
 
         wifi_config_t sta_cfg;
@@ -1121,7 +1330,18 @@ esp_err_t wifi_manager_start(void)
         /* 等 STA_START 事件到来后由内部任务补发 esp_wifi_connect */
         s_connect_pending = true;
         set_state(WIFI_MANAGER_STATE_CONNECTING);
-        ESP_LOGI(TAG, "已找到凭据（SSID=%s），以 STA 模式开始连接", ssid);
+        ESP_LOGI(TAG, "已找到凭据（SSID=%s），以 STA 模式开始连接（模式偏好=%d）", ssid, (int)mode);
+    } else if (!want_ap) {
+        /* 仅 STA 且无凭据：起 STA 接口但无人可连，停在 FAILED 等配网下发 */
+        err = esp_wifi_set_mode(WIFI_MODE_STA);
+        if (err != ESP_OK) {
+            ESP_LOGE(TAG, "切换到仅 STA 模式失败: %s", esp_err_to_name(err));
+            stop_internal();
+            s_started = false;
+            return err;
+        }
+        set_state(WIFI_MANAGER_STATE_FAILED);
+        ESP_LOGW(TAG, "模式偏好=仅 STA，但尚无凭据：不启动配网热点，等待配网下发");
     } else {
         err = enter_ap_mode();
         if (err != ESP_OK) {
@@ -1332,8 +1552,20 @@ esp_err_t wifi_manager_scan_start(void)
     esp_err_t err = esp_wifi_scan_start(NULL, false);
     if (err != ESP_OK) {
         ESP_LOGW(TAG, "发起扫描失败: %s", esp_err_to_name(err));
+    } else {
+        s_scan_busy = true; /* 已发起：SCAN_DONE 到来前 UI 轮询会看到"扫描中" */
     }
     return err;
+}
+
+/**
+ * @brief 查询是否正在扫描（v0.6.0，供配网 UI 轮询）
+ *
+ * @return true=扫描进行中（结果尚未就绪）
+ */
+bool wifi_manager_scan_is_running(void)
+{
+    return s_scan_busy;
 }
 
 /**
@@ -1358,4 +1590,85 @@ esp_err_t wifi_manager_scan_get_ap_list(wifi_ap_record_t *out, uint16_t *inout_c
 
     *inout_count = copy;
     return (total > 0) ? ESP_OK : ESP_ERR_INVALID_STATE;
+}
+
+/**
+ * @brief 查询当前的 WiFi 工作模式偏好（v0.6.0）
+ */
+wifi_manager_mode_t wifi_manager_get_mode(void)
+{
+    wifi_manager_mode_t mode;
+    portENTER_CRITICAL(&s_lock);
+    mode = s_mode;
+    portEXIT_CRITICAL(&s_lock);
+    return mode;
+}
+
+/**
+ * @brief 设置 WiFi 工作模式偏好（v0.6.0，**非阻塞**）
+ *
+ * 本函数只做三件事：校验参数 → 更新内存快照 → 把命令排进队列（不等待结果）。
+ * 真正的"写 NVS + 切 esp_wifi 模式 + 重连/起热点"由内部任务异步执行
+ * （见 handle_cmd_set_mode）。之所以不等结果：调用方是设备 UI 的模式按钮
+ * 回调（LVGL 事件回调，运行在持有 LVGL 锁的 UI 主循环里），等待会让界面冻结。
+ */
+esp_err_t wifi_manager_set_mode(wifi_manager_mode_t mode)
+{
+    if (mode > WIFI_MANAGER_MODE_AP) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    if (!s_started) {
+        return ESP_ERR_INVALID_STATE;
+    }
+    if ((s_cmd_queue == NULL) || (s_evt == NULL)) {
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    /* 内存快照立刻更新：UI 的按钮高亮/状态行下一帧就能读到新值，
+     * 不必等内部任务落地（与"乐观更新"同思路，失败时下一次刷新会纠正）。 */
+    portENTER_CRITICAL(&s_lock);
+    s_mode = mode;
+    portEXIT_CRITICAL(&s_lock);
+
+    wifi_manager_cmd_t cmd;
+    memset(&cmd, 0, sizeof(cmd));
+    cmd.type = WIFI_MANAGER_CMD_SET_MODE;
+    cmd.mode = (uint8_t)mode;
+
+    /* xQueueSend 超时 0：队列满（极少见）就直接失败返回，绝不阻塞 UI */
+    if (xQueueSend(s_cmd_queue, &cmd, 0) != pdTRUE) {
+        ESP_LOGW(TAG, "命令队列已满，模式切换请求被丢弃（模式偏好仍已更新为 %d）", (int)mode);
+        return ESP_ERR_TIMEOUT;
+    }
+    xEventGroupSetBits(s_evt, WM_EVT_CMD);
+    return ESP_OK;
+}
+
+/**
+ * @brief 查询当前 STA 连接的路由器信号强度（v0.6.0）
+ *
+ * esp_wifi_sta_get_ap_info()：读取"当前关联的 AP"信息（含 rssi）。
+ * 未连接时会返回 ESP_ERR_WIFI_NOT_CONNECT，这里统一映射为
+ * ESP_ERR_INVALID_STATE，调用方据此显示"无信号"。
+ */
+esp_err_t wifi_manager_get_rssi(int8_t *out_rssi)
+{
+    if (out_rssi == NULL) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    if (!s_started) {
+        return ESP_ERR_INVALID_STATE;
+    }
+    if (get_state_raw() != WIFI_MANAGER_STATE_CONNECTED) {
+        return ESP_ERR_INVALID_STATE; /* 未连接路由器：无信号可报 */
+    }
+
+    wifi_ap_record_t info;
+    memset(&info, 0, sizeof(info));
+    esp_err_t err = esp_wifi_sta_get_ap_info(&info);
+    if (err != ESP_OK) {
+        return ESP_ERR_INVALID_STATE;
+    }
+    *out_rssi = info.rssi;
+    return ESP_OK;
 }

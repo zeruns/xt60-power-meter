@@ -46,6 +46,8 @@
 #include "screen_measure.h"
 #include "screen_settings.h"
 #include "screen_wave.h"
+/* wifi_manager：状态栏 WiFi 图标要显示真实连接状态与信号强度（v0.6.0 需求 4） */
+#include "wifi_manager.h"
 
 /* ---- 页码指示点几何（当前页为长条、其余为圆点）---- */
 #define DOT_SIZE 6   /**< 非当前页圆点边长（px，正方形） */
@@ -70,6 +72,22 @@ static lv_obj_t *s_dots[UI_PAGE_MAX];         /**< 状态栏页码指示点（�
 static lv_obj_t *s_topbar = NULL;
 static lv_obj_t *s_lbl_runtime; /**< 状态栏左侧"运行时间"label */
 static lv_obj_t *s_lbl_bat;     /**< 状态栏右侧"电池图标+百分比"label */
+
+/* ---- 状态栏 WiFi 信号条（v0.6.0 需求 4：图标随连接状态与信号强度变化） ----
+ * 用 4 个 lv_obj 小矩形自绘，而不是 LVGL 的 WiFi 符号字形：符号只有一个
+ * "有/无"形态，无法表达信号强弱，且新增字形还要动字体子集（缺字风险）。
+ * 高度由矮到高、底部对齐，点亮格数由 wifi_manager_rssi_level() 分档给出。 */
+#define WIFI_BAR_COUNT 4                        /**< 信号条格数 */
+#define WIFI_BAR_W 3                            /**< 单格宽度（px） */
+#define WIFI_BAR_GAP 2                          /**< 格间距（px） */
+static lv_obj_t *s_wifi_bars[WIFI_BAR_COUNT] = {0}; /**< 4 个信号条对象 */
+static const int s_wifi_bar_h[WIFI_BAR_COUNT] = { 4, 6, 9, 12 }; /**< 各格高度（矮→高） */
+
+/** 信号条配色：与状态栏电池同风格（健康=绿、配网=品牌蓝、无=灰） */
+#define WIFI_COLOR_ON   lv_color_hex(0x1E9E4F) /* 已连接（信号好/中） */
+#define WIFI_COLOR_WEAK lv_color_hex(0xE8A00C) /* 已连接但信号弱 */
+#define WIFI_COLOR_AP   lv_color_hex(0x0066CC) /* 配网热点模式 */
+#define WIFI_COLOR_OFF  BAT_COLOR_NONE         /* 未连接/未启动 */
 static ui_page_t s_current = UI_PAGE_MEASURE; /**< 当前页（scroll_event_cb 跟踪滚动实时更新） */
 
 /**
@@ -194,17 +212,75 @@ static void create_topbar(lv_obj_t *scr)
     lv_obj_set_flex_align(right, LV_FLEX_ALIGN_END, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
     lv_obj_set_style_pad_column(right, 6, 0);
 
-    /* WiFi/热点占位：wifi_manager 未接入，固定灰色，不伪造在线状态 */
-    lv_obj_t *wifi = lv_label_create(right);
-    lv_label_set_text(wifi, LV_SYMBOL_WIFI); /* LV_SYMBOL_WIFI：LVGL 内置 WiFi 图标字符 */
-    lv_obj_set_style_text_color(wifi, BAT_COLOR_NONE, 0);
+    /* WiFi 信号条（v0.6.0 需求 4）：4 格自绘小条，随连接状态/信号强度点亮。
+     * 放在 flex 横排的右侧组里，底部对齐（而右侧组是居中对齐）——故再套一层
+     * 固定尺寸容器，让条组在 22px 高的状态栏内垂直居中。 */
+    lv_obj_t *wifi = lv_obj_create(right);
+    lv_obj_remove_style_all(wifi);
+    lv_obj_set_size(wifi, WIFI_BAR_COUNT * WIFI_BAR_W + (WIFI_BAR_COUNT - 1) * WIFI_BAR_GAP, 12);
     lv_obj_set_clickable(wifi, false);
+    lv_obj_set_scrollable(wifi, false);
+    lv_obj_set_flex_flow(wifi, LV_FLEX_FLOW_ROW);
+    lv_obj_set_flex_align(wifi, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_END, LV_FLEX_ALIGN_CENTER);
+    lv_obj_set_style_pad_column(wifi, WIFI_BAR_GAP, 0);
+    for (int i = 0; i < WIFI_BAR_COUNT; i++) {
+        lv_obj_t *b = lv_obj_create(wifi);
+        lv_obj_remove_style_all(b);
+        lv_obj_set_size(b, WIFI_BAR_W, s_wifi_bar_h[i]);
+        lv_obj_set_style_bg_color(b, WIFI_COLOR_OFF, 0); /* 初始灰：未连接 */
+        lv_obj_set_style_bg_opa(b, LV_OPA_COVER, 0);
+        lv_obj_set_style_radius(b, 1, 0);
+        lv_obj_set_clickable(b, false);
+        s_wifi_bars[i] = b;
+    }
 
     s_lbl_bat = lv_label_create(right);
     lv_label_set_text(s_lbl_bat, LV_SYMBOL_BATTERY_FULL " --%"); /* 图标字符与文本可直接拼接 */
     lv_obj_set_style_text_font(s_lbl_bat, lvgl_port_get_font(LVGL_PORT_FONT_14), 0);
     lv_obj_set_style_text_color(s_lbl_bat, BAT_COLOR_NONE, 0);
     lv_obj_set_clickable(s_lbl_bat, false);
+}
+
+/**
+ * @brief 刷新状态栏 WiFi 信号条（v0.6.0 需求 4）
+ *
+ * 形态由 wifi_manager 的**实时状态**决定（不再是一个永远不变的灰图标）：
+ *   · 已连接   → 按 RSSI 点亮 1~4 格：3~4 格绿色，1~2 格黄色（弱信号警示）；
+ *   · 配网模式 → 4 格全蓝（表示"本机正在提供热点"，与"连上路由器"区分）；
+ *   · 连接中   → 1 格黄色（表示在尝试，不冒充已连接）；
+ *   · 其余（未启动 / 失败 / 无凭据） → 全灰。
+ *
+ * 只读 wifi_manager 的快照接口（非阻塞），可安全地在 5Hz 状态栏刷新里调用。
+ */
+static void refresh_wifi_bars(void)
+{
+    if (s_wifi_bars[0] == NULL) {
+        return; /* 状态栏尚未建立 */
+    }
+    const wifi_manager_state_t st = wifi_manager_get_state();
+    int lit = 0;
+    lv_color_t col = WIFI_COLOR_OFF;
+
+    if (st == WIFI_MANAGER_STATE_CONNECTED) {
+        int8_t rssi = 0;
+        if (wifi_manager_get_rssi(&rssi) == ESP_OK) {
+            lit = wifi_manager_rssi_level(rssi);
+            col = (lit <= 2) ? WIFI_COLOR_WEAK : WIFI_COLOR_ON;
+        } else {
+            lit = 1;
+            col = WIFI_COLOR_ON;
+        }
+    } else if (st == WIFI_MANAGER_STATE_AP_MODE) {
+        lit = WIFI_BAR_COUNT;
+        col = WIFI_COLOR_AP;
+    } else if (st == WIFI_MANAGER_STATE_CONNECTING) {
+        lit = 1;
+        col = WIFI_COLOR_WEAK;
+    }
+
+    for (int i = 0; i < WIFI_BAR_COUNT; i++) {
+        lv_obj_set_style_bg_color(s_wifi_bars[i], (i < lit) ? col : WIFI_COLOR_OFF, 0);
+    }
 }
 
 /**
@@ -244,6 +320,9 @@ static void refresh_status(const data_store_snapshot_t *snap)
     }
     lv_label_set_text(s_lbl_bat, bat);
     lv_obj_set_style_text_color(s_lbl_bat, col, 0); /* 电量颜色随百分比变（绿/黄/红） */
+
+    /* v0.6.0：WiFi 信号条与电量同一节拍刷新（5Hz），状态变化即时可见 */
+    refresh_wifi_bars();
 }
 
 /**

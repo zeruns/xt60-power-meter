@@ -96,3 +96,82 @@ esp_err_t settings_set_wave_smooth(uint8_t on)
     s_cache.wave_smooth = on ? 1u : 0u;
     return ESP_OK;
 }
+
+/* ============================================================
+ * 以下为 v0.5.0 / v0.6.0 补齐的接口
+ * （模拟器此前与真机 API 脱节，链接时报"无法解析的外部符号"，
+ *  这里一次性补齐，恢复"模拟 = 真机"的回归闭环）
+ * ============================================================ */
+
+/** 告警阈值的模拟缓存（与真机一样是"内存 + 防抖落盘"） */
+static settings_alarm_t s_alarm = {
+    .v_en = 1u,
+    .i_en = 0u,
+    .p_en = 0u,
+    .v_limit = 15.0f,
+    .i_limit = 5.0f,
+    .p_limit = 50.0f,
+};
+
+esp_err_t settings_get_alarm(settings_alarm_t *out)
+{
+    if (out == NULL) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    if (!s_ready) {
+        return ESP_ERR_INVALID_STATE;
+    }
+    *out = s_alarm;
+    return ESP_OK;
+}
+
+esp_err_t settings_set_alarm(const settings_alarm_t *in)
+{
+    if (in == NULL) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    if (!s_ready) {
+        return ESP_ERR_INVALID_STATE;
+    }
+    /* 与真机同样的校验口径：阈值必须是有限正数，否则整体拒绝 */
+    if (!(in->v_limit > 0.0f) || !(in->i_limit > 0.0f) || !(in->p_limit > 0.0f)) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    s_alarm = *in;
+    ESP_LOGI(TAG, "告警阈值 → V %.2f(%u) / I %.2f(%u) / P %.2f(%u)（模拟落盘）",
+             (double)s_alarm.v_limit, (unsigned)s_alarm.v_en, (double)s_alarm.i_limit,
+             (unsigned)s_alarm.i_en, (double)s_alarm.p_limit, (unsigned)s_alarm.p_en);
+    return ESP_OK;
+}
+
+esp_err_t settings_set_wave_window(uint8_t window)
+{
+    ESP_LOGI(TAG, "波形时间窗 → %u（模拟落盘）", (unsigned)window);
+    return ESP_OK;
+}
+
+esp_err_t settings_set_wave_mode(uint8_t mode)
+{
+    ESP_LOGI(TAG, "波形显示模式 → %u（模拟落盘）", (unsigned)mode);
+    return ESP_OK;
+}
+
+esp_err_t settings_set_screen_off(uint8_t level)
+{
+    ESP_LOGI(TAG, "自动息屏档位 → %u（模拟落盘）", (unsigned)level);
+    return ESP_OK;
+}
+
+esp_err_t settings_restore_factory(void)
+{
+    ESP_LOGI(TAG, "恢复出厂设置（模拟：只打日志，不改内存缓存）");
+    return ESP_OK;
+}
+
+esp_err_t settings_request_save(void)
+{
+    /* v0.6.0：真机是"置脏 + 唤醒后台落盘任务"；模拟器没有后台任务，
+     * 直接打日志表示"已请求落盘"，语义对 UI 而言等价。 */
+    ESP_LOGI(TAG, "请求落盘（模拟，非阻塞）");
+    return ESP_OK;
+}

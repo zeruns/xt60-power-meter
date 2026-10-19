@@ -73,11 +73,35 @@ esp_err_t power_measure_init(void);
 esp_err_t power_measure_start(void);
 
 /**
- * @brief 更新标定参数（立即生效，并持久化到 NVS）
+ * @brief 更新标定参数（立即生效，并**同步**持久化到 NVS）
+ *
+ * ⚠ 本函数会在**调用者上下文**里执行 NVS 写入（可达数百 ms）。
+ * 若调用方是持有 LVGL 锁的 UI 事件回调，请改用
+ * power_measure_set_calibration_deferred()，否则整屏渲染会被冻结。
+ *
  * @param calib 新标定参数，不可为 NULL
  * @return ESP_OK 成功；ESP_ERR_INVALID_ARG 参数非法
  */
 esp_err_t power_measure_set_calibration(const power_measure_calib_t *calib);
+
+/**
+ * @brief 更新标定参数（立即生效，落盘**异步**执行，v0.6.0 新增）
+ *
+ * 与 power_measure_set_calibration() 的唯一区别是"谁来写 Flash"：
+ *   · 本函数只持锁改内存中的标定值，然后置"待落盘"原子标志并立即返回；
+ *   · 真正的 NVS 写入由 task_aux（Core0 辅助任务）在下一个周期完成——
+ *     它既有"每 30s 周期落盘"，也有"s_persist_dirty 置位即落盘"的通道
+ *     （落盘失败会重新置位重试，掉电最多丢数秒标定）。
+ *
+ * 用途：校准页的"应用校准"按钮回调运行在 LVGL 事件回调里（UI 主循环整轮
+ * 持有 LVGL 锁），NVS 写入若同步做会让界面冻结数百 ms，甚至与 task_aux 的
+ * 周期落盘争 s_save_mutex 而叠加成秒级卡顿（2026-10 实机观察到的卡死现象）。
+ *
+ * @param calib 新标定参数，不可为 NULL
+ * @return ESP_OK 已受理（内存已生效，落盘稍后完成）
+ *         ESP_ERR_INVALID_ARG 参数非法
+ */
+esp_err_t power_measure_set_calibration_deferred(const power_measure_calib_t *calib);
 
 /**
  * @brief 读取当前标定参数

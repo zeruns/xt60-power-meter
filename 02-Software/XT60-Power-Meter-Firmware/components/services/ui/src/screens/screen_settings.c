@@ -87,9 +87,16 @@
 #include <string.h>
 
 #include "esp_app_desc.h"
+#include "esp_log.h" /* ESP_LOGD：二级页进出日志（卡死定位用，默认 DEBUG 级不输出） */
 #include "esp_timer.h"
 #include "lvgl.h"
 #include "lvgl_port.h"
+
+/* FreeRTOS：忘记网络的一次性任务需要创建/自删任务（见 wifi_forget_task）。
+ * xTaskCreatePinnedToCore / vTaskDelete 由 task.h 提供；
+ * FreeRTOS.h 必须先包含（task.h 依赖它的类型定义）。 */
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
 
 #include "button.h"
 #include "buzzer.h"
@@ -102,6 +109,9 @@
 /* ui_nav：取当前页码（ui_nav_current_page）——设置首页的网格焦点模式需要
  * 知道"用户此刻真的在设置页"，否则按键接管会波及测量/波形页的翻页键位 */
 #include "ui_nav.h"
+
+/** ESP_LOG 日志标签（过滤本模块日志用，如 `idf.py monitor` 里按 set_ui 过滤） */
+static const char *TAG = "set_ui";
 
 /* ---- 色板（与测量页/波形页同一语义色） ----
  * lv_color_hex(0xRRGGBB)：把网页风格的十六进制色值转换成 LVGL 内部的
@@ -158,6 +168,8 @@ static lv_obj_t *s_msgbox_scrim = NULL; /**< 当前对话框的压暗遮罩（�
 static lv_obj_t *s_active_msgbox = NULL; /**< 当前打开的对话框（NULL=无；按键路由据此判模态） */
 
 static void close_active_msgbox(void);   /* 前向声明（定义见下方；弹新框前关旧框，防叠窗） */
+static void passkey_close(void);         /* 前向声明：WiFi 密码浮层（v0.6.0），见下方 WiFi 一节 */
+static void numkey_close(void);          /* 前向声明：数字键盘浮层（v0.6.0），见下方告警一节 */
 
 static data_store_snapshot_t s_last_snap; /**< 最近快照（校准向导/电能统计使用） */
 
@@ -169,6 +181,31 @@ static lv_obj_t *s_bright_value_label = NULL; /**< 显示设置：亮度数值 *
 static lv_obj_t *s_vol_value_label = NULL;    /**< 蜂鸣器：响度数值 */
 static lv_obj_t *s_wifi_state_label = NULL;   /**< WiFi 页：状态行（5Hz 刷新，F7） */
 static lv_obj_t *s_wifi_hint_label = NULL;    /**< WiFi 页：配网提示行（随状态切换） */
+
+/* ---- WiFi 页 v0.6.0 改版的状态（放在此处而非 WiFi 一节：subpage_close
+ *      需要清理它们，而 subpage_close 定义在文件靠前的位置） ---- */
+
+/** 三档模式按钮（下标 = wifi_manager_mode_t：0=自动 1=仅 STA 2=热点） */
+static lv_obj_t *s_wifi_mode_btns[3] = {0};
+static lv_obj_t *s_wifi_list = NULL;      /**< 扫描结果列表容器（行动态创建） */
+static lv_obj_t *s_wifi_scan_btn = NULL;  /**< "搜索 Wi-Fi"按钮（扫描中置灰） */
+static lv_timer_t *s_wifi_scan_timer = NULL; /**< 扫描轮询定时器（300ms 一次） */
+
+/** 最近一次扫描结果的一份拷贝（仅 UI 任务访问）：点击某一行时取它的 SSID */
+#define WIFI_UI_LIST_MAX 12 /**< 列表最多渲染几个热点（对象数量与可滚长度的折中） */
+static wifi_ap_record_t s_wifi_ap_copy[WIFI_UI_LIST_MAX];
+static uint16_t s_wifi_ap_copy_n = 0;
+
+/** 密码输入浮层（全屏浮层 + LVGL 文字键盘；触屏输入） */
+static lv_obj_t *s_passkey_page = NULL; /**< 浮层根对象；NULL=未打开 */
+static lv_obj_t *s_passkey_ta = NULL;   /**< 浮层内的密码输入框 */
+static char s_passkey_ssid[WIFI_MANAGER_SSID_MAX_LEN + 1]; /**< 待连接的 SSID */
+
+/** 一次性的"连接路由器"任务与结果传递（与"忘记网络"同款异步模式） */
+static bool s_wifi_conn_running = false;      /**< 已有一次连接在跑（防重复提交） */
+static esp_err_t s_wifi_conn_result = ESP_OK; /**< wifi_manager_connect 的返回值 */
+static char s_conn_ssid[WIFI_MANAGER_SSID_MAX_LEN + 1];
+static char s_conn_pass[WIFI_MANAGER_PASS_MAX_LEN];
 static lv_obj_t *s_alarm_value_labels[3] = { 0 }; /**< 告警设置：三阈值数值标签（V/A/W） */
 
 /** 告警设置页：当前编辑中的配置（改完即 settings_set_alarm，防抖落盘） */
@@ -794,6 +831,8 @@ static void focus_activate(void)
  */
 static void subpage_close(void)
 {
+    /* 【v0.6.0 卡死定位】离页日志（与 subpage_open 的"进入"日志成对） */
+    ESP_LOGD(TAG, "离开二级页：%s", screen_settings_current_subpage_name());
     /* 自动关页定时器：页都关了必须删掉，否则 1.4s 后回调会去关一个
      * 不存在（或已被新页面占用）的浮层（任务 2 的根因之一）。 */
     if (s_close_timer != NULL) {
@@ -806,14 +845,31 @@ static void subpage_close(void)
         lv_timer_delete(s_zero_timer);
         s_zero_timer = NULL;
     }
+    /* 【v0.6.0】WiFi 页的扫描轮询定时器与密码浮层同样必须随页失效：
+     * 定时器若留着，会在页面关闭后继续轮询并往已删除的列表里写对象。 */
+    if (s_wifi_scan_timer != NULL) {
+        lv_timer_delete(s_wifi_scan_timer);
+        s_wifi_scan_timer = NULL;
+    }
+    passkey_close();
+    numkey_close(); /* v0.6.0：数字键盘浮层也随页失效（否则会浮在已关闭的页面上） */
+    s_wifi_list = NULL;
+    s_wifi_scan_btn = NULL;
+    memset(s_wifi_mode_btns, 0, sizeof(s_wifi_mode_btns));
+    s_wifi_ap_copy_n = 0;
     if (s_subpage != NULL) {
         /* lv_obj_delete()：删除对象并连带删除其所有子对象（标题栏/内容区在内） */
         lv_obj_delete(s_subpage);
     }
-    /* 告警设置页：离开时立即落盘（settings_set_alarm 是防抖落盘，
-     * 这里补一次 settings_save_now 保证退出即写入，掉电不丢）。 */
+    /* 告警设置页：离开时请求立即落盘（settings_set_alarm 本身是防抖落盘，
+     * 这里补一次"尽快写"以保证退出即写入、掉电不丢）。
+     * 【v0.6.0 卡死修复】改用**非阻塞**的 settings_request_save()：
+     * 本函数会被 subpage_open() 在每次开页前调用，且运行在持有 LVGL 锁的
+     * UI 主循环里；原先的 settings_save_now() 会在锁内直接 nvs_commit
+     * （数百 ms），期间整屏冻结（指示灯仍闪）。request 版本只置标志并唤醒
+     * 后台落盘任务，写完即返回。 */
     if (s_sub_kind == SUB_ALARM) {
-        (void)settings_save_now();
+        (void)settings_request_save();
     }
     s_subpage = NULL;
     s_sub_content = NULL;
@@ -865,6 +921,10 @@ static lv_obj_t *subpage_open(sub_kind_t kind, const char *title)
 
     s_subpage = lv_obj_create(s_tile);
     lv_obj_remove_style_all(s_subpage);
+    /* 【v0.6.0 卡死定位】二级页进出日志：默认 DEBUG 级不输出，
+     * 排查 UI 冻结时用 esp_log_level_set("set_ui", ESP_LOG_DEBUG) 打开，
+     * 即可在串口看到"卡死前最后停在哪个子页"（配合 app_tasks 的渲染停滞告警）。 */
+    ESP_LOGD(TAG, "进入二级页：%s", title);
     lv_obj_set_size(s_subpage, LV_PCT(100), LV_PCT(100));
     lv_obj_set_pos(s_subpage, 0, 0);
     lv_obj_set_style_bg_color(s_subpage, lv_color_white(), 0);
@@ -1121,9 +1181,17 @@ static void calib_apply_cb(lv_event_t *e)
     } else {
         cal.current_gain *= ratio;
     }
-    if (power_measure_set_calibration(&cal) != ESP_OK) {
-        /* 写入失败多半是 NVS 异常，提示重试而不是静默吞掉 */
-        show_notice("校准失败", "参数保存失败，请重试。");
+    /* 【v0.6.0 卡死修复】必须用 **deferred** 版本：本回调是 LVGL 事件回调，
+     * 运行在 UI 主循环里且此时**整轮持有 LVGL 锁**（见 ui.c 主循环）。
+     * 同步版本会在锁内直接写 NVS（nvs_commit 可达数百 ms，还会与 task_aux
+     * 的周期落盘争 s_save_mutex 叠加），期间 LVGL 渲染任务拿不到锁 →
+     * 整屏冻结，而指示灯由独立 esp_timer 驱动照常闪烁 —— 这正是用户上报的
+     * "进校准页后 UI 卡死、指示灯正常"。deferred 版本只改内存并置待落盘标志，
+     * 真正的 Flash 写入由 task_aux 稍后异步完成。 */
+    if (power_measure_set_calibration_deferred(&cal) != ESP_OK) {
+        /* deferred 版本只在参数非法（增益 ≤0）时失败——校准流程已保证比值
+         * 在 [0.5,2]，走到这里说明内存中的标定值已异常，提示用户重试 */
+        show_notice("校准失败", "参数非法，请重试。");
         buzzer_play(BUZZER_TONE_ERROR);
         return;
     }
@@ -1196,7 +1264,13 @@ static void zero_sample_timer_cb(lv_timer_t *t)
     power_measure_calib_t cal;
     power_measure_get_calibration(&cal);
     cal.current_offset -= avg;
-    if (power_measure_set_calibration(&cal) != ESP_OK) {
+    /* 【v0.6.0 卡死修复】必须用 deferred 版本：本回调是 **LVGL 定时器回调**，
+     * 运行在持有 LVGL 锁的 UI 主循环里。同步版 power_measure_set_calibration()
+     * 会在锁内直接写 NVS（nvs_commit 可达数百 ms，还会与 task_aux 的周期落盘
+     * 抢同一把 s_save_mutex 而叠加成秒级等待），期间 LVGL 渲染任务拿不到锁 →
+     * 整屏冻结，而指示灯由独立 esp_timer 驱动照常闪烁。deferred 版只改内存
+     * 标定值并置"待落盘"原子标志，真正的 Flash 写入交给 task_aux 异步完成。 */
+    if (power_measure_set_calibration_deferred(&cal) != ESP_OK) {
         show_notice("清零失败", "参数保存失败，请重试。");
         return;
     }
@@ -1354,10 +1428,12 @@ static void angle_clicked_cb(lv_event_t *e)
         return;
     }
     orientation_set_auto(false); /* 手动选角度 = 退出自动旋转模式 */
-    /* settings_set_orientation(自动标志, 角度)：经 settings 封装写 NVS（Flash），
-     * settings_save_now() 立即落盘（防突然断电丢失） */
+    /* settings_set_orientation(自动标志, 角度)：经 settings 封装只改内存缓存并标脏；
+     * 【v0.6.0 卡死修复】改用非阻塞的 settings_request_save()：本回调在 LVGL 锁内
+     * 运行，原先的 settings_save_now() 会当场 nvs_commit（数百 ms）冻结整屏。
+     * request 版只置脏标志并唤醒后台落盘任务，1.5s 内异步写完（掉电窗口极小）。 */
     (void)settings_set_orientation(0, deg);
-    (void)settings_save_now();
+    (void)settings_request_save();
     if (s_auto_switch != NULL && lv_obj_has_state(s_auto_switch, LV_STATE_CHECKED)) {
         /* lv_obj_remove_state：撤销开关的"选中"状态（UI 与逻辑保持一致） */
         lv_obj_remove_state(s_auto_switch, LV_STATE_CHECKED);
@@ -1387,7 +1463,8 @@ static void auto_switch_cb(lv_event_t *e)
         /* 关自动：把当前角度固化为手动角度 */
         (void)settings_set_orientation(0, lvgl_port_get_rotation_angle());
     }
-    (void)settings_save_now(); /* 立即写 NVS，防断电丢失 */
+    /* 【v0.6.0 卡死修复】非阻塞落盘：见上面 angle_clicked_cb 的说明 */
+    (void)settings_request_save();
     (void)buzzer_play(BUZZER_TONE_CLICK);
 }
 
@@ -1417,8 +1494,10 @@ static void bright_slider_cb(lv_event_t *e)
         lv_label_set_text(s_bright_value_label, buf);
     }
     if (lv_event_get_code(e) == LV_EVENT_RELEASED) {
-        /* 用户松手即落盘，避免马上关机导致设置丢失 */
-        (void)settings_save_now();
+        /* 用户松手即请求落盘（非阻塞，避免马上关机导致设置丢失）。
+         * 【v0.6.0 卡死修复】不能用 settings_save_now()：松手事件在 LVGL 锁内派发，
+         * 同步 nvs_commit 会冻结整屏数百 ms。 */
+        (void)settings_request_save();
     }
 }
 
@@ -1443,7 +1522,7 @@ static void screen_off_cycle_cb(lv_event_t *e)
     }
     level = (uint8_t)((level + 1u) % 4u); /* 取模循环：永不→30→60→120→永不 */
     (void)settings_set_screen_off(level);
-    (void)settings_save_now(); /* 离散档位选择，立即落盘（防断电丢失） */
+    (void)settings_request_save(); /* 【v0.6.0】非阻塞落盘，防在 LVGL 锁内冻屏 */
     lv_obj_t *lbl = lv_obj_get_child(btn, 0); /* 按钮内第 0 个子对象 = 文字标签 */
     if (lbl != NULL) {
         char buf[32];
@@ -1592,7 +1671,7 @@ static void volume_slider_cb(lv_event_t *e)
         lv_label_set_text(s_vol_value_label, buf);
     }
     if (lv_event_get_code(e) == LV_EVENT_RELEASED) {
-        (void)settings_save_now();
+        (void)settings_request_save(); /* 【v0.6.0】非阻塞落盘（原 settings_save_now 会冻屏） */
     }
 }
 
@@ -1670,6 +1749,417 @@ static const char *const s_wifi_state_names[5] = {
     "未启动", "连接中", "已连接", "配网模式", "连接失败",
 };
 
+/* ---- v0.6.0 改版新增：模式切换 / 扫描列表 / 键盘配网 ---- */
+
+/** 前向声明（本区内互相引用） */
+static void wifi_update_status(void);
+static void passkey_open(const char *ssid);
+static void passkey_show_result(void);
+static void passkey_submit(void);
+
+/**
+ * @brief 在父对象里画一组"4 格信号强度条"（按 RSSI 点亮）
+ *
+ * 用 4 个 lv_obj 小矩形而不是字符符号：完全不依赖字体子集，
+ * 从根上规避"缺字方框"问题（本项目历史教训）。列表行与状态栏共用同一分档
+ * （wifi_manager_rssi_level），保证两处显示一致。
+ *
+ * @param parent   父对象
+ * @param rssi     信号强度（dBm）
+ * @param on_color 点亮格的颜色
+ */
+static void wifi_sig_bars(lv_obj_t *parent, int8_t rssi, lv_color_t on_color)
+{
+    lv_obj_t *grp = plain_container(parent);
+    lv_obj_set_size(grp, 26, 14);
+    lv_obj_set_flex_flow(grp, LV_FLEX_FLOW_ROW);
+    lv_obj_set_flex_align(grp, LV_FLEX_ALIGN_END, LV_FLEX_ALIGN_END, LV_FLEX_ALIGN_CENTER);
+    lv_obj_set_style_pad_column(grp, 2, 0);
+
+    const int lvl = wifi_manager_rssi_level(rssi);
+    static const int bar_h[4] = { 5, 8, 11, 14 }; /* 由矮到高，视觉上像信号条 */
+    for (int i = 0; i < 4; i++) {
+        lv_obj_t *b = lv_obj_create(grp);
+        lv_obj_remove_style_all(b);
+        lv_obj_set_size(b, 4, bar_h[i]);
+        lv_obj_set_style_bg_color(b, (i < lvl) ? on_color : COL_BORDER, 0);
+        lv_obj_set_style_bg_opa(b, LV_OPA_COVER, 0);
+        lv_obj_set_style_radius(b, 1, 0);
+        lv_obj_set_clickable(b, false); /* 纯显示，不拦截触摸 */
+    }
+}
+
+/* ---- 模式三档按钮 ---- */
+
+/** 刷新三档模式按钮的高亮（当前模式 = 品牌蓝底白字，其余白底灰字） */
+static void wifi_mode_btns_refresh(void)
+{
+    const int cur = (int)wifi_manager_get_mode();
+    for (int i = 0; i < 3; i++) {
+        lv_obj_t *b = s_wifi_mode_btns[i];
+        if (b == NULL) {
+            continue;
+        }
+        lv_obj_t *lbl = lv_obj_get_child(b, 0);
+        const bool on = (i == cur);
+        lv_obj_set_style_bg_color(b, on ? COL_PRIMARY : lv_color_white(), 0);
+        lv_obj_set_style_border_color(b, on ? COL_PRIMARY : COL_BORDER, 0);
+        if (lbl != NULL) {
+            lv_obj_set_style_text_color(lbl, on ? lv_color_white() : COL_INK, 0);
+        }
+    }
+}
+
+/**
+ * @brief 模式按钮点击 → 请求切换工作模式（v0.6.0）
+ *
+ * wifi_manager_set_mode() 是**非阻塞**的（写队列即返回），因此本回调
+ * 不会冻结界面；真正的 NVS 写与 esp_wifi 模式切换由 wifi_manager
+ * 内部任务完成，界面靠 5Hz 状态刷新自动跟上。
+ *
+ * @param e LVGL 点击事件；user_data 携带目标模式（wifi_manager_mode_t）
+ */
+static void wifi_mode_clicked_cb(lv_event_t *e)
+{
+    const int mode = (int)(intptr_t)lv_event_get_user_data(e);
+    if (mode < 0 || mode > (int)WIFI_MANAGER_MODE_AP) {
+        return;
+    }
+    if (wifi_manager_set_mode((wifi_manager_mode_t)mode) == ESP_OK) {
+        (void)buzzer_play(BUZZER_TONE_CLICK);
+    }
+    wifi_mode_btns_refresh(); /* 立即回显（乐观更新，状态刷新会再纠正一次） */
+    wifi_update_status();
+}
+
+/* ---- 扫描结果列表 ---- */
+
+/**
+ * @brief 点击某一行热点 → 打开密码输入浮层
+ *
+ * @param e LVGL 点击事件；user_data 携带该行在 s_wifi_ap_copy 里的下标
+ */
+static void wifi_ap_row_clicked_cb(lv_event_t *e)
+{
+    const int idx = (int)(intptr_t)lv_event_get_user_data(e);
+    if (idx < 0 || idx >= (int)s_wifi_ap_copy_n) {
+        return;
+    }
+    /* esp_wifi 的 ssid 字段是 uint8_t 数组但内容为 ASCII/UTF-8 文本 */
+    passkey_open((const char *)s_wifi_ap_copy[idx].ssid);
+}
+
+/**
+ * @brief 渲染扫描结果列表（扫描完成后调用一次）
+ *
+ * 取 wifi_manager 的扫描缓存（最多 WIFI_UI_LIST_MAX 条），按 RSSI 降序
+ * 排列后逐行创建。行高 32px：触屏目标达标，且 12 行可在内容区滚动查看。
+ * 每行都登记到焦点链，纯按键环境下也能用 K1/K2 选中并打开密码框。
+ */
+static void wifi_render_ap_list(void)
+{
+    if (s_wifi_list == NULL) {
+        return;
+    }
+    /* lv_obj_clean：删除容器的所有子对象（容器本身保留），用于重新渲染 */
+    lv_obj_clean(s_wifi_list);
+
+    uint16_t n = WIFI_UI_LIST_MAX;
+    if (wifi_manager_scan_get_ap_list(s_wifi_ap_copy, &n) != ESP_OK) {
+        n = 0; /* 没有结果（含扫描到 0 个热点） */
+    }
+    /* 按 RSSI 降序：简单的插入排序（n ≤ 12，开销可忽略） */
+    for (uint16_t i = 1; i < n; i++) {
+        wifi_ap_record_t key = s_wifi_ap_copy[i];
+        int j = (int)i - 1;
+        while (j >= 0 && s_wifi_ap_copy[j].rssi < key.rssi) {
+            s_wifi_ap_copy[j + 1] = s_wifi_ap_copy[j];
+            j--;
+        }
+        s_wifi_ap_copy[j + 1] = key;
+    }
+    s_wifi_ap_copy_n = n;
+
+    if (n == 0) {
+        lv_obj_t *none = plain_label(s_wifi_list, "未找到热点：请靠近路由器后重试。",
+                                     LVGL_PORT_FONT_12, COL_GRAY, false);
+        lv_obj_set_width(none, LV_PCT(100));
+        lv_obj_set_style_text_align(none, LV_TEXT_ALIGN_CENTER, 0);
+        return;
+    }
+
+    for (uint16_t i = 0; i < n; i++) {
+        lv_obj_t *row = lv_button_create(s_wifi_list);
+        lv_obj_set_size(row, LV_PCT(100), 32);
+        press_feedback_styles(row);
+        lv_obj_set_style_radius(row, 6, 0);
+        lv_obj_set_style_pad_hor(row, 8, 0);
+        lv_obj_set_flex_flow(row, LV_FLEX_FLOW_ROW);
+        lv_obj_set_flex_align(row, LV_FLEX_ALIGN_SPACE_BETWEEN, LV_FLEX_ALIGN_CENTER,
+                              LV_FLEX_ALIGN_CENTER);
+
+        /* 左：热点名（长名截断，右侧控件优先保证可见） */
+        lv_obj_t *nm = lv_label_create(row);
+        lv_label_set_text(nm, (const char *)s_wifi_ap_copy[i].ssid);
+        lv_obj_set_style_text_font(nm, lvgl_port_get_font(LVGL_PORT_FONT_14), 0);
+        lv_obj_set_style_text_color(nm, COL_INK, 0);
+        lv_label_set_long_mode(nm, LV_LABEL_LONG_CLIP);
+        lv_obj_set_flex_grow(nm, 1); /* 占满剩余宽度，把右侧组推到最右 */
+
+        /* 右：加密标记 + 信号条 */
+        lv_obj_t *rt = plain_container(row);
+        lv_obj_set_size(rt, LV_SIZE_CONTENT, 24);
+        lv_obj_set_flex_flow(rt, LV_FLEX_FLOW_ROW);
+        lv_obj_set_flex_align(rt, LV_FLEX_ALIGN_END, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+        lv_obj_set_style_pad_column(rt, 8, 0);
+        if (s_wifi_ap_copy[i].authmode != WIFI_AUTH_OPEN) {
+            /* 用文字"加密"而不是锁形符号：符号字形不在中文字体子集内，
+             * 用符号会出现缺字方框（本项目历史问题），文字则一定在子集里 */
+            plain_label(rt, "加密", LVGL_PORT_FONT_12, COL_GRAY, false);
+        }
+        wifi_sig_bars(rt, s_wifi_ap_copy[i].rssi, COL_OK);
+
+        lv_obj_add_event_cb(row, wifi_ap_row_clicked_cb, LV_EVENT_CLICKED,
+                            (void *)(intptr_t)i);
+        focus_add(row); /* 焦点链：逐行可选中（长按 K2 = 打开密码框） */
+    }
+}
+
+/**
+ * @brief 扫描轮询定时器：扫描结束即取结果、渲染列表、自删
+ *
+ * 用轮询而不是回调：wifi_manager 通过 wifi_manager_scan_is_running()
+ * 暴露"扫描中"标记，UI 每 300ms 问一次即可，避免再给 middleware 加通知机制。
+ *
+ * @param t 定时器（到点后自删）
+ */
+static void wifi_scan_timer_cb(lv_timer_t *t)
+{
+    if (wifi_manager_scan_is_running()) {
+        return; /* 还在扫，下一拍再问 */
+    }
+    /* 扫完了：删定时器、恢复按钮、渲染列表 */
+    lv_timer_delete(t);
+    s_wifi_scan_timer = NULL;
+    if (s_wifi_scan_btn != NULL) {
+        lv_obj_remove_state(s_wifi_scan_btn, LV_STATE_DISABLED); /* 恢复可点 */
+    }
+    wifi_render_ap_list();
+    if (s_wifi_hint_label != NULL) {
+        lv_label_set_text(s_wifi_hint_label, "点选热点后输入密码即可连接；"
+                                              "也可用手机连热点配网。");
+    }
+}
+
+/**
+ * @brief "搜索 Wi-Fi"按钮点击 → 发起扫描并开始轮询
+ *
+ * 注意 esp_wifi 的限制：STA 正在连接时不允许扫描（会返回 WIFI_STATE），
+ * 此时给出明确提示而不是静默失败。
+ *
+ * @param e LVGL 点击事件（未使用）
+ */
+static void wifi_scan_btn_clicked_cb(lv_event_t *e)
+{
+    (void)e;
+    if (s_wifi_scan_timer != NULL) {
+        return; /* 已在扫描中 */
+    }
+    esp_err_t err = wifi_manager_scan_start();
+    if (err != ESP_OK) {
+        /* 缓冲留足 160 字节：固定文案 + esp_err_to_name 的错误名（GCC 的
+         * -Wformat-truncation 会按最坏情况核算，缓冲太紧会直接编译失败） */
+        char msg[160];
+        snprintf(msg, sizeof(msg), "无法发起扫描：%s\n请稍后重试，或改用热点配网。",
+                 esp_err_to_name(err));
+        show_notice("扫描失败", msg);
+        return;
+    }
+    (void)buzzer_play(BUZZER_TONE_CLICK);
+    if (s_wifi_scan_btn != NULL) {
+        lv_obj_add_state(s_wifi_scan_btn, LV_STATE_DISABLED);
+    }
+    if (s_wifi_hint_label != NULL) {
+        lv_label_set_text(s_wifi_hint_label, "正在扫描附近热点…（约 3 秒）");
+    }
+    s_wifi_scan_timer = lv_timer_create(wifi_scan_timer_cb, 300, NULL);
+}
+
+/* ---- 密码输入浮层（全屏 + 文字键盘） ---- */
+
+/**
+ * @brief 关闭密码输入浮层（无则空操作）
+ */
+static void passkey_close(void)
+{
+    if (s_passkey_page != NULL) {
+        lv_obj_delete(s_passkey_page); /* 连带删除浮层内所有子对象（含键盘） */
+        s_passkey_page = NULL;
+    }
+    s_passkey_ta = NULL;
+}
+
+/**
+ * @brief "连接路由器"的一次性任务（**不在 LVGL 上下文**）
+ *
+ * wifi_manager_connect() 会等待其内部任务完成（最长数秒，含 NVS 写）。
+ * 若在 LVGL 回调里直接调用会冻结界面，因此与"忘记网络"同款处理：
+ * 本任务负责阻塞调用，完成后用 lv_async_call 排回 UI 弹结果。
+ *
+ * @param arg 未使用
+ */
+static void wifi_connect_task(void *arg)
+{
+    (void)arg;
+    s_wifi_conn_result = wifi_manager_connect(s_conn_ssid, s_conn_pass);
+    lv_async_call((lv_async_cb_t)passkey_show_result, NULL);
+    vTaskDelete(NULL);
+}
+
+/**
+ * @brief 连接结果收尾（**在 LVGL 上下文**执行）
+ *
+ * @param unused lv_async_call 的 user_data（未使用）
+ */
+static void passkey_show_result(void)
+{
+    s_wifi_conn_running = false;
+    wifi_update_status();
+    if (s_wifi_conn_result == ESP_OK) {
+        buzzer_play(BUZZER_TONE_OK);
+        show_notice("已提交连接",
+                    "凭据已保存并开始连接。\n连上路由器后设备热点会关闭，\n"
+                    "请用路由器分配的 IP 打开控制台。");
+    } else {
+        buzzer_play(BUZZER_TONE_ERROR);
+        char msg[96];
+        snprintf(msg, sizeof(msg), "连接请求失败：%s\n请检查密码或重试。",
+                 esp_err_to_name(s_wifi_conn_result));
+        show_notice("连接失败", msg);
+    }
+}
+
+/**
+ * @brief 密码框"连接"：取出输入内容并交给一次性任务
+ */
+static void passkey_submit(void)
+{
+    if ((s_passkey_ta == NULL) || s_wifi_conn_running) {
+        return;
+    }
+    const char *pw = lv_textarea_get_text(s_passkey_ta);
+    snprintf(s_conn_ssid, sizeof(s_conn_ssid), "%s", s_passkey_ssid);
+    snprintf(s_conn_pass, sizeof(s_conn_pass), "%s", (pw != NULL) ? pw : "");
+    passkey_close();
+    s_wifi_conn_running = true;
+    if (xTaskCreatePinnedToCore(wifi_connect_task, "wifi_conn", 3072, NULL, 4, NULL, 0) !=
+        pdPASS) {
+        s_wifi_conn_running = false;
+        show_notice("操作未完成", "系统资源不足，请重试。");
+        return;
+    }
+    if (s_wifi_hint_label != NULL) {
+        lv_label_set_text(s_wifi_hint_label, "正在提交连接…");
+    }
+}
+
+/** @brief 密码框"取消"按钮 / 返回键：直接关浮层 */
+static void passkey_cancel_cb(lv_event_t *e)
+{
+    (void)e;
+    passkey_close();
+}
+
+/** @brief "连接"按钮的 LVGL 事件薄封装（LVGL 回调签名带参数，业务函数不带） */
+static void passkey_submit_cb(lv_event_t *e)
+{
+    (void)e;
+    passkey_submit();
+}
+
+/**
+ * @brief 打开密码输入浮层（v0.6.0）
+ *
+ * 为什么是"浮层"而不是 lv_msgbox：文字键盘约 120px 高，塞进 250px 宽的
+ * 对话框会超出一屏高度；浮层挂在设置 tile 上（后创建者渲染在上层），
+ * 尺寸可控且不会与弹窗/遮罩机制互相干扰。
+ *
+ * 版式（284×240，顶部 22px 让开共享状态栏）：
+ *   标题（"连接 <SSID>"，16px 粗体）
+ *   密码输入框（单行、密码模式、34px）
+ *   lv_keyboard（TEXT_LOWER，116px）
+ *   [取消] [连接]（各 50%，32px）
+ *
+ * @param ssid 目标热点名（浮层标题显示它，连接时使用它）
+ */
+static void passkey_open(const char *ssid)
+{
+    passkey_close(); /* 防重复打开 */
+    snprintf(s_passkey_ssid, sizeof(s_passkey_ssid), "%s", (ssid != NULL) ? ssid : "");
+
+    lv_obj_t *p = lv_obj_create(s_tile); /* 挂设置 tile：不跨页，随 tile 一起滑动 */
+    lv_obj_remove_style_all(p);
+    lv_obj_set_size(p, LV_PCT(100), LV_PCT(100));
+    lv_obj_set_pos(p, 0, 0);
+    lv_obj_set_style_bg_color(p, lv_color_white(), 0);
+    lv_obj_set_style_bg_opa(p, LV_OPA_COVER, 0);
+    lv_obj_set_scroll_dir(p, LV_DIR_ALL); /* 吞掉滑动，防误翻页 */
+    lv_obj_set_scrollbar_mode(p, LV_SCROLLBAR_MODE_AUTO);
+    lv_obj_set_style_pad_top(p, 22, 0); /* 让开共享状态栏（22px） */
+    lv_obj_set_style_pad_hor(p, 8, 0);
+    lv_obj_set_style_pad_bottom(p, 4, 0);
+    lv_obj_set_style_pad_row(p, 4, 0);
+    lv_obj_set_flex_flow(p, LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_flex_align(p, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER,
+                          LV_FLEX_ALIGN_CENTER);
+    s_passkey_page = p;
+
+    char title[48];
+    snprintf(title, sizeof(title), "连接 %s", s_passkey_ssid);
+    lv_obj_t *tl = plain_label(p, title, LVGL_PORT_FONT_16, COL_INK, true);
+    lv_obj_set_width(tl, LV_PCT(100));
+    lv_label_set_long_mode(tl, LV_LABEL_LONG_DOT); /* 超长省略号，不断行占两行 */
+    lv_obj_set_style_text_align(tl, LV_TEXT_ALIGN_CENTER, 0);
+
+    /* 密码框：密码模式 + 自定义掩码字符。
+     * 掩码必须用 ASCII "*"：LVGL 默认掩码是 U+2022（•），该字形不在本工程
+     * 的中文字体子集里，真机可能显示成方框（字体审计会报缺失）。 */
+    s_passkey_ta = lv_textarea_create(p);
+    lv_obj_set_width(s_passkey_ta, LV_PCT(100));
+    lv_obj_set_height(s_passkey_ta, 34);
+    lv_textarea_set_one_line(s_passkey_ta, true);
+    lv_textarea_set_password_mode(s_passkey_ta, true);
+    lv_textarea_set_password_bullet(s_passkey_ta, "*");
+    lv_textarea_set_max_length(s_passkey_ta, WIFI_MANAGER_PASS_MAX_LEN - 1);
+    lv_obj_set_style_text_font(s_passkey_ta, lvgl_port_get_font(LVGL_PORT_FONT_16), 0);
+
+    lv_obj_t *kb = lv_keyboard_create(p);
+    lv_obj_set_width(kb, LV_PCT(100));
+    lv_obj_set_height(kb, 100); /* 4 行按键 → 每键约 24px 高，且保证底部按钮在屏内 */
+    lv_keyboard_set_mode(kb, LV_KEYBOARD_MODE_TEXT_LOWER);
+    lv_keyboard_set_textarea(kb, s_passkey_ta);
+    lv_obj_set_style_text_font(kb, lvgl_port_get_font(LVGL_PORT_FONT_14), 0);
+
+    lv_obj_t *row = plain_container(p);
+    lv_obj_set_size(row, LV_PCT(100), 32);
+    lv_obj_set_flex_flow(row, LV_FLEX_FLOW_ROW);
+    lv_obj_set_style_pad_column(row, 8, 0);
+    lv_obj_t *cancel = plain_button(row, "取消", LV_PCT(50), 32);
+    lv_obj_add_event_cb(cancel, passkey_cancel_cb, LV_EVENT_CLICKED, NULL);
+    lv_obj_t *ok = plain_button(row, "连接", LV_PCT(50), 32);
+    lv_obj_set_style_bg_color(ok, COL_PRIMARY, 0);
+    lv_obj_set_style_border_color(ok, COL_PRIMARY, 0);
+    lv_obj_t *okl = lv_obj_get_child(ok, 0);
+    if (okl != NULL) {
+        lv_obj_set_style_text_color(okl, lv_color_white(), 0);
+        lv_obj_set_style_text_font(okl, lvgl_port_get_font_bold(LVGL_PORT_FONT_16), 0);
+    }
+    lv_obj_add_event_cb(ok, passkey_submit_cb, LV_EVENT_CLICKED, NULL);
+
+    ESP_LOGD(TAG, "密码输入浮层已打开（SSID=%s）", s_passkey_ssid);
+}
+
+
 /**
  * @brief 刷新 WiFi 状态行与提示行（建页时与 5Hz 刷新各调一次）
  *
@@ -1682,9 +2172,18 @@ static const char *const s_wifi_state_names[5] = {
  */
 static void wifi_update_status(void)
 {
+    /* 模式按钮高亮：每帧都按 wifi_manager 的真实模式回显（用户点了别处/重启后
+     * 也能纠正"乐观更新"留下的偏差） */
+    wifi_mode_btns_refresh();
+
     if (s_wifi_state_label == NULL) {
         return; /* 页已关闭：防野指针（与其余刷新标签同一约定） */
     }
+    /* 【v0.6.0 复核】本函数以 5Hz 在"持有 LVGL 锁"的 UI 主循环里被调用，
+     * 因此它调用的每个 wifi_manager 接口都必须是**非阻塞**的。
+     * 已逐一核对实现（wifi_manager.c）：get_state/get_ip/get_ssid/get_ap_ssid
+     * 全部是 portENTER_CRITICAL 保护的快照拷贝，不等待内部命令任务，
+     * 不会阻塞 LVGL 锁。若将来给它们加"等待应答"的语义，必须回头改本函数。 */
     wifi_manager_state_t st = wifi_manager_get_state();
     const char *name = (st <= WIFI_MANAGER_STATE_FAILED) ? s_wifi_state_names[st] : "未知";
     char line[64];
@@ -1693,7 +2192,13 @@ static void wifi_update_status(void)
         if (wifi_manager_get_ip(ip, sizeof(ip)) != ESP_OK) {
             snprintf(ip, sizeof(ip), "--");
         }
-        snprintf(line, sizeof(line), "%s · IP %s", name, ip);
+        /* 带信号强度（dBm）：与列表里的信号条是同源数据，便于判断连接质量 */
+        int8_t rssi = 0;
+        if (wifi_manager_get_rssi(&rssi) == ESP_OK) {
+            snprintf(line, sizeof(line), "%s · IP %s · %d dBm", name, ip, (int)rssi);
+        } else {
+            snprintf(line, sizeof(line), "%s · IP %s", name, ip);
+        }
     } else if (st == WIFI_MANAGER_STATE_AP_MODE) {
         char ap[WIFI_MANAGER_AP_SSID_MAX_LEN + 1] = "";
         if (wifi_manager_get_ap_ssid(ap, sizeof(ap)) != ESP_OK) {
@@ -1717,29 +2222,90 @@ static void wifi_update_status(void)
             /* 配网指引：AP 模式下手机连热点 → 浏览器开 192.168.4.1 配网页 */
             lv_label_set_text(s_wifi_hint_label,
                               "手机连接上述热点后，\n浏览器打开 192.168.4.1 完成配网。");
+        } else if (st == WIFI_MANAGER_STATE_FAILED &&
+                   wifi_manager_get_mode() != WIFI_MANAGER_MODE_AP) {
+            /* 仅 STA / 自动但无凭据：热点未开，提示先切到热点模式才能配网 */
+            lv_label_set_text(s_wifi_hint_label,
+                              "当前未连接且无凭据。\n切到「热点」模式即可用手机/电脑配网。");
         } else {
             lv_label_set_text(s_wifi_hint_label, "“忘记网络”将清除已保存的 WiFi 凭据。");
         }
     }
 }
 
+/** 忘记网络：一次性任务与 LVGL 异步回调之间的结果传递（同一时刻只允许一个在跑） */
+static esp_err_t s_forget_result = ESP_OK;   /**< wifi_manager_forget() 的返回值 */
+static bool s_forget_running = false;        /**< 已有一个"忘记网络"任务在跑（防重复点击） */
+
 /**
- * @brief "忘记网络"确认后动作：清 WiFi 凭据并回配网热点（F7）
+ * @brief 忘记网络完成后的 UI 收尾（**在 LVGL 上下文**执行）
  *
- * 由 show_confirm 的 ok_cb 调用（确认框已先被关闭）。wifi_manager_forget
- * 会等待内部任务完成（最长数秒），期间界面短暂无响应，属一次性操作可接受。
- * 结果分成功/失败两种提示；无论成败都刷新状态行（背后的状态页同步更新）。
+ * 由 wifi_forget_task() 通过 lv_async_call() 排队到 LVGL 任务里执行，
+ * 因此这里可以安全地操作 LVGL 对象（弹提示框/刷状态行）。
+ *
+ * @param unused lv_async_call 的 user_data（未使用）
  */
-static void wifi_forget_ok(void)
+static void wifi_forget_done_async(void *unused)
 {
-    esp_err_t err = wifi_manager_forget();
+    (void)unused;
+    s_forget_running = false;
     wifi_update_status(); /* 先刷背后状态页，再弹结果框 */
-    if (err == ESP_OK) {
+    if (s_forget_result == ESP_OK) {
         buzzer_play(BUZZER_TONE_OK);
-        show_notice("已忘记网络", "WiFi 凭据已清除，\n设备回到配网热点模式。");
+        /* 结果文案随模式偏好变化：仅 STA 模式下不会开热点，不能照旧说"回到热点" */
+        if (wifi_manager_get_mode() == WIFI_MANAGER_MODE_STA) {
+            show_notice("已忘记网络", "WiFi 凭据已清除。\n当前为「仅 STA」模式，\n"
+                                      "需要重新配网时请切到「热点」模式。");
+        } else {
+            show_notice("已忘记网络", "WiFi 凭据已清除，\n设备回到配网热点模式。");
+        }
     } else {
         buzzer_play(BUZZER_TONE_ERROR);
         show_notice("操作未完成", "清除 WiFi 凭据失败，请重试。");
+    }
+}
+
+/**
+ * @brief 忘记网络的一次性执行任务（**不在 LVGL 上下文**）
+ *
+ * 【v0.6.0 卡死修复】wifi_manager_forget() 会等待其内部任务完成（头文件
+ * 注明"最长数秒"）。若直接在 LVGL 事件回调里调用，UI 主循环会持着 LVGL 锁
+ * 干等数秒→整屏冻结（指示灯仍闪）。因此拆成两步：
+ *   ① 本任务（普通 FreeRTOS 任务，不碰任何 LVGL 对象）执行阻塞操作；
+ *   ② 完成后用 lv_async_call() 把结果排回 LVGL 任务里收尾。
+ * 栈用内部 RAM（3KB）：本任务只做一次信号量等待 + 几个 WiFi API 调用，
+ * 且 esp_wifi 的中断不依赖本任务栈（区别于必须内部栈的采样任务）。
+ *
+ * @param arg 未使用
+ */
+static void wifi_forget_task(void *arg)
+{
+    (void)arg;
+    s_forget_result = wifi_manager_forget();
+    /* lv_async_call：把回调排到 LVGL 任务上下文执行（跨线程安全） */
+    lv_async_call(wifi_forget_done_async, NULL);
+    vTaskDelete(NULL); /* 一次性任务：干完自删 */
+}
+
+/**
+ * @brief "忘记网络"确认后动作：清 WiFi 凭据并回配网热点（F7）
+ *
+ * 由 show_confirm 的 ok_cb 调用（确认框已先被关闭）。**不再阻塞**：
+ * 立即在状态行显示"正在忘记网络…"，真正的动作交给一次性任务，
+ * 完成后弹结果框（见 wifi_forget_done_async）。
+ */
+static void wifi_forget_ok(void)
+{
+    if (s_forget_running) {
+        return; /* 已有一次在跑：忽略重复点击，避免并发两次 forget */
+    }
+    s_forget_running = true;
+    if (s_wifi_state_label != NULL) {
+        lv_label_set_text(s_wifi_state_label, "正在忘记网络…");
+    }
+    if (xTaskCreatePinnedToCore(wifi_forget_task, "wifi_forget", 3072, NULL, 4, NULL, 0) != pdPASS) {
+        s_forget_running = false;
+        show_notice("操作未完成", "系统资源不足，请重试。");
     }
 }
 
@@ -1768,34 +2334,85 @@ static void wifi_open_cb(void)
 {
     lv_obj_t *c = subpage_open(SUB_WIFI, "WiFi 与热点");
 
-    /* LV_SYMBOL_WIFI：LVGL 内置 WiFi 字形符号（免图片资源）；16px 小图标省纵向空间 */
-    lv_obj_t *icon = plain_label(c, LV_SYMBOL_WIFI, LVGL_PORT_FONT_16, COL_PRIMARY, false);
-    (void)icon;
-
-    /* 状态行：品牌蓝加粗（本页主信息），由 wifi_update_status 填充并 5Hz 刷新 */
-    s_wifi_state_label = plain_label(c, "--", LVGL_PORT_FONT_16, COL_PRIMARY, true);
+    /* ---- ① 状态行：品牌蓝加粗（本页主信息），由 wifi_update_status 5Hz 刷新 ---- */
+    s_wifi_state_label = plain_label(c, "--", LVGL_PORT_FONT_14, COL_PRIMARY, true);
     lv_obj_set_width(s_wifi_state_label, LV_PCT(100));
     lv_label_set_long_mode(s_wifi_state_label, LV_LABEL_LONG_WRAP); /* 超宽折行不截断 */
     lv_obj_set_style_text_align(s_wifi_state_label, LV_TEXT_ALIGN_CENTER, 0);
 
-    /* 提示行：配网模式给 192.168.4.1 指引，其余状态提示"忘记网络"含义 */
+    /* ---- ② 模式三档：自动 / 仅 STA / 热点（v0.6.0 需求 2） ----
+     * 点击即 wifi_manager_set_mode（非阻塞），高亮由 wifi_mode_btns_refresh 维护。
+     * 三档语义见 wifi_manager.h：自动=有凭据连路由器、无凭据开热点；
+     * 仅 STA=不开热点（纯客户端）；热点=强制配网热点。 */
+    lv_obj_t *mrow = plain_container(c);
+    lv_obj_set_size(mrow, LV_PCT(100), 30);
+    lv_obj_set_flex_flow(mrow, LV_FLEX_FLOW_ROW);
+    lv_obj_set_style_pad_column(mrow, 6, 0);
+    static const char *const mode_names[3] = { "自动", "仅 STA", "热点" };
+    for (int i = 0; i < 3; i++) {
+        lv_obj_t *b = plain_button(mrow, mode_names[i], LV_PCT(33), 30);
+        lv_obj_add_event_cb(b, wifi_mode_clicked_cb, LV_EVENT_CLICKED, (void *)(intptr_t)i);
+        focus_add(b); /* 焦点链：三档模式按钮在最前（最常用） */
+        s_wifi_mode_btns[i] = b;
+    }
+
+    /* ---- ③ 操作行：搜索 Wi-Fi / 忘记网络 ---- */
+    lv_obj_t *arow = plain_container(c);
+    lv_obj_set_size(arow, LV_PCT(100), 32);
+    lv_obj_set_flex_flow(arow, LV_FLEX_FLOW_ROW);
+    lv_obj_set_style_pad_column(arow, 8, 0);
+
+    s_wifi_scan_btn = plain_button(arow, "搜索 Wi-Fi", LV_PCT(50), 32);
+    lv_obj_set_style_bg_color(s_wifi_scan_btn, COL_PRIMARY, 0);
+    lv_obj_set_style_border_color(s_wifi_scan_btn, COL_PRIMARY, 0);
+    {
+        lv_obj_t *l = lv_obj_get_child(s_wifi_scan_btn, 0);
+        if (l != NULL) {
+            lv_obj_set_style_text_color(l, lv_color_white(), 0);
+            lv_obj_set_style_text_font(l, lvgl_port_get_font_bold(LVGL_PORT_FONT_14), 0);
+        }
+    }
+    lv_obj_add_event_cb(s_wifi_scan_btn, wifi_scan_btn_clicked_cb, LV_EVENT_CLICKED, NULL);
+    focus_add(s_wifi_scan_btn);
+
+    lv_obj_t *fbtn = plain_button(arow, "忘记网络", LV_PCT(50), 32);
+    lv_obj_set_style_border_color(fbtn, COL_DANGER, 0);
+    {
+        lv_obj_t *l = lv_obj_get_child(fbtn, 0);
+        if (l != NULL) {
+            lv_obj_set_style_text_color(l, COL_DANGER, 0);
+            lv_obj_set_style_text_font(l, lvgl_port_get_font_bold(LVGL_PORT_FONT_14), 0);
+        }
+    }
+    lv_obj_add_event_cb(fbtn, wifi_forget_clicked_cb, LV_EVENT_CLICKED, NULL);
+    focus_add(fbtn);
+
+    /* ---- ④ 扫描结果列表（flex_grow 占满剩余高度，行内滚动） ----
+     * 行在扫描完成后由 wifi_render_ap_list 动态创建（每行登记焦点链）。 */
+    s_wifi_list = plain_container(c);
+    lv_obj_set_width(s_wifi_list, LV_PCT(100));
+    lv_obj_set_height(s_wifi_list, 0);
+    lv_obj_set_flex_grow(s_wifi_list, 1);
+    lv_obj_set_flex_flow(s_wifi_list, LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_style_pad_all(s_wifi_list, 2, 0);
+    lv_obj_set_style_pad_row(s_wifi_list, 4, 0);
+    lv_obj_set_scroll_dir(s_wifi_list, LV_DIR_VER); /* 内容多时纵向滚动 */
+    lv_obj_set_scrollbar_mode(s_wifi_list, LV_SCROLLBAR_MODE_AUTO);
+    {
+        lv_obj_t *ph = plain_label(s_wifi_list, "点「搜索 Wi-Fi」列出附近热点。",
+                                   LVGL_PORT_FONT_12, COL_GRAY, false);
+        lv_obj_set_width(ph, LV_PCT(100));
+        lv_obj_set_style_text_align(ph, LV_TEXT_ALIGN_CENTER, 0);
+    }
+
+    /* ---- ⑤ 提示行：随状态切换（配网指引 / 忘记网络说明） ---- */
     s_wifi_hint_label = plain_label(c, "", LVGL_PORT_FONT_12, COL_GRAY, false);
     lv_obj_set_width(s_wifi_hint_label, LV_PCT(100));
     lv_label_set_long_mode(s_wifi_hint_label, LV_LABEL_LONG_WRAP);
     lv_obj_set_style_text_align(s_wifi_hint_label, LV_TEXT_ALIGN_CENTER, 0);
 
-    /* "忘记网络"按钮：清凭据回配网热点（红字示警 + 确认框，与"清零统计"同款） */
-    lv_obj_t *btn = plain_button(c, "忘记网络", LV_PCT(100), 40);
-    lv_obj_set_style_border_color(btn, COL_DANGER, 0);
-    lv_obj_t *lbl = lv_obj_get_child(btn, 0);
-    if (lbl != NULL) {
-        lv_obj_set_style_text_color(lbl, COL_DANGER, 0);
-        lv_obj_set_style_text_font(lbl, lvgl_port_get_font_bold(LVGL_PORT_FONT_16), 0);
-    }
-    lv_obj_add_event_cb(btn, wifi_forget_clicked_cb, LV_EVENT_CLICKED, NULL);
-    focus_add(btn); /* 焦点链第 1 项：忘记网络（长按 K2 弹确认框） */
-
-    wifi_update_status(); /* 建页即填状态，不等 5Hz 刷新的第一帧 */
+    s_wifi_ap_copy_n = 0; /* 新开页：清掉上一次的行下标映射 */
+    wifi_update_status(); /* 建页即填状态与模式高亮，不等 5Hz 刷新的第一帧 */
 }
 
 /* ============================================================
@@ -1870,6 +2487,194 @@ static void energy_open_cb(void)
                                  COL_GRAY, false);
     lv_obj_set_width(note, LV_PCT(100));
     lv_obj_set_style_text_align(note, LV_TEXT_ALIGN_CENTER, 0);
+}
+
+/* ============================================================
+ * 数字键盘弹窗（v0.6.0 新增：点击数值直接输入）
+ * ============================================================ */
+
+/** 用户按下"确定"后的回调：拿到已校验并在范围内的数值 */
+typedef void (*numkey_ok_cb_t)(float value);
+
+/* 同一时刻只允许一个数字键盘弹窗，故这些状态用文件级静态变量即可 */
+static lv_obj_t *s_numkey_box = NULL;   /**< 弹窗本体（lv_msgbox）；NULL=未打开 */
+static lv_obj_t *s_numkey_ta = NULL;    /**< 弹窗内的输入框 */
+static lv_obj_t *s_numkey_hint = NULL;  /**< 校验失败提示行（复用正文区最后一行） */
+static numkey_ok_cb_t s_numkey_ok = NULL; /**< 确定回调 */
+static float s_numkey_min = 0.0f;       /**< 允许的最小值（越界钳制） */
+static float s_numkey_max = 0.0f;       /**< 允许的最大值（越界钳制） */
+
+static void numkey_close(void); /* 前向声明（定义见下） */
+
+/**
+ * @brief 弹窗被删除时的清理（含用户点遮罩/按 K1 关闭的路径）
+ *
+ * 与 box_deleted_cb 类似：对象没了，登记的状态必须一并失效，
+ * 否则下次 numkey_open 会往已删除的输入框写字（野指针）。
+ */
+static void numkey_deleted_cb(lv_event_t *e)
+{
+    (void)e;
+    s_numkey_box = NULL;
+    s_numkey_ta = NULL;
+    s_numkey_hint = NULL;
+    s_numkey_ok = NULL;
+}
+
+/**
+ * @brief 数字键盘弹窗："确定"点击 → 校验 → 关闭 → 回调
+ *
+ * 校验失败的两种情形都**不关框**，只在提示行给反馈，让用户接着改：
+ *   · 空串 / 非数字（含多个小数点）→ 提示"请输入数字"；
+ *   · 超出范围 → 直接钳到边界值（与 ± 步进越界即停的语义一致）。
+ *
+ * @param e LVGL 点击事件（未使用）
+ */
+static void numkey_ok_cb(lv_event_t *e)
+{
+    (void)e;
+    if (s_numkey_ta == NULL) {
+        return;
+    }
+    const char *t = lv_textarea_get_text(s_numkey_ta);
+    char *end = NULL;
+    float v = (t != NULL) ? strtof(t, &end) : 0.0f;
+    /* 判据：非空、至少解析出一个数、且整串都被吃掉（拒绝 "1.2.3"）、且有限 */
+    if ((t == NULL) || (t[0] == '\0') || (end == t) || (*end != '\0') || !isfinite(v)) {
+        if (s_numkey_hint != NULL) {
+            lv_label_set_text(s_numkey_hint, "请输入数字（例如 12.5）");
+        }
+        return;
+    }
+    if (v < s_numkey_min) {
+        v = s_numkey_min;
+    }
+    if (v > s_numkey_max) {
+        v = s_numkey_max;
+    }
+
+    /* 回调指针先取出（关闭弹窗会把它清空），再关框、再执行动作 */
+    numkey_ok_cb_t cb = s_numkey_ok;
+    numkey_close();
+    if (cb != NULL) {
+        cb(v);
+    }
+}
+
+/**
+ * @brief 关闭数字键盘弹窗（无则空操作）
+ */
+static void numkey_close(void)
+{
+    if (s_numkey_box != NULL) {
+        /* 浮层根对象删除：连带删除输入框与键盘（状态由 numkey_deleted_cb 清理） */
+        lv_obj_delete(s_numkey_box);
+    }
+}
+
+/**
+ * @brief 数字键盘浮层"取消"：直接关闭（不改动任何值）
+ */
+static void numkey_cancel_cb(lv_event_t *e)
+{
+    (void)e;
+    numkey_close();
+}
+
+/**
+ * @brief 打开数字键盘浮层（点击数值直接输入，v0.6.0）
+ *
+ * 结构（284×240，顶部 22px 让开共享状态栏）：标题 + 范围提示 + 输入框 +
+ * 数字键盘 + [取消][确定]。提示行兼职"校验失败反馈"（省一行高度）。
+ *
+ * 为什么用浮层而不是 lv_msgbox：数字键盘高约 92px，加上 msgbox 自带的
+ * 标题/正文/按钮区会超过一屏高度（footer 按钮被挤出屏幕 = 点不到）。
+ * 浮层挂在设置 tile 上（后创建者渲染在上层），高度可控、按钮必定可见。
+ *
+ * 键盘用 LVGL 内置 lv_keyboard 的 NUMBER 模式（4×4 数字键，每键约 60px 宽）。
+ *
+ * @param title  标题（如"输入过压阈值"）
+ * @param unit   单位（如"V"；仅用于提示文案）
+ * @param init   初始值（显示在输入框里）
+ * @param min    允许最小值（确定时钳制）
+ * @param max    允许最大值（确定时钳制）
+ * @param cb     确定回调（已校验、已钳制的值）
+ */
+static void numkey_open(const char *title, const char *unit, float init, float min, float max,
+                        numkey_ok_cb_t cb)
+{
+    numkey_close(); /* 防叠加 */
+
+    s_numkey_min = min;
+    s_numkey_max = max;
+    s_numkey_ok = cb;
+
+    lv_obj_t *p = lv_obj_create(s_tile); /* 全屏浮层（在二级页之上） */
+    lv_obj_remove_style_all(p);
+    lv_obj_set_size(p, LV_PCT(100), LV_PCT(100));
+    lv_obj_set_pos(p, 0, 0);
+    lv_obj_set_style_bg_color(p, lv_color_white(), 0);
+    lv_obj_set_style_bg_opa(p, LV_OPA_COVER, 0);
+    lv_obj_set_scroll_dir(p, LV_DIR_ALL);
+    lv_obj_set_scrollbar_mode(p, LV_SCROLLBAR_MODE_AUTO);
+    lv_obj_set_style_pad_top(p, 22, 0); /* 让开共享状态栏 */
+    lv_obj_set_style_pad_hor(p, 8, 0);
+    lv_obj_set_style_pad_bottom(p, 4, 0);
+    lv_obj_set_style_pad_row(p, 4, 0);
+    lv_obj_set_flex_flow(p, LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_flex_align(p, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    s_numkey_box = p;
+    lv_obj_add_event_cb(p, numkey_deleted_cb, LV_EVENT_DELETE, NULL);
+
+    lv_obj_t *tl = plain_label(p, title, LVGL_PORT_FONT_16, COL_INK, true);
+    lv_obj_set_width(tl, LV_PCT(100));
+    lv_obj_set_style_text_align(tl, LV_TEXT_ALIGN_CENTER, 0);
+
+    /* 提示行：初值是"允许范围"，校验失败时改写为错误提示（一行两用） */
+    char text[64];
+    snprintf(text, sizeof(text), "范围 %.3g ~ %.3g %s", (double)min, (double)max, unit);
+    s_numkey_hint = plain_label(p, text, LVGL_PORT_FONT_12, COL_GRAY, false);
+    lv_obj_set_width(s_numkey_hint, LV_PCT(100));
+    lv_obj_set_style_text_align(s_numkey_hint, LV_TEXT_ALIGN_CENTER, 0);
+
+    s_numkey_ta = lv_textarea_create(p);
+    lv_obj_set_width(s_numkey_ta, LV_PCT(100));
+    lv_obj_set_height(s_numkey_ta, 34);
+    lv_textarea_set_one_line(s_numkey_ta, true);
+    /* accepted_chars：只允许数字与小数点，键盘之外也挡得住误输入 */
+    lv_textarea_set_accepted_chars(s_numkey_ta, "0123456789.");
+    lv_textarea_set_max_length(s_numkey_ta, 9);
+    lv_obj_set_style_text_font(s_numkey_ta, lvgl_port_get_font(LVGL_PORT_FONT_16), 0);
+    {
+        char init_buf[24];
+        snprintf(init_buf, sizeof(init_buf), "%.4g", (double)init);
+        lv_textarea_set_text(s_numkey_ta, init_buf);
+    }
+
+    lv_obj_t *kb = lv_keyboard_create(p);
+    lv_obj_set_width(kb, LV_PCT(100));
+    lv_obj_set_height(kb, 92); /* 4 行数字键 → 每键约 22px 高，恰好一屏放下 */
+    lv_keyboard_set_mode(kb, LV_KEYBOARD_MODE_NUMBER);
+    lv_keyboard_set_textarea(kb, s_numkey_ta);
+    lv_obj_set_style_text_font(kb, lvgl_port_get_font(LVGL_PORT_FONT_14), 0);
+
+    lv_obj_t *row = plain_container(p);
+    lv_obj_set_size(row, LV_PCT(100), 32);
+    lv_obj_set_flex_flow(row, LV_FLEX_FLOW_ROW);
+    lv_obj_set_style_pad_column(row, 8, 0);
+    lv_obj_t *cancel = plain_button(row, "取消", LV_PCT(50), 32);
+    lv_obj_add_event_cb(cancel, numkey_cancel_cb, LV_EVENT_CLICKED, NULL);
+    lv_obj_t *ok = plain_button(row, "确定", LV_PCT(50), 32);
+    lv_obj_set_style_bg_color(ok, COL_PRIMARY, 0);
+    lv_obj_set_style_border_color(ok, COL_PRIMARY, 0);
+    {
+        lv_obj_t *ol = lv_obj_get_child(ok, 0);
+        if (ol != NULL) {
+            lv_obj_set_style_text_color(ol, lv_color_white(), 0);
+            lv_obj_set_style_text_font(ol, lvgl_port_get_font_bold(LVGL_PORT_FONT_16), 0);
+        }
+    }
+    lv_obj_add_event_cb(ok, numkey_ok_cb, LV_EVENT_CLICKED, NULL);
 }
 
 /* ============================================================
@@ -2027,11 +2832,59 @@ static void alarm_switch_cb(lv_event_t *e)
     (void)buzzer_play(BUZZER_TONE_CLICK);
 }
 
+/** 数字键盘正在编辑的行（-1 = 未在编辑）；供 alarm_numkey_ok 回写 */
+static int s_numkey_alarm_row = -1;
+
+/**
+ * @brief 数字键盘"确定"→ 写回告警阈值并落盘
+ *
+ * @param v 已由 numkey_open 校验并钳制到该行范围内的值
+ */
+static void alarm_numkey_ok(float v)
+{
+    const int row = s_numkey_alarm_row;
+    s_numkey_alarm_row = -1;
+    if (row < 0 || row >= ALARM_ROW_CNT) {
+        return;
+    }
+    *alarm_row_value(row) = v;
+    alarm_update_label(row);
+    alarm_apply(); /* 与 ± 步进同一出口：写内存 + 防抖落盘（非阻塞） */
+    (void)buzzer_play(BUZZER_TONE_CLICK);
+}
+
+/**
+ * @brief 点击阈值数值 → 弹出数字键盘直接输入（v0.6.0）
+ *
+ * 与 ± 步进按钮**并列**的两个入口：触屏用户可以直接输精确值，
+ * 纯按键用户仍旧走 ± 步进（本标签不登记焦点链）。
+ *
+ * @param e LVGL 点击事件；user_data 携带行下标（ALARM_ROW_*）
+ */
+static void alarm_value_clicked_cb(lv_event_t *e)
+{
+    const int row = (int)(intptr_t)lv_event_get_user_data(e);
+    if (row < 0 || row >= ALARM_ROW_CNT) {
+        return;
+    }
+    float lo = 0.0f, hi = 0.0f, step = 0.0f;
+    alarm_row_range(row, &lo, &hi, &step);
+    const char *unit = (row == ALARM_ROW_V) ? "V" : ((row == ALARM_ROW_I) ? "A" : "W");
+    char title[24];
+    snprintf(title, sizeof(title), "输入%s阈值", (row == ALARM_ROW_V)   ? "过压"
+                                           : (row == ALARM_ROW_I) ? "过流"
+                                                                  : "过功率");
+    s_numkey_alarm_row = row;
+    numkey_open(title, unit, *alarm_row_value(row), lo, hi, alarm_numkey_ok);
+}
+
 /**
  * @brief 构造一行"阈值 ± 调节"（名称 + － + 数值 + ＋），并登记焦点链
  *
  * 行内 flex 横排：名称左对齐，± 与数值靠右成组。
  * 焦点链按"－ → ＋"逐行登记，纯按键路径就是 K1/K2 移焦点、长按 K2 点按钮。
+ * 【v0.6.0】数值标签额外做成可点击：点击弹数字键盘直接输入（触屏入口），
+ * 标签下加一条品牌蓝下划线作为"这里可以点"的视觉提示。
  *
  * @param c    二级页内容容器
  * @param row  行下标（ALARM_ROW_*）
@@ -2062,6 +2915,14 @@ static lv_obj_t *alarm_add_limit_row(lv_obj_t *c, int row, const char *name)
     s_alarm_value_labels[row] = plain_label(grp, "--", LVGL_PORT_FONT_16, COL_PRIMARY, true);
     lv_obj_set_width(s_alarm_value_labels[row], 72);
     lv_obj_set_style_text_align(s_alarm_value_labels[row], LV_TEXT_ALIGN_CENTER, 0);
+    /* 可点击 + 下划线提示（点击弹数字键盘，见 alarm_value_clicked_cb） */
+    lv_obj_add_flag(s_alarm_value_labels[row], LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_set_style_border_side(s_alarm_value_labels[row], LV_BORDER_SIDE_BOTTOM, 0);
+    lv_obj_set_style_border_width(s_alarm_value_labels[row], 1, 0);
+    lv_obj_set_style_border_color(s_alarm_value_labels[row], COL_PRIMARY, 0);
+    lv_obj_set_style_pad_bottom(s_alarm_value_labels[row], 2, 0);
+    lv_obj_add_event_cb(s_alarm_value_labels[row], alarm_value_clicked_cb, LV_EVENT_CLICKED,
+                        (void *)(intptr_t)row);
     alarm_update_label(row);
 
     lv_obj_t *plus = plain_button(grp, "＋", 36, 32);
@@ -2113,7 +2974,8 @@ static void alarm_add_switch_row(lv_obj_t *c, int row, const char *name, bool on
  *
  * 初值从 settings_get_alarm 读；读失败用安全默认（三阈值 50% 量程、全使能）。
  * 任一改动经 alarm_apply 写回 settings_set_alarm（防抖落盘），
- * 子页关闭时 subpage_close 还会 settings_save_now 一次兜底。
+ * 子页关闭时 subpage_close 还会请求一次尽快落盘（settings_request_save，非阻塞）。
+ * 【v0.6.0】阈值数值可直接点击 → 弹数字键盘输入精确值（触屏入口）。
  */
 static void alarm_open_cb(void)
 {
@@ -2129,7 +2991,8 @@ static void alarm_open_cb(void)
         s_alarm_cfg.p_limit = 100.0f;
     }
 
-    lv_obj_t *hint = plain_label(c, "阈值越限时测量页弹出告警；关掉开关即停用该项。",
+    lv_obj_t *hint = plain_label(c, "阈值越限时测量页弹出告警；关掉开关即停用该项。\n"
+                                    "点击数值可直接输入（触屏），或用 －/＋ 步进（按键）。",
                                  LVGL_PORT_FONT_12, COL_GRAY, false);
     lv_obj_set_width(hint, LV_PCT(100));
     lv_label_set_long_mode(hint, LV_LABEL_LONG_WRAP);
@@ -2449,6 +3312,25 @@ static void msgbox_key_action(button_id_t id)
     }
 }
 
+const char *screen_settings_current_subpage_name(void)
+{
+    /* 返回静态字符串（不写共享缓冲）：调用方是 app_tasks 巡检任务，
+     * 与 UI 任务并发，字符串常量才是安全的。校准页名随通道变化，
+     * 只读一个 bool 标志（读到新旧值都无害）。 */
+    switch (s_sub_kind) {
+    case SUB_NONE:       return "首页";
+    case SUB_CALIB_MENU: return "测量设置";
+    case SUB_CALIB_EDIT: return s_cal_is_voltage ? "校准 · 电压" : "校准 · 电流";
+    case SUB_CALIB_DONE: return "校准完成";
+    case SUB_DISPLAY:    return "显示设置";
+    case SUB_BUZZER:     return "蜂鸣器";
+    case SUB_WIFI:       return "WiFi 与热点";
+    case SUB_ENERGY:     return "电能统计";
+    case SUB_ALARM:      return "告警设置";
+    default:             return "未知";
+    }
+}
+
 /**
  * @brief 查询设置页是否有模态浮层（二级页/弹窗）正在打开——不管当前在哪一页
  *
@@ -2458,7 +3340,9 @@ static void msgbox_key_action(button_id_t id)
  */
 bool screen_settings_modal_is_open(void)
 {
-    return (s_subpage != NULL || s_active_msgbox != NULL);
+    /* passkey/numkey：v0.6.0 新增的两个全屏键盘浮层（含虚拟键盘），也是模态 */
+    return (s_subpage != NULL || s_active_msgbox != NULL || s_passkey_page != NULL ||
+            s_numkey_box != NULL);
 }
 
 /**
@@ -2498,6 +3382,38 @@ bool screen_settings_key(button_id_t id, button_event_t ev)
         }
         /* 长按松开/双击等无动作但不外漏（防止长按结束的 RELEASE 落到翻页逻辑） */
         return true;
+    }
+
+    /* ---- ①b WiFi 密码输入浮层（v0.6.0）：K1=取消 / K2=连接 ----
+     * 密码本身要靠触屏键盘输入（两键无法打字），但"取消/连接"必须可按键，
+     * 否则浮层打开后按键全废、用户会以为界面卡死。 */
+    if (s_passkey_page != NULL) {
+        if (ev == BUTTON_EVENT_SINGLE_CLICK || ev == BUTTON_EVENT_LONG_PRESS_START) {
+            if (id == BUTTON_ID_BOOT) {
+                passkey_close(); /* K1 = 取消 */
+            } else {
+                passkey_submit(); /* K2 = 连接 */
+            }
+        }
+        return true; /* 浮层期间按键不外漏 */
+    }
+
+    /* ---- ①c 数字键盘浮层（v0.6.0 告警阈值输入）：K1=取消 / K2=确定 ----
+     * 数字靠触屏数字键输入；"取消/确定"可由按键完成（与弹窗键位一致）。 */
+    if (s_numkey_box != NULL) {
+        if (ev == BUTTON_EVENT_SINGLE_CLICK || ev == BUTTON_EVENT_LONG_PRESS_START) {
+            if (id == BUTTON_ID_BOOT) {
+                numkey_close(); /* K1 = 取消 */
+            } else {
+                /* K2 = 确定：合成点击"确定"按钮，走与触屏完全相同的出口 */
+                lv_obj_t *box = s_numkey_box;
+                lv_obj_t *row = lv_obj_get_child(box, lv_obj_get_child_count(box) - 1);
+                if (row != NULL && lv_obj_get_child_count(row) >= 2) {
+                    lv_obj_send_event(lv_obj_get_child(row, 1), LV_EVENT_CLICKED, NULL);
+                }
+            }
+        }
+        return true; /* 浮层期间按键不外漏 */
     }
 
     /* ---- ② 二级页焦点链 ---- */

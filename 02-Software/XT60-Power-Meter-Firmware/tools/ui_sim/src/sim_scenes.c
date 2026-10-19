@@ -404,8 +404,20 @@ static void open_sub_page(const char *entry_text)
     sim_step(250);
 }
 
+/* ============================================================
+ * v0.6.0 新增场景用的 mock 可控接口（实现在 mocks/mock_wifi_manager.c）
+ * 通过它们把"WiFi 状态/模式/RSSI/扫描列表"调成想走查的形态。
+ * ============================================================ */
+#include "wifi_manager.h"
+
+extern void mock_wifi_set_state(wifi_manager_state_t st);
+extern void mock_wifi_set_mode(wifi_manager_mode_t m);
+extern void mock_wifi_set_rssi(int8_t rssi);
+extern void mock_wifi_set_scan_list(uint16_t n);
+extern void mock_wifi_scan_finish(void);
+
 /**
- * @brief 经由"显示设置"页切换屏幕角度（0/90/180/270）
+ * @brief 由"显示设置"页切换屏幕角度（0/90/180/270）
  *
  * 点角度按钮后 lvgl_port 改分辨率 → ui_nav 下一帧按新分辨率重建三页
  * （二级页随旧页关闭），step 450ms 足以跑完重建；随后翻到 page_after
@@ -641,6 +653,79 @@ void sim_run_scenes(void)
     ensure_page(2);
     ui_nav_refresh(sim_get_measurement());
     shot("23_settings_final");
+
+    /* ============================================================
+     * v0.6.0 新增场景：WiFi 页改版 + 状态栏信号条 + 数字键盘
+     * ============================================================ */
+
+    /* ---- WiFi 页：模式三档 + 扫描列表 + 密码键盘 ---- */
+    ensure_page(2);
+    open_sub_page("WiFi 与热点");
+    shot("31_wifi_page"); /* 状态行 + 自动/仅 STA/热点 三档 + 搜索/忘记 + 列表占位 */
+
+    click_text("仅 STA");
+    sim_step(200);
+    shot("32_wifi_mode_sta"); /* 高亮切到「仅 STA」（mock 同时把状态改为连接中） */
+    click_text("热点");
+    sim_step(200);
+    shot("33_wifi_mode_ap"); /* 高亮切到「热点」，mock 状态变配网模式 */
+    click_text("自动");
+    sim_step(200);
+
+    click_text("搜索 Wi-Fi");
+    mock_wifi_scan_finish(); /* 模拟 SCAN_DONE：让 300ms 轮询定时器收尾 */
+    sim_step(450);
+    shot("34_wifi_scan_list"); /* 5 条热点，按 RSSI 降序，含「加密」标记与信号条 */
+
+    click_text("XT60-Lab"); /* 点选某一行 → 打开密码输入浮层（含 lv_keyboard） */
+    sim_step(250);
+    shot("35_wifi_passkey");
+    click_text("取消"); /* 关闭浮层（K1 亦可） */
+    sim_step(200);
+    close_subpage_if_open();
+    sim_step(150);
+
+    /* ---- 状态栏 WiFi 信号条四态（测量页截图即可看到状态栏） ---- */
+    ensure_page(0);
+    mock_wifi_set_state(WIFI_MANAGER_STATE_CONNECTED);
+    mock_wifi_set_rssi(-52); /* 强信号 → 4 格绿 */
+    ui_nav_refresh(sim_get_measurement());
+    sim_step(250);
+    shot("36_wifi_bar_connected");
+    mock_wifi_set_rssi(-85); /* 弱信号 → 1 格黄 */
+    ui_nav_refresh(sim_get_measurement());
+    sim_step(250);
+    shot("37_wifi_bar_weak");
+    mock_wifi_set_state(WIFI_MANAGER_STATE_AP_MODE);
+    ui_nav_refresh(sim_get_measurement());
+    sim_step(250);
+    shot("38_wifi_bar_ap"); /* 配网热点 → 4 格蓝 */
+    mock_wifi_set_state(WIFI_MANAGER_STATE_FAILED);
+    ui_nav_refresh(sim_get_measurement());
+    sim_step(250);
+    shot("39_wifi_bar_off"); /* 未连接 → 全灰 */
+    /* 还原成"已连接"给后续场景 */
+    mock_wifi_set_state(WIFI_MANAGER_STATE_CONNECTED);
+    mock_wifi_set_rssi(-52);
+    ui_nav_refresh(sim_get_measurement());
+    sim_step(200);
+
+    /* ---- 告警设置：点击数值 → 数字键盘弹窗 → 确定写回 ---- */
+    ensure_page(2);
+    open_sub_page("告警设置");
+    shot("40_alarm_page"); /* 三阈值数值标签带下划线（可点击提示） */
+    click_text("15.00 V"); /* 点"过压"数值 → 数字键盘（NUMBER 模式） */
+    sim_step(250);
+    shot("41_alarm_numkey");
+    click_text("确定");
+    sim_step(250);
+    shot("42_alarm_after_input");
+    close_subpage_if_open();
+    sim_step(150);
+
+    /* 收尾回到设置首页（与旧场景一致，便于人工对照 23_settings_final） */
+    ensure_page(2);
+    ui_nav_refresh(sim_get_measurement());
 
     printf("=== 场景执行完成 ===\n");
 }

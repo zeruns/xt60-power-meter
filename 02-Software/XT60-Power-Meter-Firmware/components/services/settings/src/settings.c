@@ -759,6 +759,28 @@ esp_err_t settings_save_now(void)
     return err;
 }
 
+esp_err_t settings_request_save(void)
+{
+    if (!s_ready) {
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    /* ① 置脏标记（与 save_task / 防抖定时器回调共享，进临界区改） */
+    portENTER_CRITICAL(&s_lock);
+    s_dirty = true;
+    portEXIT_CRITICAL(&s_lock);
+
+    /* ② 取消可能待触发的防抖定时器：同一批改动不必被通知两次
+     * （esp_timer_stop：定时器没在运行会返回错误，这里无害地忽略） */
+    esp_timer_stop(s_save_timer);
+
+    /* ③ 直接置事件位唤醒 save_task。本函数因此是**非阻塞**的：
+     * 调用者（可能是持有 LVGL 锁的 UI 事件回调）几微秒内即可返回，
+     * 真正的 nvs_set_xxx/commit 全部在 save_task 里完成。 */
+    xEventGroupSetBits(s_save_events, SETTINGS_EVT_DO_SAVE);
+    return ESP_OK;
+}
+
 esp_err_t settings_get_alarm(settings_alarm_t *out)
 {
     if (out == NULL) {

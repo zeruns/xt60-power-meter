@@ -1375,7 +1375,7 @@ esp_err_t power_measure_start(void)
  * @param calib 新标定参数，不可为 NULL
  * @return ESP_OK 成功；ESP_ERR_INVALID_ARG 参数非法
  */
-esp_err_t power_measure_set_calibration(const power_measure_calib_t *calib)
+esp_err_t power_measure_set_calibration_deferred(const power_measure_calib_t *calib)
 {
     if (calib == NULL || calib->voltage_gain <= 0.0f || calib->current_gain <= 0.0f) {
         return ESP_ERR_INVALID_ARG;
@@ -1384,10 +1384,39 @@ esp_err_t power_measure_set_calibration(const power_measure_calib_t *calib)
     xSemaphoreTake(s_calib_mutex, portMAX_DELAY);
     s_calib = *calib;
     xSemaphoreGive(s_calib_mutex);
-    save_persist(); /* save_persist 内部快照共享数据 + s_save_mutex 串行落盘 */
-    ESP_LOGI(TAG, "标定已更新并持久化（V gain=%.6e off=%.6f / I gain=%.6e off=%.6f）",
+
+    /* 【v0.6.0 卡死修复】只置"待落盘"标志，**不在调用者上下文写 NVS**。
+     * task_aux 的落盘节拍会看到该标志并立即执行一次 save_persist()
+     * （见 task_aux 的 `else if (atomic_exchange(&s_persist_dirty, false))` 分支），
+     * 失败时 save_persist 会把标志重新置位，不会丢改动。
+     * atomic_store：C11 原子写，跨核可见（本函数在 UI 核，落盘在 Core0/测量核协作）。 */
+    atomic_store(&s_persist_dirty, true);
+    ESP_LOGI(TAG, "标定已更新（内存即时生效，落盘由辅助任务异步完成）："
+                  "V gain=%.6e off=%.6f / I gain=%.6e off=%.6f",
              (double)calib->voltage_gain, (double)calib->voltage_offset,
              (double)calib->current_gain, (double)calib->current_offset);
+    return ESP_OK;
+}
+
+/**
+ * @brief 更新标定参数（立即生效，并同步持久化到 NVS）
+ *
+ * ⚠ 同步版本：会在**调用者上下文**里写 NVS（可达数百 ms）。UI 事件回调
+ * （持有 LVGL 锁）**不得**调用本函数，请改用 deferred 版本，否则界面会冻结。
+ * 保留本函数供非 UI 上下文（如命令行/自动化）使用。
+ *
+ * @param calib 新标定参数，不可为 NULL
+ * @return ESP_OK 成功；ESP_ERR_INVALID_ARG 参数非法
+ */
+esp_err_t power_measure_set_calibration(const power_measure_calib_t *calib)
+{
+    esp_err_t err = power_measure_set_calibration_deferred(calib);
+    if (err != ESP_OK) {
+        return err;
+    }
+    /* 调用方明确要求"立即落盘"：这里同步执行（消费掉刚置的 dirty 标志） */
+    (void)atomic_exchange(&s_persist_dirty, false);
+    save_persist(); /* save_persist 内部快照共享数据 + s_save_mutex 串行落盘 */
     return ESP_OK;
 }
 

@@ -469,8 +469,10 @@ static void apply_roller_selection(void)
         s_shrink_cnt_b = 0;
         s_hold_min_val = NAN; /* 极值锚点失效，重新锚定 */
         s_hold_max_val = NAN;
-        /* "确定"是离散动作（非拖动）：立即落盘，防马上断电丢失本次选择 */
-        (void)settings_save_now();
+        /* "确定"是离散动作（非拖动）：请求立即落盘，防马上断电丢失本次选择。
+         * 【v0.6.0 卡死修复】改用非阻塞 settings_request_save()：本回调在 LVGL
+         * 锁内运行，同步 settings_save_now() 会当场 nvs_commit 冻结整屏。 */
+        (void)settings_request_save();
     }
 }
 
@@ -1296,7 +1298,8 @@ static void smooth_switch_cb(lv_event_t *e)
     /* lv_obj_has_state：查询对象是否处于某状态（开关选中＝LV_STATE_CHECKED） */
     bool on = lv_obj_has_state(sw, LV_STATE_CHECKED);
     (void)settings_set_wave_smooth(on ? 1u : 0u);
-    (void)settings_save_now();
+    /* 【v0.6.0 卡死修复】非阻塞落盘（原 settings_save_now 会冻屏） */
+    (void)settings_request_save();
 }
 
 /**

@@ -47,6 +47,23 @@ esp_err_t power_measure_set_calibration(const power_measure_calib_t *calib)
     return ESP_OK;
 }
 
+/**
+ * @brief 异步版标定写入的模拟实现（v0.6.0 新增）
+ *
+ * 真机：只改内存 + 置"待落盘"标志，NVS 写入交给 task_aux（校准页的卡死修复）。
+ * 模拟器：没有 NVS，直接改内存并打日志，让校准页的"应用校准"流程可完整走查。
+ */
+esp_err_t power_measure_set_calibration_deferred(const power_measure_calib_t *calib)
+{
+    if (calib == NULL || calib->voltage_gain <= 0.0f || calib->current_gain <= 0.0f) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    s_calib = *calib;
+    ESP_LOGI(TAG, "标定已更新（模拟：内存即时生效，落盘异步）：V gain=%.6e / I gain=%.6e",
+             (double)calib->voltage_gain, (double)calib->current_gain);
+    return ESP_OK;
+}
+
 void power_measure_get_calibration(power_measure_calib_t *out)
 {
     if (out != NULL) {

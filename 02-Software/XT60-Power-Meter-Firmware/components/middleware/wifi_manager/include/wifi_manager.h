@@ -50,6 +50,19 @@ typedef enum {
 #define WIFI_MANAGER_AP_SSID_MAX_LEN 24
 
 /**
+ * @brief WiFi 工作模式偏好（v0.6.0 新增）
+ *
+ * 与 wifi_manager_state_t 的区别：state 是"当前实际在做什么"（实时状态），
+ * mode 是"用户希望设备怎么工作"（偏好设置，掉电保留）。二者配合使用——
+ * 例如偏好 STA 但尚未配网时，state 会是 FAILED（等配网），mode 仍是 STA。
+ */
+typedef enum {
+    WIFI_MANAGER_MODE_AUTO = 0, /**< 自动（默认）：有凭据走 STA，无凭据起配网热点 */
+    WIFI_MANAGER_MODE_STA,      /**< 仅 STA：不启动配网热点（无凭据时只等配网下发） */
+    WIFI_MANAGER_MODE_AP,       /**< 强制配网热点：即使已有凭据也不连接路由器 */
+} wifi_manager_mode_t;
+
+/**
  * @brief 启动 WiFi 管理（读取 NVS 凭据，按需进入 STA 或 AP 模式）
  *
  * 行为：
@@ -165,6 +178,16 @@ esp_err_t wifi_manager_get_ap_ssid(char *out, size_t out_len);
 esp_err_t wifi_manager_scan_start(void);
 
 /**
+ * @brief 查询是否正在扫描（v0.6.0 新增）
+ *
+ * esp_wifi 没有公开的"扫描是否进行中"接口，本组件按 scan_start()/
+ * SCAN_DONE 自行记账。配网 UI 用它轮询"扫完了没有"（扫完即可取列表）。
+ *
+ * @return true=扫描进行中
+ */
+bool wifi_manager_scan_is_running(void);
+
+/**
  * @brief 读取最近一次扫描到的热点列表（按信号强度降序，取前若干个）
  *
  * @param out 输出数组（元素为 wifi_ap_record_t），由调用方提供，不可为 NULL
@@ -174,3 +197,69 @@ esp_err_t wifi_manager_scan_start(void);
  *         ESP_ERR_INVALID_ARG 参数非法
  */
 esp_err_t wifi_manager_scan_get_ap_list(wifi_ap_record_t *out, uint16_t *inout_count);
+
+/**
+ * @brief 查询当前的 WiFi 工作模式偏好（v0.6.0 新增）
+ *
+ * @return 当前模式（读内存快照，非阻塞）
+ */
+wifi_manager_mode_t wifi_manager_get_mode(void);
+
+/**
+ * @brief 设置 WiFi 工作模式偏好（v0.6.0 新增，**非阻塞**）
+ *
+ * 行为：
+ *   · 立即更新内存快照（wifi_manager_get_mode 随后即返回新值）；
+ *   · 把"写 NVS + 切换 esp_wifi 模式"排给内部任务异步执行，
+ *     本函数写完队列即返回，**不等待结果**。
+ *
+ * 为什么设计成非阻塞：调用方是设备 UI 的模式按钮回调（LVGL 事件回调，
+ * 运行在持有 LVGL 锁的 UI 主循环里）。若像 connect()/forget() 那样等待
+ * 内部任务完成，界面会冻结（NVS 写 + esp_wifi_set_mode 可达数百 ms）。
+ *
+ * 切换语义：
+ *   · AUTO：有凭据 → 连路由器；无凭据 → 起配网热点；
+ *   · STA ：关闭配网热点（WIFI_MODE_STA），有凭据则连接；无凭据则只等
+ *           配网下发（此时设备不可通过热点访问，UI 会提示先配网）；
+ *   · AP  ：强制起配网热点（WIFI_MODE_APSTA），并断开当前 STA 连接。
+ *
+ * @param mode 目标模式
+ * @return ESP_OK 请求已受理；ESP_ERR_INVALID_ARG 模式非法；
+ *         ESP_ERR_INVALID_STATE 组件未启动；ESP_ERR_TIMEOUT 队列已满
+ */
+esp_err_t wifi_manager_set_mode(wifi_manager_mode_t mode);
+
+/**
+ * @brief 查询当前 STA 连接的路由器信号强度（v0.6.0 新增，供状态栏图标用）
+ *
+ * @param out_rssi 输出信号强度（dBm，负值；数值越接近 0 说明信号越强），不可为 NULL
+ * @return ESP_OK 成功
+ *         ESP_ERR_INVALID_ARG 参数非法
+ *         ESP_ERR_INVALID_STATE 组件未启动 / 当前未连接路由器（AP 模式或无凭据）
+ */
+esp_err_t wifi_manager_get_rssi(int8_t *out_rssi);
+
+/**
+ * @brief RSSI → 信号格数（1~4），v0.6.0 新增
+ *
+ * 分档写死在这里（而不是各 UI 各写一套），保证设备状态栏图标与
+ * WiFi 页列表里的信号条档位一致：
+ *   ≥ -60dBm → 4 格（优秀）；≥ -70 → 3 格（良好）；
+ *   ≥ -80 → 2 格（一般）；其余 → 1 格（弱）。
+ *
+ * @param rssi 信号强度（dBm）
+ * @return 1~4 格
+ */
+static inline int wifi_manager_rssi_level(int8_t rssi)
+{
+    if (rssi >= -60) {
+        return 4;
+    }
+    if (rssi >= -70) {
+        return 3;
+    }
+    if (rssi >= -80) {
+        return 2;
+    }
+    return 1;
+}

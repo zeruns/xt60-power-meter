@@ -53,6 +53,7 @@ add_executable(ui_sim
   src/mocks/mock_orientation.c
   src/mocks/mock_buzzer.c
   src/mocks/mock_power_measure.c
+  src/mocks/mock_wifi_manager.c # v0.6.0：WiFi 页与状态栏信号条依赖 wifi_manager
   # ↓ 与真机完全相同的界面源码（设置页/波形页/测量页/启动页/导航）
   "${UI_DIR}/ui_nav.c"
   "${UI_DIR}/screens/splash.c"
@@ -63,7 +64,7 @@ add_executable(ui_sim
 
 target_include_directories(ui_sim PRIVATE
   "${CMAKE_CURRENT_SOURCE_DIR}/include"     # 模拟器版 lvgl_port.h / lcd_nv3030b.h（覆盖真机同名头）
-  "${CMAKE_CURRENT_SOURCE_DIR}/src/stubs"   # esp_err.h / esp_log.h / esp_app_desc.h
+  "${CMAKE_CURRENT_SOURCE_DIR}/src/stubs"   # esp_err.h / esp_log.h / esp_app_desc.h / freertos（桩）
   "${CMAKE_CURRENT_SOURCE_DIR}/src"
   "${UI_DIR}" "${UI_DIR}/screens"
   "${ROOT_DIR}/components/services/ui/include"
@@ -73,6 +74,8 @@ target_include_directories(ui_sim PRIVATE
   "${ROOT_DIR}/components/drivers/buzzer/include"
   "${ROOT_DIR}/components/drivers/key_button/include"
   "${ROOT_DIR}/components/middleware/data_store/include"
+  # v0.6.0：WiFi 页（模式/扫描/RSSI/键盘配网）与状态栏信号条依赖它
+  "${ROOT_DIR}/components/middleware/wifi_manager/include"
 )
 
 target_compile_definitions(ui_sim PRIVATE

@@ -64,3 +64,13 @@ bool screen_settings_modal_is_open(void);
  * @return true=事件已消费（ui_nav 不再翻页/开菜单）；false=本页未接管
  */
 bool screen_settings_key(button_id_t id, button_event_t ev);
+
+/**
+ * @brief 当前打开的二级页名称（诊断用，v0.6.0 新增）
+ *
+ * 用途：app_tasks 的「渲染停滞」告警要把"卡在哪一页"一起打出来，
+ * 否则只看到 flush 零增长无法定位是哪个子页触发的冻结。
+ *
+ * @return 中文页名（"首页"/"测量设置"/"校准 · 电压"…）；未打开任何二级页时返回 "首页"
+ */
+const char *screen_settings_current_subpage_name(void);

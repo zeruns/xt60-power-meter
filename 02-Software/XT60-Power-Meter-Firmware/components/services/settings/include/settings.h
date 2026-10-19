@@ -167,6 +167,23 @@ esp_err_t settings_set_wave_smooth(uint8_t on);
 esp_err_t settings_save_now(void);
 
 /**
+ * @brief 请求立即落盘（**非阻塞**，v0.6.0 新增）
+ *
+ * 与 settings_save_now() 的区别只在于"谁来写 Flash"：
+ *   · settings_save_now() 在**调用者**上下文里直接写 NVS，可达数百 ms；
+ *   · 本函数只置脏标记 + 唤醒已有的防抖落盘任务（save_task），
+ *     写完即返回，**绝不在调用者上下文做 NVS 写入**。
+ *
+ * 用途：UI 的 LVGL 事件回调（UI 主循环整轮持有 LVGL 锁）里不能做 NVS 写，
+ * 否则整屏渲染被冻结数百 ms（表现为"UI 卡死、指示灯仍闪"）。这类场景
+ * （如离开告警设置页、校准应用）一律改用本函数。
+ *
+ * @return ESP_OK 请求已受理（真正落盘由后台任务完成）
+ *         ESP_ERR_INVALID_STATE 尚未初始化
+ */
+esp_err_t settings_request_save(void);
+
+/**
  * @brief 读取当前告警阈值配置（内存缓存）
  * @param out 输出，不可为 NULL
  * @return ESP_OK 成功；ESP_ERR_INVALID_STATE 尚未初始化

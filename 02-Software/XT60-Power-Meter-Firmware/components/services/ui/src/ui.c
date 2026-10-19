@@ -39,6 +39,7 @@
 
 #include "esp_log.h"
 #include "esp_timer.h"
+#include "esp_task_wdt.h" /* 看门狗：UI 任务订阅它以便卡死时能打印调用栈（v0.6.0） */
 
 #include "button.h"
 #include "data_store.h"
@@ -60,8 +61,11 @@ static const char *TAG = "ui";
 /* 组件不得依赖 main 层的 APP_CORE_UI 宏，此处本地定义 UI 任务核绑定 */
 #define UI_TASK_CORE 0
 #define UI_TASK_NAME "ui"
-/* 三页 + chart + msgbox 对象层级较多，栈比 demo 阶段加大 */
-#define UI_TASK_STACK_BYTES 12288 /**< UI 任务栈字节数（xTaskCreatePinnedToCore 以字节计） */
+/* 三页 + chart + msgbox + 设置二级页（含虚拟键盘/扫描列表）对象层级较多。
+ * 【v0.6.0】由 12288 提到 16384：与 taskLVGL 同步（项目实测 12KB 栈在
+ * 软件旋转 + 波形页渲染时余量不足 200B，设置子页构建也跑在本任务栈上，
+ * 余量过低会触发栈溢出保护而卡死界面）。 */
+#define UI_TASK_STACK_BYTES 16384 /**< UI 任务栈字节数（xTaskCreatePinnedToCore 以字节计） */
 #define UI_TASK_PRIORITY 12       /**< UI 任务优先级：高于空闲/日志任务，保证交互跟手 */
 
 #define UI_BUILD_LOCK_TIMEOUT_MS 5000 /**< 构建界面时获取 LVGL 锁的超时 */
@@ -516,7 +520,22 @@ static void task_ui(void *arg)
     last = xTaskGetTickCount();
     s_last_input_us = esp_timer_get_time(); /* 输入计时起点＝进主循环时刻（防开机即息屏） */
 
+    /* 【v0.6.0 卡死取证】把 UI 任务订阅到任务看门狗（TWDT）。
+     * 背景：UI 主循环整轮持有 LVGL 锁，若某个事件回调里出现阻塞（NVS 写、
+     * 等 WiFi 任务数秒），UI 任务会长时间不喂狗 → 看门狗超时（5s）时
+     * ESP-IDF 会打印**卡住任务名 + 调用栈回溯**，把"卡在哪一行"落到串口，
+     * 这比只看"渲染停滞"更精确。注意 CONFIG_ESP_TASK_WDT_PANIC 未开启，
+     * 所以只告警、不重启，不影响现场（可安心作为常驻诊断）。
+     * LVGL 任务（taskLVGL）由官方 esp_lvgl_port 创建、无法在其循环里喂狗，
+     * 故不订阅它——改用 app_tasks 的 flush 增量检测（见 app_tasks.c）。 */
+    if (esp_task_wdt_add(NULL) != ESP_OK) {
+        ESP_LOGW(TAG, "UI 任务加入看门狗失败（不影响功能，仅少一项诊断）");
+    }
+
     for (;;) {
+        /* 喂狗：本轮循环已跑完（若某回调阻塞过久，这里就喂不上 → 触发告警） */
+        (void)esp_task_wdt_reset();
+
         /* UI 任务心跳：每轮更新，供 app_task 判断 UI 任务是否也停摆 */
         s_ui_loop_us = esp_timer_get_time(); /* 取系统启动以来的微秒时间戳（64 位单调时钟） */
         s_ui_loop_count++;
