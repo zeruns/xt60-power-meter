@@ -1,0 +1,88 @@
+# XT60 功率计固件 CI（仓库镜像到 GitHub 时直接可用）
+#
+# 说明：
+#   · 主机单元测试（test/host/run_host_tests.ps1）与 UI 模拟器回归（tools/ui_sim/build.ps1）
+#     依赖 Windows（PowerShell + MSVC），Linux CI 无法执行，跳过并在 Job Summary 中说明，
+#     完整回归请在本机运行 tools/ci/run_ci.ps1。
+#   · 构建依赖 ESP 组件管理器联网下载 managed_components/（版本由 dependencies.lock 锁定）。
+
+name: CI
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  host-tests:
+    name: 主机单元测试（gcc，Linux）
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v4
+
+      # 三个纯 C 测试套件（无平台依赖，与 test/host/run_host_tests.ps1 同源同参）
+      - name: 编译并运行主机单测
+        shell: bash
+        run: |
+          set -e
+          echo "::group::power_calc"
+          gcc -std=c11 -Wall -Wextra -I components/services/power_measure/include \
+            test/host/test_power_calc.c \
+            components/services/power_measure/src/power_calc.c -o /tmp/test_power_calc
+          /tmp/test_power_calc
+          echo "::endgroup::"
+          echo "::group::button_fsm"
+          gcc -std=c11 -Wall -Wextra -I components/drivers/key_button/include \
+            test/host/test_button_fsm.c \
+            components/drivers/key_button/src/button_fsm.c -o /tmp/test_button_fsm
+          /tmp/test_button_fsm
+          echo "::endgroup::"
+          echo "::group::aht20_calc"
+          gcc -std=c11 -Wall -Wextra -I components/drivers/aht20/include \
+            test/host/test_aht20_calc.c \
+            components/drivers/aht20/src/aht20_calc.c -o /tmp/test_aht20_calc
+          /tmp/test_aht20_calc
+          echo "::endgroup::"
+
+  build:
+    name: idf.py build（ESP-IDF v6.1）
+    runs-on: ubuntu-latest
+    container: espressif/idf:v6.1
+
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v4
+
+      - name: 构建固件（idf.py build）
+        shell: bash
+        run: |
+          # 加载容器内的 ESP-IDF 环境
+          . ${IDF_PATH}/export.sh
+
+          echo "::group::idf.py build"
+          if ! idf.py build; then
+            echo "::error::构建失败。若日志中出现组件下载/网络错误，请检查：\
+          1) 依赖是否已由 ESP 组件管理器拉取到 managed_components/（需联网，版本锁定在 dependencies.lock）；\
+          2) 公司网络受限时可配置组件镜像源（设置环境变量 IDF_COMPONENT_MANAGER 或使用代理后重试）；\
+          3) 本地复现请运行 tools/ci/run_ci.ps1。"
+            exit 1
+          fi
+          echo "::endgroup::"
+
+      - name: 写 Job Summary（说明 Windows 专属检查项已跳过）
+        if: always()
+        shell: bash
+        run: |
+          {
+            echo "## CI 结果"
+            echo ""
+            echo "- \`idf.py build\`：见上方步骤状态（ESP-IDF v6.1 容器）。"
+            echo "- \`主机单元测试\`：独立 job 在 Linux gcc 下执行（与本机 run_host_tests.ps1 同源）。"
+            echo "- **已跳过（仅 Windows 可运行）**："
+            echo "  - UI 模拟器回归 \`tools/ui_sim/build.ps1\`（需 MSVC + CMake/Ninja），"
+            echo "    UI 改动请在本机跑完并确认 \`[scene] !!\` 告警为 0 后再提交。"
+            echo "- 本地一键回归入口：\`tools/ci/run_ci.ps1\`（构建 + 主机单测 + UI 回归）。"
+          } >> "$GITHUB_STEP_SUMMARY"

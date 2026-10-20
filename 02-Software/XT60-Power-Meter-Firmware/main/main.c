@@ -1,13 +1,20 @@
 /**
  * @file main.c
- * @brief 应用入口：只做初始化编排与启动顺序控制，不承载业务逻辑
+ * @brief 应用入口：只负责"编排启动顺序"，不写任何业务逻辑
  *
- * 启动顺序（每一步失败都会通过 ESP_ERROR_CHECK 中止并复位）：
- *   板级初始化 → 指示灯/状态机 → 外设与服务 → 创建任务 → 进入正常运行态
+ * 这是一个刻意保持很薄的文件。ESP-IDF 规定 app_main() 是固件的入口，
+ * 如果在这里堆业务代码，很快会变成没人敢动的巨型函数。
+ * 因此这里只做三件事：
+ *   ① 调用 app_init_startup() 完成初始化（细节见 app_init.c）；
+ *   ② 创建各应用任务（细节见 app_tasks.c）；
+ *   ③ 记录启动结果。
+ *
+ * 特别说明：本工程刻意不使用 ESP_ERROR_CHECK。
+ * 原因见 app_init.c 文件头——那会导致"某个外设坏掉 →
+ * 不断复位 → 设备变砖"。这里遇到故障只是记录并降级运行。
  */
+#include "app_init.h"
 #include "app_tasks.h"
-#include "board.h"
-#include "status_led.h"
 #include "system_state.h"
 
 #include "esp_log.h"
@@ -17,32 +24,31 @@ static const char *TAG = "main";
 
 void app_main(void)
 {
-    /* 1. 板级初始化：必须最先执行，后续驱动都依赖它提供的引脚与总线环境 */
-    ESP_ERROR_CHECK(board_init());
+    /* ---------- ① 系统初始化（含分级容错） ---------- */
+    esp_err_t err = app_init_startup();
+    if (err != ESP_OK) {
+        /* 走到这里说明有关键模块（如测量前端）初始化失败。
+         * 不做复位，而是让设备停在异常状态：
+         *   · 指示灯快闪 5Hz，现场一眼可辨；
+         *   · 串口有完整日志；
+         *   · 后续接入 WiFi 后仍可通过网页升级固件救回。 */
+        char fault_text[96];
+        system_state_fault_to_str(system_state_get_fault_mask(), fault_text, sizeof(fault_text));
+        ESP_LOGE(TAG, "启动未完成：存在致命故障（%s），系统保持异常状态等待处理", fault_text);
+    }
 
-    /* 2. 状态指示灯与状态机：进入 INIT 状态（指示灯常亮，表示正在启动）
-     *    注意顺序——指示灯必须先于状态机初始化，因为状态迁移会调用它 */
-    ESP_ERROR_CHECK(status_led_init());
-    ESP_ERROR_CHECK(system_state_init());
+    /* ---------- ② 创建应用任务 ---------- */
+    err = app_tasks_start();
+    if (err != ESP_OK) {
+        /* 任务都建不起来通常是内存不足，属于系统级严重问题，
+         * 登记为 INFRA 故障（该位在关键掩码中，会把状态推到 FAULT），
+         * 以便在指示灯与日志中明确体现。同样不使用 abort()，理由同上。 */
+        ESP_LOGE(TAG, "创建应用任务失败: %s", esp_err_to_name(err));
+        system_state_report_fault(SYSTEM_FAULT_INFRA);
+    }
 
-    /* 3. 外设与服务初始化在此依次加入（每接入一个模块补一行）：
-     *      button_init()            -> components/drivers/button
-     *      battery_adc_init()       -> components/drivers/battery_adc
-     *      aht20_init()             -> components/drivers/aht20
-     *      imu_sc7a20h_init()       -> components/drivers/imu_sc7a20h
-     *      ads131m02_init()         -> components/drivers/ads131m02
-     *      lcd_nv3030b_init()       -> components/drivers/lcd_nv3030b
-     *      touch_cst816d_init()     -> components/drivers/touch_cst816d
-     *      lvgl_port_init()         -> components/middleware/lvgl_port
-     *      wifi_manager_start()     -> components/middleware/wifi_manager
-     *    接入后建议改为「失败则 system_state_set(SYSTEM_STATE_FAULT)」而非直接中止，
-     *    以便在异常状态下仍能通过状态灯快闪提示故障。 */
-
-    /* 4. 创建应用任务（含双核亲和性绑定，见 app_tasks.h） */
-    ESP_ERROR_CHECK(app_tasks_start());
-
-    /* 5. 全部就绪，进入正常运行状态（指示灯转为 1 Hz 慢闪） */
-    ESP_ERROR_CHECK(system_state_set(SYSTEM_STATE_RUNNING));
-
-    ESP_LOGI(TAG, "启动完成");
+    /* ---------- ③ 退出 app_main ----------
+     * app_main 返回后，它的任务会被删除，但 FreeRTOS 调度器继续运行，
+     * 我们创建的任务会照常工作。这是 ESP-IDF 的正常用法。 */
+    ESP_LOGI(TAG, "app_main 结束，系统交由 FreeRTOS 调度");
 }

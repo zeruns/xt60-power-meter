@@ -6,6 +6,8 @@
  */
 #include "board.h"
 
+#include "board_pins.h"
+
 #include "esp_chip_info.h"
 #include "esp_idf_version.h"
 #include "esp_log.h"
@@ -15,6 +17,13 @@ static const char *TAG = "board";
 
 #define BOARD_NAME "XT60 Power Meter"    /**< 板卡名称 */
 #define BOARD_REV  "上板 V2 / 下板 V1.0" /**< 板卡版本（以原理图版本为准） */
+
+/* 传感器 I2C 总线参数（AHT20 + SC7A20H 共享，见 board_pins.h） */
+#define BOARD_SENSOR_I2C_PORT     I2C_NUM_1
+#define BOARD_SENSOR_I2C_FREQ_HZ  100000 /* 100kHz，两类传感器都足够 */
+
+/** 传感器 I2C 总线句柄（create-or-get，见 board_i2c_sensor_bus_get） */
+static i2c_master_bus_handle_t s_sensor_bus = NULL;
 
 /**
  * @brief 板级初始化
@@ -36,5 +45,40 @@ esp_err_t board_init(void)
     ESP_LOGI(TAG, "MCU: ESP32-S3 rev v%d.%d, %d core(s), ESP-IDF %s", chip.revision / 100,
              chip.revision % 100, chip.cores, esp_get_idf_version());
 
+    return ESP_OK;
+}
+
+esp_err_t board_i2c_sensor_bus_get(i2c_master_bus_handle_t *out)
+{
+    if (out == NULL) {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    /* 已创建过：直接复用同一句柄，保证多器件共享同一总线控制器 */
+    if (s_sensor_bus != NULL) {
+        *out = s_sensor_bus;
+        return ESP_OK;
+    }
+
+    const i2c_master_bus_config_t bus_cfg = {
+        .i2c_port = BOARD_SENSOR_I2C_PORT,
+        .sda_io_num = BOARD_PIN_I2C_SDA,
+        .scl_io_num = BOARD_PIN_I2C_SCL,
+        .clk_source = I2C_CLK_SRC_DEFAULT,
+        .glitch_ignore_cnt = 7,
+        .flags.enable_internal_pullup = true, /* 板上已有 2.2k 上拉，内部上拉兜底 */
+    };
+
+    esp_err_t err = i2c_new_master_bus(&bus_cfg, &s_sensor_bus);
+    if (err != ESP_OK) {
+        s_sensor_bus = NULL;
+        ESP_LOGE(TAG, "传感器 I2C 总线创建失败: %s", esp_err_to_name(err));
+        return err;
+    }
+
+    ESP_LOGI(TAG, "传感器 I2C 总线就绪（I2C%d，SCL=IO%d SDA=IO%d）", BOARD_SENSOR_I2C_PORT,
+             BOARD_PIN_I2C_SCL, BOARD_PIN_I2C_SDA);
+
+    *out = s_sensor_bus;
     return ESP_OK;
 }

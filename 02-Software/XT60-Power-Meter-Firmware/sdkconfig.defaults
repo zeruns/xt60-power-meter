@@ -1,31 +1,248 @@
 # XT60 功率计固件——版本化默认配置
-# 注意：sdkconfig 本身不纳入版本管理，本文件是全新克隆时的配置基线。
-#       修改后需删除 sdkconfig 重新生成，或使用 idf.py reconfigure 生效。
+#
+# 重要：sdkconfig 本身不纳入版本管理（见 .gitignore），
+#       本文件才是"全新克隆后应该得到什么配置"的唯一依据。
+#
+# 如何生效（修改本文件后必须重新生成 sdkconfig）：
+#   idf.py fullclean && rm sdkconfig && idf.py build
+#   或（只改配置不改代码时）删除 sdkconfig 后执行 idf.py reconfigure
 
-# ---------- 目标芯片 ----------
+# ============================================================
+# 目标芯片与模组
+# ============================================================
 CONFIG_IDF_TARGET="esp32s3"
 
-# ---------- 双核 ----------
+# 模组型号：ESP32-S3-WROOM-1-N16R8
+#   N16 → 16MB Flash（四线 QIO/DIO，非八线）
+#   R8  → 8MB PSRAM（八线 Octal，占用 GPIO33~37）
+# IDF 没有"模组型号"这个总开关，需由下面几项分别配置。
+
+# ---------------- Flash（N16 = 16MB，四线） ----------------
+# 烧录波特率说明：
+#   esptool 烧录波特率**不由 Kconfig 控制**（idf.py 没有 CONFIG_ESPTOOLPY_BAUD_*），
+#   而是由环境变量 ESPBAUD 决定。本工程约定 ESPBAUD=921600（ESP32-S3 + 16MB
+#   Flash 实测可稳定；esptool 会先低波特率握手再切到目标值）。
+#   用法：$env:ESPBAUD="921600" ; idf.py flash
+#   若个别烧录器不稳，改 460800 或 115200 再试。
+CONFIG_ESPTOOLPY_FLASHSIZE_16MB=y
+# N16R8 的 Flash 是四线器件，因此八线 Flash 选项必须关闭。
+# （若误开 OCT_FLASH，IDF 会把 Flash 切到 OPI 八线模式去访问四线器件，直接无法启动）
+# CONFIG_ESPTOOLPY_OCT_FLASH is not set
+# 使用 QIO（四线）而不是 DIO（双线）：读带宽翻倍
+# （80MHz 下 QIO ≈ 320Mbit/s，DIO ≈ 160Mbit/s），代码取指与 PSRAM 缓存
+# 未命中时的 Flash 访问都受益。
+#
+# 关于"QIO 会不会和八线 PSRAM 冲突"——不会，原因有两点：
+#   ① IDF 的约束是 QIO 仅与「八线 Flash（OCT_FLASH）」互斥，
+#      与「八线 PSRAM」无关（见 components/esptool_py/Kconfig.projbuild
+#      中 ESPTOOLPY_FLASHMODE_QIO 的 depends on !ESPTOOLPY_OCT_FLASH）；
+#   ② Flash 与 PSRAM 挂在同一组 SPI0 总线上，靠片选（CS0/CS1）分时复用
+#      数据线 D0~D3；八线 PSRAM 额外增加的 D4~D7 与 DQS 走 IO33~IO37，
+#      与 Flash 的引脚不重叠。
+# 注意：即使选了 QIO，esptool 烧录时仍以 DIO 写入 bootloader，
+#       由 bootloader 在启动初始化阶段自行升级到四线模式（IDF 的既定行为）。
+CONFIG_ESPTOOLPY_FLASHMODE_QIO=y
+CONFIG_ESPTOOLPY_FLASHFREQ_80M=y
+
+# ---------------- PSRAM（R8 = 8MB 八线） ----------------
+CONFIG_SPIRAM=y
+CONFIG_SPIRAM_MODE_OCT=y
+CONFIG_SPIRAM_TYPE_AUTO=y
+CONFIG_SPIRAM_SPEED_80M=y
+CONFIG_SPIRAM_BOOT_INIT=y
+# 开机做一次 PSRAM 内存自检：耗时很短，但能及早发现焊接不良的模组，
+# 对量产与售后排查很有价值。
+CONFIG_SPIRAM_MEMTEST=y
+CONFIG_SPIRAM_USE_MALLOC=y
+# 小于该值的分配才强制内部 RAM；设 0 = 不按大小强制，malloc 先内部、
+# 内部不足自动溢出到 PSRAM（分配永不因该阈值失败）。
+# 演进史（三次实测调整，每档都有真实的上板故障背书）：
+#   16KB/8KB/1KB → 752B WiFi beacon 缓冲被强制推入内部 RAM →
+#     「alloc eb len=752 type=4 fail」+ WiFi 驱动任务 NULL 解引用崩溃；
+#   512 → v0.6.0 后 LVGL（clib malloc）高频小分配（建对象/每秒数十次
+#     label set_text 的 strdup）+ WS 10Hz 每客户端 350B 发送缓冲全部
+#     挤在仅剩 ~19KB 的内部 RAM，碎片化后耗尽 → lv_malloc 得到 NULL →
+#     渲染/布局解引用崩溃 abort 复位（v0.6.0 实测「设置页概率卡死、
+#     卡几秒自动复位」的根因）→ 设 0，小分配允许溢出到 PSRAM。
+# WiFi beacon 池不受影响：它由驱动显式按能力分配，不走普通 malloc。
+CONFIG_SPIRAM_MALLOC_ALWAYSINTERNAL=0
+# 预留 8KB 内部 RAM 专供"必须从内部 RAM 分配"的场景（DMA 描述符等）
+# （32KB→16KB→8KB：WiFi 内存实测调优；大任务栈已移 PSRAM，预留可收窄）
+CONFIG_SPIRAM_MALLOC_RESERVE_INTERNAL=8192
+# 把 WiFi 与 LWIP 的收发缓冲放到 PSRAM：
+# WiFi 缓冲占用很大（数十 KB），放内部 RAM 会挤占采样与 DMA 所需空间。
+CONFIG_SPIRAM_TRY_ALLOCATE_WIFI_LWIP=y
+# 允许把任务栈分配到 PSRAM（IDF 默认行为，保留）。
+# 注意配置项名称：ESP-IDF v5.5 起已由 SPIRAM_ALLOW_STACK_EXTERNAL_MEMORY
+# 更名为 FREERTOS_TASK_CREATE_ALLOW_EXT_MEM，写旧名会得到
+# "was replaced with ..." 警告（旧名仍作为兼容别名保留）。
+# ⚠ 重要约束：中断服务程序（ISR）运行在当前任务的栈上，而 ISR 期间
+#   不能访问 PSRAM（cache 未命中会异常）。因此凡是"可能被中断打断时
+#   正在使用"的任务（如测量采样任务），其栈必须在内部 RAM，
+#   创建时不要传 MALLOC_CAP_SPIRAM。
+CONFIG_FREERTOS_TASK_CREATE_ALLOW_EXT_MEM=y
+
+# ============================================================
+# 性能
+# ============================================================
+# 主频 240MHz（ESP32-S3 最高）。测量运算、LVGL 渲染、WiFi 都受益。
+CONFIG_ESP_DEFAULT_CPU_FREQ_MHZ_240=y
+
+# 缓存：32KB 指令缓存 + 64KB 数据缓存（ESP32-S3 的推荐配置）
+# 说明：先前的配置被降为 16KB/32KB，会明显拖慢代码执行与 PSRAM 访问；
+#       代价是占用更多内部 SRAM，但本工程内存预算充足（外部还有 8MB PSRAM）。
+CONFIG_ESP32S3_INSTRUCTION_CACHE_32KB=y
+CONFIG_ESP32S3_DATA_CACHE_64KB=y
+
+# 编译优化 -O2（性能优先）。
+# 默认的 -Og（调试优先）会让浮点运算与 LVGL 渲染慢很多；
+# 本项目是测量仪器，性能优先。若要单步调试汇编级代码可临时改回。
+CONFIG_COMPILER_OPTIMIZATION_PERF=y
+# 保留断言：能在开发阶段尽早暴露非法参数等问题，代价可接受
+CONFIG_COMPILER_OPTIMIZATION_ASSERTIONS_ENABLE=y
+
+# ============================================================
+# FreeRTOS 与系统节拍
+# ============================================================
 CONFIG_FREERTOS_UNICORE=n
-# 1 kHz 节拍，满足测量核 1 ms 采样周期
+# 1kHz 节拍（1 tick = 1ms）：供显示/逻辑定时；采样节奏由 DRDY# 硬件中断自驱动
+#（4kHz，250µs/样本），不依赖节拍精度。
+# 代码中统一使用 pdMS_TO_TICKS()，因此改这里不会破坏延时逻辑。
 CONFIG_FREERTOS_HZ=1000
 
-# ---------- 控制台 / 日志 ----------
-# 控制台走 USB-Serial/JTAG，与烧录共用同一串口
+# ============================================================
+# 控制台 / 日志
+# ============================================================
+# 控制台走 USB-Serial/JTAG：烧录与看日志共用同一根 USB 线，无需额外串口模块。
 CONFIG_ESP_CONSOLE_UART_DEFAULT=n
 CONFIG_ESP_CONSOLE_USB_SERIAL_JTAG=y
 CONFIG_LOG_DEFAULT_LEVEL_INFO=y
 
-# ---------- 八线 PSRAM（N16R8 模组） ----------
-CONFIG_SPIRAM=y
-CONFIG_SPIRAM_MODE_OCT=y
-CONFIG_SPIRAM_SPEED_80M=y
+# 注意：请勿开启 nano 格式化（新版配置项名已加 LIBC_ 前缀）。
+# nano 格式化不支持 %f，会导致日志里的浮点测量值打印为空或乱码。
+# CONFIG_LIBC_NEWLIB_NANO_FORMAT is not set
 
-# ---------- Flash 与分区表 ----------
-CONFIG_ESPTOOLPY_FLASHSIZE_16MB=y
+# ============================================================
+# 分区表与崩溃取证
+# ============================================================
+# 使用工程根目录的 partitions.csv（双 4MB OTA + 64KB coredump + 8MB storage）。
+# 默认的 two_ota 方案应用区只有 1MB，接入 LVGL 与 WiFi 后必然不够用。
 CONFIG_PARTITION_TABLE_CUSTOM=y
 CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="partitions.csv"
 
-# ---------- 任务与核绑定 ----------
-# WiFi 任务钉在 Core 0（与 UI / 交互同核），Core 1 留给 ADS131M02 采样
+# 把崩溃现场写入 Flash 的 coredump 分区。
+# 野外设备不会有人守着串口，没有它就无法定位偶发崩溃。
+# 注意：V6.1 中数据格式（ELF）与校验算法（SHA256）已改为由
+# ESP_COREDUMP_ENABLE 自动 select，不再是用户可设置项；
+# 此处若仍写 ESP_COREDUMP_DATA_FORMAT_ELF / ESP_COREDUMP_CHECKSUM_CRC32
+# 会被报为 unknown kconfig symbol（旧名 CRC32 亦已被 SHA256 取代）。
+CONFIG_ESP_COREDUMP_ENABLE_TO_FLASH=y
+# panic 后延迟 3 秒再复位：留出时间把完整日志打到串口（默认 0 秒会来不及打完）
+CONFIG_ESP_SYSTEM_PANIC_PRINT_REBOOT=y
+CONFIG_ESP_SYSTEM_PANIC_REBOOT_DELAY_SECONDS=3
+
+# 电源跌落检测：电池供电 + 大电流负载场景下很必要，
+# 能在电压跌落导致 RAM 数据错乱之前先复位，避免"跑飞"。
+# 注意配置项名：v5.5 起通用化为 ESP_BROWNOUT_DET（不再带芯片前缀）。
+CONFIG_ESP_BROWNOUT_DET=y
+
+# ============================================================
+# LVGL 图形库（组件 lvgl/lvgl，由 ESP 组件管理器托管，见 dependencies.lock）
+# ============================================================
+# 颜色深度 16bit（RGB565）：与面板驱动的像素格式一致
+CONFIG_LV_COLOR_DEPTH_16=y
+# **像素字节序必须用 Big-endian（RGB565_SWAPPED）**：
+#   面板 QSPI 线上要求每像素「高字节在前」（厂商 STM32 例程 Lcd_ColorBox
+#   即先发 Color>>8 再发 Color）。LVGL 渲染缓冲按小端组织，直接发会整屏
+#   偏色/列错位。用 SWAPPED 后 LVGL 直接渲染成线上所需字节序，
+#   既不用软件逐像素交换、性能也更好。
+#   对应 LVGL 9 的 lv_display_set_color_format(LV_COLOR_FORMAT_RGB565_SWAPPED)。
+CONFIG_LV_COLOR_FORMAT_RGB565_SWAPPED=y
+# 正式测量界面已上线，不再编译官方 widgets demo
+# CONFIG_LV_USE_DEMO_WIDGETS is not set
+# 关闭 FPS/CPU 性能监视器（台阶1 验收已完成，恢复无角标的干净界面）
+# CONFIG_LV_USE_SYSMON is not set
+# 中文字体方案：tiny_ttf，字体文件放 SPIFFS（storage 分区，挂载于 /spiffs）
+#   字体由 tools/fonts/make_fonts.py 生成（Noto Sans SC Regular/Bold，
+#   GB2312 一级字库子集，OFL 授权），构建时打入 SPIFFS 镜像随固件烧入，
+#   不占 app 程序分区空间。lvgl_port_init 时用标准 fopen 把两个 TTF 整读入
+#   PSRAM（约 2.2MB），之后渲染走内存，运行期对 flash 零访问（避免渲染中
+#   读 SPIFFS 与 flash 擦除/LCD DMA 交错引发的 cache 故障）。
+#   文件缺失时 lvgl_port 回退内置 montserrat14（仅 ASCII）。
+#   tiny_ttf 运行时只使用内存接口 lv_tiny_ttf_create_data，不需要文件支持。
+CONFIG_LV_USE_TINY_TTF=y
+# CONFIG_LV_TINY_TTF_FILE_SUPPORT is not set
+# ⚠ 字形缓存条数（每字体的槽位结构 + 位图）：64 → 32。
+#   14 个字体实例时缓存结构本身就要几十 KB；32 条配合 LRU 驱逐足够覆盖
+#   单页可见字形（每页常用字形约 20 个），代价仅为少量重光栅化。
+CONFIG_LV_TINY_TTF_CACHE_GLYPH_CNT=32
+CONFIG_LV_TINY_TTF_CACHE_KERNING_CNT=16
+# LVGL 内存池大小（lv_malloc 的堆）。
+# ⚠ 符号名注意：LVGL 9.6 已废弃 LV_MEM_SIZE_KILOBYTES（KB），改为
+#   LV_MEM_SIZE（字节，默认 65536）。写旧名会得到「DEPRECATED」且不生效。
+# 正式界面（tileview + chart + 三级对象）与此前 demo 实测同档，保持 128KB。
+# 该内存池是静态数组，占用内部 RAM（S3 有 512KB，可承受）。
+CONFIG_LV_MEM_SIZE=131072
+# 内存分配器：改用系统堆（malloc/free）而非内建池。
+# 实机 coredump 定位：内建池被"字形缓存 + 二级页对象"逐步耗尽，
+# 渲染新字形时 stb_truetype 临时缓冲分配失败（stbtt__new_active 断言）→ panic 复位。
+# 系统堆下：分配先内部 RAM、不足自动溢出 PSRAM（ALWAYSINTERNAL=0，见上文），
+# 彻底解除 128KB 上限；渲染结果与内建池完全一致。
+# ⚠ 内部 RAM 余量必须盯紧：LVGL 对象生命周期短、分配频率高，配合
+#   RESERVE_INTERNAL=8KB 保底，实测稳态内部空闲 19KB+ 时不枯竭。
+# ⚠ Kconfig 是 choice：必须同时翻"成员行"，只改序号会被 Kconfig 按成员覆盖回
+#   BUILTIN（本工程踩过：序号改了、成员没改 → 配置静默回退）。
+CONFIG_LV_USE_CLIB_MALLOC=y
+CONFIG_LV_USE_STDLIB_MALLOC=1
+
+# ============================================================
+# 任务与网络资源（为 WiFi + 网页控制台预留）
+# ============================================================
+# WiFi 任务钉在 Core 0：与本工程"Core 0 = 交互与通信、Core 1 = 测量"
+# 的划分一致，因此保持默认即可，无需修改。
 CONFIG_ESP_WIFI_TASK_PINNED_TO_CORE_0=y
+# 系统事件任务默认栈 2304 字节，处理 WiFi 事件偏紧，加大到 4096
+CONFIG_ESP_SYSTEM_EVENT_TASK_STACK_SIZE=4096
+# 网页控制台需要 HTTP 服务端 + WebSocket 同时占用多个 socket，
+# 默认 10 个偏少，加大到 16
+CONFIG_LWIP_MAX_SOCKETS=16
+# 开启 httpd WebSocket 支持（web_console /ws 实时推送；关闭时页面退化为轮询）
+CONFIG_HTTPD_WS_SUPPORT=y
+# WiFi 静态收发缓冲按低吞吐场景调小（v0.5.0 上板实测修复）：
+# 默认 RX16+TX16 个 ×1.6KB≈51KB，而 SPIRAM_MALLOC_ALWAYSINTERNAL=16384
+# 会把 1.6KB 级小分配全部判入内部 RAM → esf_buf alloc eb fail（WiFi 起不来）。
+# 本设备仅 Web 5Hz 推送 + CSV 导出，RX/TX 调小足够；同时显式约束
+# BA_WIN 一致性（esp_wifi 编译期校验：BA_WIN ≤ DYNAMIC_RX 且 ≤ 2×STATIC_RX）。
+CONFIG_ESP_WIFI_STATIC_RX_BUFFER_NUM=2
+CONFIG_ESP_WIFI_STATIC_TX_BUFFER_NUM=4
+CONFIG_ESP_WIFI_DYNAMIC_RX_BUFFER_NUM=12
+CONFIG_ESP_WIFI_CACHE_TX_BUFFER_NUM=8
+CONFIG_ESP_WIFI_AMPDU_RX_ENABLED=y
+CONFIG_ESP_WIFI_RX_BA_WIN=2
+# 管理帧短缓冲默认 32 个偏多（Kconfig range 6~32，取下限 6）
+CONFIG_ESP_WIFI_MGMT_SBUF_NUM=6
+
+# ============================================================
+# OTA 回滚（v0.5.0，ota_update 组件的 A/B 安全语义依赖）
+# ============================================================
+# 新固件首次启动进入 PENDING_VERIFY 待验证态：bootloader 不再自动确认，
+# 由应用启动自检通过后 esp_ota_mark_app_valid_cancel_rollback 确认；
+# 自检失败（或看门狗复位）则 bootloader 自动回滚到上一分区——
+# 没有此项时 ota_update_rollback_if_pending() 退化为空操作（无回滚保护）。
+CONFIG_BOOTLOADER_APP_ROLLBACK_ENABLE=y
+
+# ============================================================
+# Flash 擦除窗口与中断安全（必须）
+# ============================================================
+# NVS 定时落盘（电能/运行时间）会擦除 Flash，期间两条 CPU 的 cache 短暂关闭；
+# 此时 ADS131M02 的 DRDY# 仍以 4kHz 产生 GPIO 下降沿中断。GPIO ISR 派发服务
+# 默认链接在 Flash 中，若在 cache 关闭窗口被挂起触发会引发 Cache error 崩溃。
+# 把 GPIO 控制/中断函数放 IRAM 后，任意 Flash 擦除期间 GPIO 中断均安全。
+# 注意：V6.1 已把该选项由 GPIO_ISR_IRAM_SAFE 更名为 GPIO_CTRL_FUNC_IN_IRAM，
+# 沿用旧名会被报为 unknown kconfig symbol 并静默失效（等于失去本保护）。
+CONFIG_GPIO_CTRL_FUNC_IN_IRAM=y
+# DRDY ISR 内调用 esp_timer_get_time()（δ 延迟统计，ads131m02_engine.c）。
+# 该函数的 IRAM 属性随 CONFIG_ESP_TIMER_IN_IRAM 条件编译
+# （IDF esp_timer_impl.h 的 ESP_TIMER_IRAM_ATTR 宏），不开此项时它留在 Flash，
+# cache 关闭窗口被 DRDY 中断命中即 Cache error 崩溃。
+CONFIG_ESP_TIMER_IN_IRAM=y

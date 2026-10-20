@@ -1,0 +1,708 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>XT60 功率计固件 · 产品需求与分步实施计划（PRD）</title>
+<style>
+  :root{
+    --ink:#1a2332; --ink-2:#3d4c63; --ink-3:#6b7a90;
+    --bg:#f7f8fa; --paper:#ffffff; --line:#e3e8ef;
+    --accent:#0f62fe; --accent-soft:#e8f0fe;
+    --ok:#12805c; --ok-soft:#e3f4ee;
+    --warn:#b25700; --warn-soft:#fdf0e0;
+    --risk:#c0362c; --risk-soft:#fbe9e7;
+    --tag-radius:4px;
+  }
+  *{box-sizing:border-box; margin:0; padding:0;}
+  html{scroll-behavior:smooth;}
+  body{
+    font-family:"Microsoft YaHei","PingFang SC","Noto Sans SC",sans-serif;
+    background:var(--bg); color:var(--ink); line-height:1.75; font-size:15px;
+  }
+  .wrap{max-width:960px; margin:0 auto; padding:0 28px 96px;}
+  header.hero{
+    background:linear-gradient(135deg,#16263f 0%,#1f3a5f 60%,#274b73 100%);
+    color:#fff; padding:56px 0 44px;
+  }
+  header.hero .wrap{padding-bottom:0;}
+  .kicker{font-size:12.5px; letter-spacing:.18em; text-transform:uppercase; color:#9db8d8; margin-bottom:14px;}
+  h1{font-size:30px; line-height:1.35; font-weight:700; margin-bottom:14px;}
+  .subtitle{font-size:16px; color:#c6d6ea; max-width:720px;}
+  .meta-chips{display:flex; flex-wrap:wrap; gap:10px; margin-top:26px;}
+  .chip{
+    background:rgba(255,255,255,.12); border:1px solid rgba(255,255,255,.22);
+    border-radius:999px; padding:5px 14px; font-size:12.5px; color:#dce8f5;
+  }
+  nav.toc{
+    background:var(--paper); border:1px solid var(--line); border-radius:12px;
+    padding:22px 26px; margin:-30px 0 40px; position:relative;
+    box-shadow:0 10px 30px rgba(22,38,63,.08);
+  }
+  nav.toc h2{font-size:13px; letter-spacing:.12em; color:var(--ink-3); margin-bottom:12px;}
+  nav.toc ol{list-style:none; display:grid; grid-template-columns:1fr 1fr; gap:6px 28px;}
+  nav.toc a{color:var(--ink-2); text-decoration:none; font-size:13.5px;}
+  nav.toc a:hover{color:var(--accent);}
+  nav.toc .n{color:var(--accent); font-weight:600; margin-right:8px;}
+  section{margin-bottom:52px;}
+  h2.sec{
+    font-size:21px; padding-bottom:10px; margin-bottom:20px;
+    border-bottom:2px solid var(--ink); display:flex; align-items:baseline; gap:12px;
+  }
+  h2.sec .num{
+    font-size:12px; color:#fff; background:var(--ink); border-radius:var(--tag-radius);
+    padding:2px 9px; letter-spacing:.08em; font-weight:600;
+  }
+  h3{font-size:16.5px; margin:26px 0 12px; color:var(--ink);}
+  h4{font-size:14.5px; margin:18px 0 8px; color:var(--ink-2);}
+  p{margin-bottom:12px;}
+  .lead{font-size:15.5px; color:var(--ink-2);}
+  table{width:100%; border-collapse:collapse; margin:14px 0 20px; background:var(--paper); font-size:13.5px;}
+  th{
+    background:#eef2f7; color:var(--ink-2); text-align:left; font-weight:600;
+    padding:9px 12px; border:1px solid var(--line); white-space:nowrap;
+  }
+  td{padding:9px 12px; border:1px solid var(--line); vertical-align:top;}
+  tr:nth-child(even) td{background:#fafbfc;}
+  .tag{display:inline-block; border-radius:var(--tag-radius); padding:1px 8px; font-size:11.5px; font-weight:600; white-space:nowrap;}
+  .t-crit{background:var(--risk-soft); color:var(--risk);}
+  .t-high{background:var(--warn-soft); color:var(--warn);}
+  .t-mid{background:var(--accent-soft); color:var(--accent);}
+  .t-low{background:#eef1f5; color:var(--ink-3);}
+  .t-ok{background:var(--ok-soft); color:var(--ok);}
+  .t-phase{background:#ece9fb; color:#5b45c0;}
+  .card{
+    background:var(--paper); border:1px solid var(--line); border-left:4px solid var(--accent);
+    border-radius:8px; padding:16px 20px; margin:16px 0;
+  }
+  .card.warn{border-left-color:var(--warn);}
+  .card.risk{border-left-color:var(--risk);}
+  .card.ok{border-left-color:var(--ok);}
+  .card h4{margin-top:0;}
+  .flow{display:flex; flex-wrap:wrap; gap:10px; align-items:center; margin:18px 0;}
+  .flow .step{
+    background:var(--paper); border:1.5px solid var(--ink); border-radius:8px;
+    padding:10px 16px; font-size:13px; font-weight:600;
+  }
+  .flow .step small{display:block; font-weight:400; color:var(--ink-3); font-size:11.5px;}
+  .flow .arrow{color:var(--ink-3); font-size:18px;}
+  .evidence{
+    background:#f2f5f9; border-radius:8px; padding:12px 16px; margin:12px 0;
+    font-size:13px; color:var(--ink-2); border:1px dashed #c8d2de;
+  }
+  .evidence b{color:var(--ink);}
+  .tbd{background:#fff7e0; color:#8a6100; padding:0 6px; border-radius:3px; font-size:12.5px;}
+  code{
+    font-family:Consolas,"Courier New",monospace; font-size:12.5px;
+    background:#eef2f7; padding:1px 6px; border-radius:3px; color:#28456b;
+  }
+  ul,ol{padding-left:22px; margin-bottom:12px;}
+  li{margin-bottom:6px;}
+  .fr-head{
+    display:flex; align-items:center; gap:10px; margin:28px 0 10px;
+    padding:10px 14px; background:var(--accent-soft); border-radius:8px;
+  }
+  .fr-head .id{
+    font-family:Consolas,monospace; font-weight:700; color:var(--accent);
+    font-size:13px; letter-spacing:.03em;
+  }
+  .fr-head .name{font-weight:700; font-size:15.5px;}
+  .fr-head .phase{margin-left:auto;}
+  .grid2{display:grid; grid-template-columns:1fr 1fr; gap:16px;}
+  .stat-row{display:grid; grid-template-columns:repeat(4,1fr); gap:12px; margin:18px 0;}
+  .stat{
+    background:var(--paper); border:1px solid var(--line); border-radius:10px;
+    padding:14px 16px; text-align:center;
+  }
+  .stat .v{font-size:24px; font-weight:700; color:var(--accent);}
+  .stat .l{font-size:12px; color:var(--ink-3); margin-top:2px;}
+  .roadmap{width:100%; height:auto; margin:10px 0 6px;}
+  footer{
+    margin-top:60px; padding-top:22px; border-top:1px solid var(--line);
+    font-size:12.5px; color:var(--ink-3);
+  }
+  @media (max-width:720px){
+    nav.toc ol{grid-template-columns:1fr;}
+    .grid2{grid-template-columns:1fr;}
+    .stat-row{grid-template-columns:1fr 1fr;}
+    h1{font-size:24px;}
+    table{display:block; overflow-x:auto;}
+  }
+  @media print{
+    body{background:#fff; font-size:12px;}
+    header.hero{background:#1f3a5f !important; -webkit-print-color-adjust:exact; print-color-adjust:exact;}
+    nav.toc{box-shadow:none;}
+    section{page-break-inside:avoid;}
+  }
+</style>
+</head>
+<body>
+
+<header class="hero">
+  <div class="wrap">
+    <div class="kicker">PRD · Product Requirements Document</div>
+    <h1>XT60 功率计固件<br>产品需求与分步实施计划（v0.2.0 → v1.0.0）</h1>
+    <p class="subtitle">在 4kHz 测量链路 WIP 中间态的基础上，收口质量、补齐仪器功能、打通数据出口，分四个门控阶段把产品从「能测」推进到「可信、可导、可社区」。</p>
+    <div class="meta-chips">
+      <span class="chip">版本：v1.0（草案已对齐）</span>
+      <span class="chip">日期：2026-10-16</span>
+      <span class="chip">深度：Heavy（多发布线）</span>
+      <span class="chip">配套：spec / 实施计划（文件级）</span>
+    </div>
+  </div>
+</header>
+
+<div class="wrap">
+
+<nav class="toc">
+  <h2>目录</h2>
+  <ol>
+    <li><a href="#s1"><span class="n">01</span>背景、问题与目标</a></li>
+    <li><a href="#s2"><span class="n">02</span>产品契约与核心模型</a></li>
+    <li><a href="#s3"><span class="n">03</span>范围（P0 / P1 / 排除项）</a></li>
+    <li><a href="#s4"><span class="n">04</span>现状问题基线（修复 / 优化）</a></li>
+    <li><a href="#s5"><span class="n">05</span>功能需求</a></li>
+    <li><a href="#s6"><span class="n">06</span>共享规则与例外</a></li>
+    <li><a href="#s7"><span class="n">07</span>分步实施计划（四阶段门控）</a></li>
+    <li><a href="#s8"><span class="n">08</span>验收标准</a></li>
+    <li><a href="#s9"><span class="n">09</span>风险与开放问题</a></li>
+  </ol>
+</nav>
+
+<!-- ================= 1 ================= -->
+<section id="s1">
+  <h2 class="sec"><span class="num">01</span>背景、问题与目标</h2>
+
+  <h3>1.1 观察到的问题</h3>
+  <div class="evidence">
+    <b>证据（2026-10 代码实证 + 两份历史审计交叉核对）：</b>
+    ① 4kHz DMA 采样重构处于 WIP 中间态——数据引擎已落地并接线，但控制面容错只完成约一半、全量验收完全未做；
+    ② 两个在途缺陷（波形规律性尖峰、引擎启动链超时）排查未闭环，取证探针留在生产代码路径，其中自动模拟按键翻页会篡改开机行为；
+    ③ 电压/电流换算增益仍是<b>未实测的理论值</b>，仪器「读数可信」无数据背书；
+    ④ 数据出口（导出 / 远程读数 / 升级）全部缺失——用户无法把测量数据带走，设备无法远程升级。
+  </div>
+
+  <p><b>受影响的用户与时刻：</b>把设备当作直流功率测量仪器的使用者（电池 / 电源 / 负载测试场景）。在「读数要拿去做决策」的时刻（标定、对比、留档），现有产品既不能证明读数精度，也不能把数据导出留档。</p>
+
+  <p><b>产品决策：</b>放弃「堆功能」路线，按 <b>质量收口 → 仪器可信 → 数据自由 → 社区化</b> 的顺序分四个门控阶段交付；每阶段以可二值验证的验收收口，前一阶段验收不通过不开下一阶段的功能开发。</p>
+
+  <p><b>预期可观测结果：</b>使用者在 v0.2.0 后可以相信屏幕上/导出数据的数值误差在标定阈值内且有实测记录；在 v0.5.0 后可以把数据以 CSV 带走、在网页上实时读数并远程升级固件；在 v1.0.0 后可以把设备接入家庭/实验室自动化体系。</p>
+
+  <h3>1.2 目标</h3>
+  <ul>
+    <li><b>读数可信</b>：完成真机标定并公布实测精度（目标 ≤±0.5%，不达标则公布实测值），测量链路通过 24 小时长跑验收。</li>
+    <li><b>行为可信</b>：出厂固件不携带任何调试行为；掉电 / 崩溃 / 升级失败均可恢复，不出现「不可救回」状态。</li>
+    <li><b>数据自由</b>：测量数据可导出（CSV）、可远程读取（网页）、固件可远程升级（A/B 回滚）。</li>
+    <li><b>覆盖完整</b>：纯按键与触屏双路径全功能可达；数值、单位、持久化行为在掉电重启后保持一致。</li>
+  </ul>
+
+  <div class="stat-row">
+    <div class="stat"><div class="v">23</div><div class="l">修复 / 优化问题项（B1–B23）</div></div>
+    <div class="stat"><div class="v">13</div><div class="l">新增 / 完善功能（F1–F13）</div></div>
+    <div class="stat"><div class="v">4</div><div class="l">门控阶段（V0 / 0.2.0 / 0.5.0 / 1.0.0）</div></div>
+    <div class="stat"><div class="v">10</div><div class="l">二值验收条目（AC-1–AC-10）</div></div>
+  </div>
+</section>
+
+<!-- ================= 2 ================= -->
+<section id="s2">
+  <h2 class="sec"><span class="num">02</span>产品契约与核心模型</h2>
+
+  <div class="grid2">
+    <div class="card">
+      <h4>产品契约</h4>
+      <p><b>使用者：</b>需要直流电压/电流/功率/电能测量与留档的工程师、爱好者。</p>
+      <p><b>触发：</b>XT60 接入被测电源/负载，设备上电。</p>
+      <p><b>核心任务：</b>读到可信的测量值，观察波形，必要时告警保护、导出数据、升级固件。</p>
+      <p><b>完成条件：</b>测量值稳定显示且与参考仪表一致（标定阈值内）；需要留档时数据可导出且与屏显一致。</p>
+      <p><b>可信基础：</b>启动自检 + 分级故障指示 + 崩溃取证 + 掉电恢复。</p>
+    </div>
+    <div class="card ok">
+      <h4>核心对象（单一定义）</h4>
+      <p><b>测量快照</b>：电压/电流/功率/电能/Ah/峰值 的当前值集合，掉电可恢复的部分持久化。</p>
+      <p><b>标定参数</b>：电压、电流的增益与零偏，经真机标定写入。</p>
+      <p><b>告警规则</b>：阈值 + 触发状态 + 响应动作（蜂鸣 / 弹窗）。</p>
+      <p><b>用户设置</b>：显示、声音、方向、告警阈值等偏好，掉电保留。</p>
+      <p><b>固件镜像</b>：带版本与签名的可升级单元，双份互为回滚。</p>
+    </div>
+  </div>
+
+  <h3>2.1 系统状态模型（已有，本期不变）</h3>
+  <div class="flow">
+    <div class="step">INIT<small>启动未完成 · 指示灯常亮</small></div>
+    <span class="arrow">→</span>
+    <div class="step">RUNNING<small>无故障 · 慢闪</small></div>
+    <span class="arrow">→</span>
+    <div class="step">DEGRADED<small>非致命故障 · 双闪，静音</small></div>
+    <span class="arrow">→</span>
+    <div class="step">FAULT<small>致命故障 · 快闪 + 每秒长鸣，不复位</small></div>
+  </div>
+  <p class="lead">致命故障 = 测量前端（ADC）或基础设施故障；其余外设故障只降级。本期仅扩展故障位来源（告警不进入该状态机，见 §6）。</p>
+</section>
+
+<!-- ================= 3 ================= -->
+<section id="s3">
+  <h2 class="sec"><span class="num">03</span>范围（P0 / P1 / 排除项）</h2>
+
+  <h3>3.1 P0：最小完整旅程</h3>
+  <p>「接入 → 读到可信数值 → 异常时被告警 → 数据可留档」：</p>
+  <ol>
+    <li><b>进入</b>：上电自检通过（或降级提示明确），测量页显示 V / I / P / Wh。</li>
+    <li><b>完成</b>：数值与参考仪表一致（标定阈值内，有实测记录）；峰值 / Ah 可查且掉电保留。</li>
+    <li><b>保护</b>：越阈值 200ms 内蜂鸣 + 弹窗，用户可调阈值。</li>
+    <li><b>恢复</b>：掉电重启后电能 / Ah / 峰值 / 设置不丢；固件异常可经 coredump 取证；升级失败自动回滚。</li>
+  </ol>
+
+  <h3>3.2 P1：支撑能力</h3>
+  <ul>
+    <li>波形 120s 时间窗可用（无空白槽、包络正确）；自动息屏 / 锁屏；温度补偿；恢复出厂设置。</li>
+    <li>WiFi 配网、Web 实时读数、CSV 导出、OTA 升级（v0.5.0）。</li>
+    <li>MQTT/Home Assistant、多语言、成本报表（v1.0.0）。</li>
+  </ul>
+
+  <h3>3.3 明确排除（防止分歧）</h3>
+  <table>
+    <tr><th>排除项</th><th>原因</th></tr>
+    <tr><td>触发捕获（超阈值冻结波形）、统计面板、校准参数导入导出</td><td>本轮评审明确暂缓；保留在 backlog，不进入任何阶段承诺。</td></tr>
+    <tr><td>USB PD 解码、蓝牙 App、云账号</td><td>沿用既有不做清单；蓝牙与「无手机依赖」的配网原则冲突。</td></tr>
+    <tr><td>交流测量 / 真有效值（RMS）档</td><td>现有前端为直流口径（块均值）；RMS 留给未来交流档，本期只统一文案口径。</td></tr>
+  </table>
+</section>
+
+<!-- ================= 4 ================= -->
+<section id="s4">
+  <h2 class="sec"><span class="num">04</span>现状问题基线（修复 / 优化需求）</h2>
+  <p class="lead">下列条目来自两份 2026-10 审计报告与本期代码实证的合并去重。<b>严重度</b>按「是否阻断发布 / 是否影响读数可信」评定；<b>归属</b>为门控阶段。</p>
+
+  <h3>4.1 发布阻断与读数可信（V0 / v0.2.0）</h3>
+  <table>
+    <tr><th>ID</th><th>问题</th><th>严重度</th><th>归属</th></tr>
+    <tr><td>B1</td><td>波形「1s 规律性 13/14V 交替尖峰」缺陷未定位，探针留在取数热路径</td><td><span class="tag t-crit">阻断</span></td><td><span class="tag t-phase">V0</span></td></tr>
+    <tr><td>B2</td><td>采样引擎启动链超时 / TX 通路取证未闭环，成功路径每帧输出取证日志</td><td><span class="tag t-crit">阻断</span></td><td><span class="tag t-phase">V0</span></td></tr>
+    <tr><td>B3</td><td>中断安全保护链缺环：擦写 Flash 窗口内采样中断可能崩溃（配置与声明不符）</td><td><span class="tag t-crit">阻断</span></td><td><span class="tag t-phase">V0</span></td></tr>
+    <tr><td>B4</td><td>开机 2 秒自动模拟按键翻页 + 压测脚手架残留，出厂行为被取证代码篡改</td><td><span class="tag t-crit">阻断</span></td><td><span class="tag t-phase">V0</span></td></tr>
+    <tr><td>B5</td><td>标定增益为未实测理论值，无标定记录文档</td><td><span class="tag t-high">高</span></td><td><span class="tag t-phase">v0.2.0</span></td></tr>
+    <tr><td>B6</td><td>测量链路全量验收（延迟分布 / 24h 长跑 / 一致性）完全未做</td><td><span class="tag t-high">高</span></td><td><span class="tag t-phase">v0.2.0</span></td></tr>
+    <tr><td>B7</td><td>帧校验连续失败后的自动恢复（重对齐 → 复位重初始化）缺失</td><td><span class="tag t-high">高</span></td><td><span class="tag t-phase">v0.2.0</span></td></tr>
+    <tr><td>B8</td><td>丢帧与 ADC 真故障混计一条链，故障上报延迟可达数分钟</td><td><span class="tag t-high">高</span></td><td><span class="tag t-phase">v0.2.0</span></td></tr>
+  </table>
+
+  <h3>4.2 显示、精度与健壮性（v0.2.0）</h3>
+  <table>
+    <tr><th>ID</th><th>问题</th><th>严重度</th><th>归属</th></tr>
+    <tr><td>B9</td><td>波形 120s 时间窗稀疏 / 包络失效</td><td><span class="tag t-mid">中</span></td><td><span class="tag t-phase">v0.2.0</span></td></tr>
+    <tr><td>B10</td><td>测试链断裂：主机单测从未真跑（无编译器时假绿）、CI 仅构建、高风险纯逻辑零单测</td><td><span class="tag t-mid">中</span></td><td><span class="tag t-phase">v0.2.0</span></td></tr>
+    <tr><td>B11</td><td>掉电恢复后电能累计精度回退（超 1024Wh 后增量被舍入吞掉）</td><td><span class="tag t-mid">中</span></td><td><span class="tag t-phase">v0.2.0</span></td></tr>
+    <tr><td>B12</td><td>清零采样定时器在关页 / 旋转重建时不清理，异时弹窗（同类问题复发）</td><td><span class="tag t-mid">中</span></td><td><span class="tag t-phase">v0.2.0</span></td></tr>
+    <tr><td>B13</td><td>旋转全树重建靠手工复位清单兜底，回归高发</td><td><span class="tag t-mid">中</span></td><td><span class="tag t-phase">v0.2.0</span></td></tr>
+    <tr><td>B14</td><td>文档口径漂移：RMS ×4（实为块均值）、500Hz ×2、软/硬旋转矛盾、过时注释</td><td><span class="tag t-mid">中</span></td><td><span class="tag t-phase">v0.2.0</span></td></tr>
+    <tr><td>B15</td><td>并发审计残留未复核（总线互斥、信号量释放窗口、句柄回滚、锁内聚合、故障位读改写）</td><td><span class="tag t-mid">中</span></td><td><span class="tag t-phase">v0.2.0</span></td></tr>
+    <tr><td>B16</td><td>崩溃转储只写不读，无开机崩溃摘要；日志无持久化</td><td><span class="tag t-mid">中</span></td><td><span class="tag t-phase">v0.2.0</span></td></tr>
+    <tr><td>B17</td><td>构建/烧录脚本硬编码本机路径与串口，换机不可复现</td><td><span class="tag t-low">低中</span></td><td><span class="tag t-phase">v0.2.0</span></td></tr>
+    <tr><td>B19</td><td>UI 细节：NaN 显示 0.0000、0℃/0%RH 被当占位符、末位抖动、无帧率指标</td><td><span class="tag t-low">低中</span></td><td><span class="tag t-phase">v0.2.0</span></td></tr>
+    <tr><td>B22</td><td>死代码与文案版本口径不一致（界面文案 vs 版本唯一来源）</td><td><span class="tag t-low">低</span></td><td><span class="tag t-phase">v0.2.0</span></td></tr>
+  </table>
+
+  <h3>4.3 联网前置与配置（v0.5.0）</h3>
+  <table>
+    <tr><th>ID</th><th>问题</th><th>严重度</th><th>归属</th></tr>
+    <tr><td>B18</td><td>安全基线缺失（镜像签名 / 加密），OTA 硬前置</td><td><span class="tag t-high">高</span></td><td><span class="tag t-phase">v0.5.0 前</span></td></tr>
+    <tr><td>B20</td><td>设置覆盖缺口：波形窗 / 模式未持久化、无恢复出厂、配置存储分裂两处</td><td><span class="tag t-mid">中</span></td><td><span class="tag t-phase">v0.5.0</span></td></tr>
+    <tr><td>B21</td><td>手势阈值 / 亮度默认 / 电池曲线等硬编码，不可配置</td><td><span class="tag t-low">低</span></td><td><span class="tag t-phase">v0.5.0</span></td></tr>
+    <tr><td>B23</td><td>配置分区偏小（WiFi 凭据 / 历史索引将加剧），数据分区大量闲置</td><td><span class="tag t-low">低中</span></td><td><span class="tag t-phase">v0.5.0</span></td></tr>
+  </table>
+</section>
+
+<!-- ================= 5 ================= -->
+<section id="s5">
+  <h2 class="sec"><span class="num">05</span>功能需求</h2>
+  <p class="lead">按模块组织，每个模块给出目的、触发、处理规则、结果与状态变化、例外。实现技术选型不在本文档定义。</p>
+
+  <!-- FR 1 -->
+  <div class="fr-head"><span class="id">FR-MEAS</span><span class="name">测量与读数可信（含峰值 / Ah）</span><span class="phase tag t-phase">v0.2.0</span></div>
+  <p><b>目的：</b>让「屏幕上显示的数」和「拿去用的数」都有精度背书。</p>
+  <table>
+    <tr><th>ID</th><th>用户与触发</th><th>产品行为</th><th>规则与状态</th></tr>
+    <tr>
+      <td>FR-MEAS-01</td>
+      <td>维护者完成真机标定（接参考仪表）</td>
+      <td>按 ≥5 个标定点（0 / 10 / 25 / 50 / 75 / 100% 量程）写入增益与零偏，生成标定记录</td>
+      <td>记录含每点标称值 / 实测值 / 误差；误差 ≤±0.5%（≥10% FS 读数）为合格，不合格则记录实测精度并注明原因；标定值掉电不丢</td>
+    </tr>
+    <tr>
+      <td>FR-MEAS-02</td>
+      <td>使用者观察测量页</td>
+      <td>显示电压 / 电流 / 功率 / 电能（Wh）/ 累计容量（Ah）/ 运行时间</td>
+      <td>直流口径为块均值（非 RMS，见 §6 口径规则）；单位 V / A / W / Wh / Ah；数值稳定显示不跳字</td>
+    </tr>
+    <tr>
+      <td>FR-MEAS-03</td>
+      <td>使用者查看峰值统计</td>
+      <td>显示电压 / 电流 / 功率的本次上电最大 / 最小值</td>
+      <td>峰值随测量持续更新；掉电后恢复上次持久化值（与电能同一持久化节奏）；提供清零入口（需确认，见 §6）</td>
+    </tr>
+    <tr>
+      <td>FR-MEAS-04</td>
+      <td>掉电重启后</td>
+      <td>电能、Ah、运行时间、峰值从持久化恢复并继续累计</td>
+      <td>恢复值不得因精度回退导致「累计停滞」（超 1024Wh 后增量必须继续生效）</td>
+    </tr>
+  </table>
+  <p><b>例外：</b>ADC 故障时测量值冻结并进入 FAULT 提示；标定参数损坏时回退出厂默认值并在「关于」页标注未经标定。</p>
+
+  <!-- FR 2 -->
+  <div class="fr-head"><span class="id">FR-WAVE</span><span class="name">波形观察</span><span class="phase tag t-phase">v0.2.0</span></div>
+  <p><b>目的：</b>1s～10min 各时间窗都能看出信号形态。</p>
+  <table>
+    <tr><th>ID</th><th>用户与触发</th><th>产品行为</th><th>规则与状态</th></tr>
+    <tr>
+      <td>FR-WAVE-01</td>
+      <td>使用者切换 1s / 10s / 30s / 60s / 120s / 10min 时间窗</td>
+      <td>各时间窗显示连续折线 + min/max 包络，无空白槽</td>
+      <td>120s 窗每槽有有效数据（本期修复项）；量程 1-2-5 序列、刻度锚定整格；量程切换有滞回防跳变</td>
+    </tr>
+    <tr>
+      <td>FR-WAVE-02</td>
+      <td>测量信号出现尖峰 / 谷值</td>
+      <td>包络渲染保留峰谷，不因降采样丢失</td>
+      <td>显示平滑（滑动平均）可由设置开关；开关状态持久化</td>
+    </tr>
+  </table>
+
+  <!-- FR 3 -->
+  <div class="fr-head"><span class="id">FR-ALM</span><span class="name">告警保护</span><span class="phase tag t-phase">v0.2.0</span></div>
+  <p><b>目的：</b>过压 / 过流 / 过功率时第一时间提醒使用者，避免被测件与测量装置受损。</p>
+  <table>
+    <tr><th>ID</th><th>用户与触发</th><th>产品行为</th><th>规则与状态</th></tr>
+    <tr>
+      <td>FR-ALM-01</td>
+      <td>使用者在设置页配置阈值（过压 V / 过流 A / 过功率 W）</td>
+      <td>阈值可设 / 可关（每项独立使能），保存后掉电保留</td>
+      <td>阈值范围 0～满量程；使能关闭的项不参与判定；非法输入（超范围 / 非数）拒绝并保持原值</td>
+    </tr>
+    <tr>
+      <td>FR-ALM-02</td>
+      <td>测量值越过已使能阈值</td>
+      <td>蜂鸣告警 + 弹窗显示越限项与当前值</td>
+      <td>自采样块判定越限起至<b>蜂鸣发声 &lt;200ms</b>；弹窗渲染允许 +100ms；持续越限按告警周期重复鸣响（沿用既有报警节奏配置）</td>
+    </tr>
+    <tr>
+      <td>FR-ALM-03</td>
+      <td>测量值回落到阈值内</td>
+      <td>告警停止，弹窗保留「已恢复」状态后自动关闭</td>
+      <td>回到正常不需重启设备；一次越限事件只产生一个告警弹窗（不堆叠）</td>
+    </tr>
+    <tr>
+      <td>FR-ALM-04</td>
+      <td>使用者在弹窗上确认</td>
+      <td>静音本次告警，弹窗关闭</td>
+      <td>确认只影响当前事件；下次越限重新告警；按键与触屏均可确认（纯按键可达）</td>
+    </tr>
+  </table>
+  <p><b>例外：</b>FAULT 状态下不重复弹告窗（先处理致命故障）；蜂鸣器故障时告警仅弹窗 + 指示灯。</p>
+
+  <!-- FR 4 -->
+  <div class="fr-head"><span class="id">FR-NET</span><span class="name">WiFi 配网与联网</span><span class="phase tag t-phase">v0.5.0</span></div>
+  <table>
+    <tr><th>ID</th><th>用户与触发</th><th>产品行为</th><th>规则与状态</th></tr>
+    <tr>
+      <td>FR-NET-01</td>
+      <td>使用者进入设置页「WiFi」或设备无凭据</td>
+      <td>进入配网模式（推荐设备开热点 + 网页配网，<span class="tbd">[TBD：配网方式最终选型]</span>），引导输入 SSID / 密码</td>
+      <td>凭据保存后掉电保留；连接状态在状态栏有真实图标（连接中 / 已连接 / 失败 / 配网模式）</td>
+    </tr>
+    <tr>
+      <td>FR-NET-02</td>
+      <td>路由器不可用 / 密码错误</td>
+      <td>有限次重试后回到可配网状态，不无限重启、不影响测量</td>
+      <td>联网失败只降级，不进 FAULT；测量功能全程不受影响（联网与测量隔离原则，见 §6）</td>
+    </tr>
+    <tr>
+      <td>FR-NET-03</td>
+      <td>使用者主动忘记网络</td>
+      <td>清除凭据并回到配网模式</td>
+      <td>需二次确认（涉及配置删除，见 §6 确认规则）</td>
+    </tr>
+  </table>
+
+  <!-- FR 5 -->
+  <div class="fr-head"><span class="id">FR-WEB</span><span class="name">Web 控制台与数据导出</span><span class="phase tag t-phase">v0.5.0</span></div>
+  <table>
+    <tr><th>ID</th><th>用户与触发</th><th>产品行为</th><th>规则与状态</th></tr>
+    <tr>
+      <td>FR-WEB-01</td>
+      <td>使用者浏览器访问设备地址</td>
+      <td>网页显示实时测量值（刷新 ≥5Hz）、波形缩略、设备状态</td>
+      <td>数值与屏显同源同值；断线后页面明确提示，恢复后自动重连</td>
+    </tr>
+    <tr>
+      <td>FR-WEB-02</td>
+      <td>使用者在网页调整参数（刷新率 / 告警阈值 / 设置项）</td>
+      <td>参数下发并在设备生效、持久化</td>
+      <td>越界输入拒绝并提示；下发结果有回执（成功 / 失败原因）</td>
+    </tr>
+    <tr>
+      <td>FR-WEB-03</td>
+      <td>使用者导出历史数据</td>
+      <td>按时间段导出 CSV 文件（含时间戳、V、I、P、Wh、Ah）</td>
+      <td>导出数值与屏显一致（同源）；文件可被常见表格工具解析；历史数据写入限频以保护存储寿命</td>
+    </tr>
+    <tr>
+      <td>FR-WEB-04</td>
+      <td>存储将满 / 已满</td>
+      <td>按「覆盖最旧」策略回收，并在网页提示</td>
+      <td>不得因存储满导致测量或设置保存失败</td>
+    </tr>
+  </table>
+
+  <!-- FR 6 -->
+  <div class="fr-head"><span class="id">FR-OTA</span><span class="name">固件升级（A/B 回滚）</span><span class="phase tag t-phase">v0.5.0</span></div>
+  <table>
+    <tr><th>ID</th><th>用户与触发</th><th>产品行为</th><th>规则与状态</th></tr>
+    <tr>
+      <td>FR-OTA-01</td>
+      <td>使用者在网页 / 设备检查并执行升级</td>
+      <td>下载镜像 → 校验签名与版本 → 写入备用分区 → 重启切换 → 升级后自检</td>
+      <td>校验失败拒绝安装；升级中掉电不影响当前固件运行</td>
+    </tr>
+    <tr>
+      <td>FR-OTA-02</td>
+      <td>新固件启动失败 / 自检不通过</td>
+      <td>自动回滚到上一版本并在界面标注「已回滚」</td>
+      <td>回滚后设备保持可测量、可再次升级；任何升级路径不得导致设备「变砖」</td>
+    </tr>
+    <tr>
+      <td>FR-OTA-03</td>
+      <td>升级完成后</td>
+      <td>版本号更新（唯一来源为版本文件）</td>
+      <td>设置 / 标定 / 电能等用户数据保留；资源（字体 / 网页）版本与固件版本匹配校验，不匹配时提示</td>
+    </tr>
+  </table>
+
+  <!-- FR 7 -->
+  <div class="fr-head"><span class="id">FR-UX</span><span class="name">体验批（息屏 / 温补 / 恢复出厂）</span><span class="phase tag t-phase">v0.5.0</span></div>
+  <table>
+    <tr><th>ID</th><th>用户与触发</th><th>产品行为</th><th>规则与状态</th></tr>
+    <tr>
+      <td>FR-UX-01</td>
+      <td>无操作持续设定时长</td>
+      <td>自动降低背光 / 息屏；触摸或按键立即唤醒</td>
+      <td>时长可设（含「永不」）；息屏期间测量与告警照常（告警触发时自动亮屏）</td>
+    </tr>
+    <tr>
+      <td>FR-UX-02</td>
+      <td>环境温度变化明显</td>
+      <td>按温度对测量前端漂移做补偿修正</td>
+      <td>补偿系数经实测标定；不劣化既有精度（补偿后误差仍满足 FR-MEAS-01 阈值）</td>
+    </tr>
+    <tr>
+      <td>FR-UX-03</td>
+      <td>使用者执行「恢复出厂设置」</td>
+      <td>清空用户设置与配网凭据，保留标定（标定属仪器属性，见 §6）</td>
+      <td>需二次确认 + 明确清单提示（哪些会被清）；完成后自动回到首次启动引导状态</td>
+    </tr>
+    <tr>
+      <td>FR-UX-04</td>
+      <td>掉电重启后</td>
+      <td>波形时间窗 / 波形模式等界面偏好恢复到关机前</td>
+      <td>纳入统一设置持久化（修复 B20 覆盖缺口）</td>
+    </tr>
+  </table>
+
+  <!-- FR 8 -->
+  <div class="fr-head"><span class="id">FR-COM</span><span class="name">社区批（MQTT / 多语言 / 成本报表）</span><span class="phase tag t-phase">v1.0.0</span></div>
+  <table>
+    <tr><th>ID</th><th>用户与触发</th><th>产品行为</th><th>规则与状态</th></tr>
+    <tr>
+      <td>FR-COM-01</td>
+      <td>使用者配置 MQTT 服务器</td>
+      <td>周期发布测量值，支持 Home Assistant 自动发现</td>
+      <td>发布频率可设；断线重连不影响测量；凭据持久化并可清除</td>
+    </tr>
+    <tr>
+      <td>FR-COM-02</td>
+      <td>使用者切换语言</td>
+      <td>界面文案切换为中文 / 英文</td>
+      <td>全覆盖无缺字（含标点与单位符号）；切换立即生效并持久化</td>
+    </tr>
+    <tr>
+      <td>FR-COM-03</td>
+      <td>使用者设定电价</td>
+      <td>按累计电量计算费用并展示成本报表</td>
+      <td>电价可设（单位、费率）；费用 = 累计电量 × 费率，四舍五入规则统一（见 §6）；电价与费用持久化</td>
+    </tr>
+  </table>
+</section>
+
+<!-- ================= 6 ================= -->
+<section id="s6">
+  <h2 class="sec"><span class="num">06</span>共享规则与例外</h2>
+
+  <h3>6.1 数值与单位口径（唯一定义）</h3>
+  <ul>
+    <li>直流口径：<b>块均值</b>（约 200ms 窗口内的平均值），不称「真有效值 / RMS」；RMS 保留给未来交流档。所有界面文案与文档统一此口径。</li>
+    <li>单位：V / A / W / Wh / Ah / ℃ / %RH；数值显示不跳字（末位稳定策略统一）。</li>
+    <li>舍入：显示值按界面精度四舍五入；累计量（Wh / Ah / 费用）按内部高精度累计，仅显示时舍入。</li>
+  </ul>
+
+  <h3>6.2 持久化与掉电恢复（唯一定义）</h3>
+  <ul>
+    <li>用户设置：改动后防抖落盘（停止操作约 1.5 秒后写入）；离开设置页 / 关机前立即落盘。</li>
+    <li>累计量（电能 / Ah / 运行时间 / 峰值）：周期性落盘 + 启动恢复；恢复后继续累计，不得停滞。</li>
+    <li>标定参数：单独保存，<b>不随「恢复出厂设置」清除</b>；损坏时回退出厂理论值并标注「未经标定」。</li>
+    <li>存储寿命：任何高频数据（历史记录）不得直写配置存储，历史数据按限频写入数据分区。</li>
+  </ul>
+
+  <h3>6.3 确认与不可逆操作</h3>
+  <table>
+    <tr><th>操作</th><th>确认方式</th><th>可逆性</th></tr>
+    <tr><td>电能 / 峰值清零</td><td>弹窗二次确认（触屏 + 按键双路径）</td><td>不可逆，提示「无法恢复」</td></tr>
+    <tr><td>恢复出厂设置</td><td>弹窗列出将被清除的项</td><td>不可逆；标定保留</td></tr>
+    <tr><td>忘记 WiFi 网络</td><td>弹窗二次确认</td><td>可重新配网</td></tr>
+    <tr><td>固件升级</td><td>版本确认后执行</td><td>失败自动回滚（FR-OTA-02）</td></tr>
+    <tr><td>清除历史数据</td><td>弹窗二次确认</td><td>不可逆，导出建议先行</td></tr>
+  </table>
+
+  <h3>6.4 隔离原则（跨模块约束）</h3>
+  <ul>
+    <li><b>测量与联网隔离</b>：联网 / 网页 / 升级的任何负载不得影响测量数值与采样时序；联网故障只降级不进 FAULT。</li>
+    <li><b>告警独立于故障状态机</b>：越限告警是业务事件（蜂鸣 / 弹窗），不改变系统状态机的 INIT/RUNNING/DEGRADED/FAULT。</li>
+    <li><b>按键与触屏等价</b>：所有 P0 流程（含弹窗确认）纯按键可达。</li>
+  </ul>
+</section>
+
+<!-- ================= 7 ================= -->
+<section id="s7">
+  <h2 class="sec"><span class="num">07</span>分步实施计划（四阶段门控）</h2>
+  <p class="lead">每阶段为一个门控：验收条目全部通过才进入下一阶段。文件级实施步骤见配套实施计划文档（含逐条文件定位与执行顺序）。</p>
+
+  <svg class="roadmap" viewBox="0 0 920 172" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="四阶段路线图">
+    <defs>
+      <marker id="arw" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto">
+        <path d="M0,0 L9,4.5 L0,9 z" fill="#6b7a90"/>
+      </marker>
+    </defs>
+    <line x1="40" y1="86" x2="880" y2="86" stroke="#c8d2de" stroke-width="3" marker-end="url(#arw)"/>
+    <g>
+      <rect x="40" y="30" width="180" height="112" rx="10" fill="#fbe9e7" stroke="#c0362c" stroke-width="2"/>
+      <text x="130" y="58" text-anchor="middle" font-size="15" font-weight="700" fill="#c0362c">阶段 V0</text>
+      <text x="130" y="80" text-anchor="middle" font-size="12" fill="#1a2332">WIP 收口</text>
+      <text x="130" y="100" text-anchor="middle" font-size="11" fill="#6b7a90">两缺陷闭环 · IRAM 补齐</text>
+      <text x="130" y="118" text-anchor="middle" font-size="11" fill="#6b7a90">探针清零 · 原子化入库</text>
+    </g>
+    <g>
+      <rect x="258" y="30" width="180" height="112" rx="10" fill="#fdf0e0" stroke="#b25700" stroke-width="2"/>
+      <text x="348" y="58" text-anchor="middle" font-size="15" font-weight="700" fill="#b25700">v0.2.0</text>
+      <text x="348" y="80" text-anchor="middle" font-size="12" fill="#1a2332">可信仪器版</text>
+      <text x="348" y="100" text-anchor="middle" font-size="11" fill="#6b7a90">标定 · 24h 验收 · 120s 窗</text>
+      <text x="348" y="118" text-anchor="middle" font-size="11" fill="#6b7a90">峰值 / Ah / 告警 · 测试链</text>
+    </g>
+    <g>
+      <rect x="476" y="30" width="180" height="112" rx="10" fill="#e8f0fe" stroke="#0f62fe" stroke-width="2"/>
+      <text x="566" y="58" text-anchor="middle" font-size="15" font-weight="700" fill="#0f62fe">v0.5.0</text>
+      <text x="566" y="80" text-anchor="middle" font-size="12" fill="#1a2332">联网数据版</text>
+      <text x="566" y="100" text-anchor="middle" font-size="11" fill="#6b7a90">配网 · Web · CSV · OTA</text>
+      <text x="566" y="118" text-anchor="middle" font-size="11" fill="#6b7a90">息屏 / 温补 / 出厂 · 72h 压测</text>
+    </g>
+    <g>
+      <rect x="694" y="30" width="180" height="112" rx="10" fill="#e3f4ee" stroke="#12805c" stroke-width="2"/>
+      <text x="784" y="58" text-anchor="middle" font-size="15" font-weight="700" fill="#12805c">v1.0.0</text>
+      <text x="784" y="80" text-anchor="middle" font-size="12" fill="#1a2332">社区化发布版</text>
+      <text x="784" y="100" text-anchor="middle" font-size="11" fill="#6b7a90">MQTT / HA · 多语言</text>
+      <text x="784" y="118" text-anchor="middle" font-size="11" fill="#6b7a90">成本报表 · 7 天挂机</text>
+    </g>
+  </svg>
+
+  <h3>7.1 阶段 V0 —— WIP 收口（发布阻断，先做）</h3>
+  <table>
+    <tr><th>步骤</th><th>内容</th><th>门控判据</th></tr>
+    <tr><td>V0-1</td><td>波形尖峰缺陷闭环（先复现、再定位、修复后删探针）</td><td rowspan="3">AC-1、AC-3：探针归零、开机行为正常、擦写窗口零崩溃</td></tr>
+    <tr><td>V0-2</td><td>引擎启动链缺陷闭环（取证结论落定、删每帧日志）</td></tr>
+    <tr><td>V0-3</td><td>中断安全保护链补齐 + 引擎依赖补全 + 调试脚手架删除 + WIP 原子化入库</td></tr>
+  </table>
+  <div class="card warn">
+    <h4>时间盒与降级条款</h4>
+    <p>V0-1 / V0-2 各设一个时间盒。盒满仍未定位根因：探针以编译开关封禁（默认关闭）+ 已知问题记录后放行进入 v0.2.0，缺陷挂 P0 backlog 并在发布说明中披露。</p>
+  </div>
+
+  <h3>7.2 阶段 v0.2.0 —— 可信仪器版</h3>
+  <table>
+    <tr><th>批次</th><th>步骤组</th><th>对应需求 / 问题</th></tr>
+    <tr><td>测试链先行</td><td>主机单测真实化、CI 补测试任务、高风险纯逻辑抽离补测</td><td>B10</td></tr>
+    <tr><td>精度与链路</td><td>真机标定（FR-MEAS-01）、24h 验收、帧校验自动恢复、故障判定分离、120s 窗修复、恢复精度修复</td><td>B5–B9、B11、FR-MEAS-04、FR-WAVE-01</td></tr>
+    <tr><td>仪器功能批</td><td>峰值统计、累计 Ah、告警保护</td><td>FR-MEAS-03、FR-ALM-01…04</td></tr>
+    <tr><td>收口批</td><td>悬空定时器修复、文档口径统一、并发残留复核、崩溃摘要、脚本去硬编码、UI 细节与死代码</td><td>B12–B17、B19、B22</td></tr>
+  </table>
+
+  <h3>7.3 阶段 v0.5.0 —— 联网数据版</h3>
+  <table>
+    <tr><th>顺序</th><th>步骤组</th><th>对应需求 / 问题</th></tr>
+    <tr><td>1（硬前置）</td><td>安全基线：镜像签名 / 加密评估落地</td><td>B18</td></tr>
+    <tr><td>2</td><td>WiFi 状态机与配网、状态栏真实状态</td><td>FR-NET-01…03</td></tr>
+    <tr><td>3</td><td>Web 控制台 + 参数下发 + CSV 历史导出</td><td>FR-WEB-01…04</td></tr>
+    <tr><td>4</td><td>OTA 闭环（校验 / A/B / 回滚 / 升级后自检）</td><td>FR-OTA-01…03</td></tr>
+    <tr><td>5</td><td>体验批 + 可配置化 + 72h 满载压测</td><td>FR-UX-01…04、B20–B23、AC-9</td></tr>
+  </table>
+
+  <h3>7.4 阶段 v1.0.0 —— 社区化发布版</h3>
+  <table>
+    <tr><td>1</td><td>MQTT / Home Assistant 接入</td><td>FR-COM-01</td></tr>
+    <tr><td>2</td><td>多语言（中 / 英，全量文案外置）</td><td>FR-COM-02</td></tr>
+    <tr><td>3</td><td>成本报表（电价设置 + 费用计算）</td><td>FR-COM-03</td></tr>
+    <tr><td>4</td><td>7 天挂机验收 + 发布物料与版本对齐</td><td>AC-10</td></tr>
+  </table>
+</section>
+
+<!-- ================= 8 ================= -->
+<section id="s8">
+  <h2 class="sec"><span class="num">08</span>验收标准</h2>
+  <p class="lead">全部为二值判据（通过 / 不通过），按阶段门控执行。测量手段以真机 + 参考仪表 + 长跑条件为准（无逻辑分析仪，延迟类指标采用设备内置统计口径）。</p>
+  <table>
+    <tr><th>ID</th><th>判据</th><th>门控</th></tr>
+    <tr><td>AC-1</td><td>调试标记全文检索 0 命中；上电后停留测量页 ≥10 秒无自动翻页</td><td><span class="tag t-phase">V0</span></td></tr>
+    <tr><td>AC-2</td><td>一键回归（构建 + 主机单测 + UI 回归）全绿；单测无编译器时不得「假绿」</td><td><span class="tag t-phase">V0 / v0.2.0</span></td></tr>
+    <tr><td>AC-3</td><td>连续 100 次立即落盘压测，擦写窗口内采样零崩溃、零 Cache 错误</td><td><span class="tag t-phase">V0</span></td></tr>
+    <tr><td>AC-4</td><td>24h 长跑：采样率 4000Hz ±0.05%；帧校验失败 / 丢帧 / 重同步计数 = 0；延迟统计 p99 ≤20µs</td><td><span class="tag t-phase">v0.2.0</span></td></tr>
+    <tr><td>AC-5</td><td>标定 ≥5 点，V / I 误差 ≤±0.5%（≥10% FS 读数）且有标定记录；不达标则公布实测精度</td><td><span class="tag t-phase">v0.2.0</span></td></tr>
+    <tr><td>AC-6</td><td>120s 波形窗无空白槽、包络正确；尖峰缺陷具备「复现步骤 + 根因 + 回归防护」记录</td><td><span class="tag t-phase">v0.2.0</span></td></tr>
+    <tr><td>AC-7</td><td>峰值 / Ah 掉电恢复与电能行为一致；告警自判定越限至蜂鸣 &lt;200ms（弹窗 +100ms 内）；阈值持久化</td><td><span class="tag t-phase">v0.2.0</span></td></tr>
+    <tr><td>AC-8</td><td>配网接通；网页实时刷新 ≥5Hz；CSV 与屏显一致；OTA 正常升级 1 次 + 损坏镜像回滚 1 次</td><td><span class="tag t-phase">v0.5.0</span></td></tr>
+    <tr><td>AC-9</td><td>72h 满载长跑：丢帧 &lt;0.1%、零复位；联网开启时测量误差仍在 AC-5 阈值内</td><td><span class="tag t-phase">v0.5.0</span></td></tr>
+    <tr><td>AC-10</td><td>Home Assistant 可发现并读数；中英切换无缺字；成本报表算例正确并持久化</td><td><span class="tag t-phase">v1.0.0</span></td></tr>
+  </table>
+</section>
+
+<!-- ================= 9 ================= -->
+<section id="s9">
+  <h2 class="sec"><span class="num">09</span>风险与开放问题</h2>
+
+  <h3>9.1 风险登记</h3>
+  <table>
+    <tr><th>风险</th><th>影响</th><th>缓解</th></tr>
+    <tr><td>V0 缺陷根因难定位导致收口膨胀</td><td>整体后移</td><td>时间盒 + 降级放行条款（§7.1）</td></tr>
+    <tr><td>标定达不到 ±0.5%（前端硬件限制）</td><td>精度宣称口径</td><td>v0.2.0 早期先做标定探底；不达标则公布实测精度，不阻塞发版</td></tr>
+    <tr><td>联网栈引入稳定性回退</td><td>测量抖动 / UI 卡顿</td><td>隔离原则（§6.4）+ 72h 满载压测门控（AC-9）</td></tr>
+    <tr><td>无逻辑分析仪，时序风险不可直接观测</td><td>验收盲区</td><td>设备内置延迟统计口径写入 AC-4；长跑计数兜底</td></tr>
+    <tr><td>存储磨损（历史记录 / 频繁落盘）</td><td>寿命</td><td>限频写入 + 防抖落盘（§6.2）</td></tr>
+    <tr><td>升级变砖</td><td>设备不可用</td><td>A/B 分区 + 签名校验 + 升级后自检 + 回滚实测（AC-8）</td></tr>
+    <tr><td>单人开发带宽导致阶段拖期</td><td>交付节奏</td><td>阶段门控以验收条目承诺，不承诺日期；砍范围优先砍 P1</td></tr>
+  </table>
+
+  <h3>9.2 开放问题</h3>
+  <table>
+    <tr><th>ID</th><th>问题</th><th>状态</th><th>决策时点</th></tr>
+    <tr><td>Q1</td><td>WiFi 配网方式：设备热点 + 网页配网（推荐）/ 其他方案</td><td><span class="tbd">[TBD]</span></td><td>v0.5.0 开工前</td></tr>
+    <tr><td>Q2</td><td>对外精度文案口径：统一为「平均值（块均值）」（推荐）或保留 RMS 表述</td><td><span class="tbd">[TBD]</span></td><td>v0.2.0 文档统一时</td></tr>
+    <tr><td>Q3</td><td>配置分区是否随 WiFi 凭据 / 历史索引扩容（涉及升级兼容）</td><td><span class="tbd">[TBD]</span></td><td>v0.5.0 前</td></tr>
+    <tr><td>Q4</td><td>告警响应 200ms 判定以「判定越限 → 蜂鸣发声」计；若事件链路延迟不达标，优先缩短链路而非放宽阈值</td><td><span class="tbd">[Assumption, TBD]</span></td><td>FR-ALM-02 实施时验证</td></tr>
+  </table>
+</section>
+
+<footer>
+  <p><b>XT60 功率计固件 · 产品需求与分步实施计划（PRD）</b> · 2026-10-16</p>
+  <p>配套文档：需求契约（spec）与文件级实施计划（plan）存放于 <code>.claude/artifacts/</code>；领域词汇表见 <code>CONTEXT.md</code>；采样链路技术决策见 <code>docs/adr/0001-4khz-sampling-chain.md</code>。</p>
+</footer>
+
+</div>
+</body>
+</html>

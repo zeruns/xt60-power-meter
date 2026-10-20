@@ -1,8 +1,29 @@
-# XT60 功率计固件分区表（16MB Flash，双 OTA + 资源分区）
+# XT60 功率计固件分区表（16MB Flash，双 OTA + 崩溃转储 + 资源分区）
+#
+# 列的含意：Name(分区名), Type(类型), SubType(子类型), Offset(起始偏移), Size(大小), Flags
+#
+# 为什么需要这么划分？
+#   · 双 OTA（ota_0 / ota_1）：支持 A/B 分区升级，升级失败可自动回滚，
+#     是"设备装到用户手里之后还能修"的前提；
+#   · coredump：崩溃时把现场（任务栈、寄存器）写入 Flash，
+#     事后可以取出来分析。野外设备没有串口可看，这是唯一的取证手段；
+#   · storage：给后续文件系统（曲线记录、网页静态资源）预留空间。
+#
+# ── 地址规划校验（务必保证首尾衔接、不重叠、不超出 16MB）──
+#   0x009000 + 0x006000 = 0x00F000   nvs
+#   0x00F000 + 0x002000 = 0x011000   otadata
+#   0x011000 + 0x001000 = 0x012000   phy_init
+#   0x020000 + 0x400000 = 0x420000   ota_0   （4MB，足够 LVGL + WiFi + 网页）
+#   0x420000 + 0x400000 = 0x820000   ota_1
+#   0x820000 + 0x010000 = 0x830000   coredump（64KB，足够记录一次崩溃现场）
+#   0x830000 + 0x7D0000 = 0x1000000  storage （约 8MB）
+#                        ^^^^^^^^^ 0x1000000 = 16MB，正好用满
+#
 # Name,     Type, SubType,  Offset,    Size,      Flags
 nvs,        data, nvs,      0x9000,    0x6000,
 otadata,    data, ota,      0xf000,    0x2000,
 phy_init,   data, phy,      0x11000,   0x1000,
 ota_0,      app,  ota_0,    0x20000,   0x400000,
 ota_1,      app,  ota_1,    0x420000,  0x400000,
-storage,    data, spiffs,   0x820000,  0x7E0000,
+coredump,   data, coredump, 0x820000,  0x10000,
+storage,    data, spiffs,   0x830000,  0x7D0000,
