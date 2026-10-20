@@ -50,21 +50,34 @@
 
 static const char *TAG = "lvgl_port";
 
-/** LVGL 心跳周期（毫秒）：交给官方 esp_lvgl_port 的 timer_period_ms */
-#define LVGL_PORT_TICK_MS 5
+/** LVGL 心跳周期（毫秒）：交给官方 esp_lvgl_port 的 timer_period_ms
+ *
+ * 【v0.6.3 性能】5ms → 16ms。这个值决定"多久唤醒一次 LVGL 任务去跑
+ * lv_timer_handler"。本工程最高刷新需求是：测量页 30Hz（33ms/帧）与
+ * 波形页 25Hz（40ms/帧），另外还有滚动/切换动画——16ms（约 62 次/秒）
+ * 对它们都留有余量，而 5ms（200 次/秒）意味着每秒 195 次"没事也醒来看看"
+ * 的空唤醒，白耗 CPU 与唤醒延迟。实测日志显示应用层 flush 只有约 176 次/秒，
+ * 且 UI 心跳龄 1~4ms（主循环本身 5ms 节拍），因此 16ms 不会拖慢交互。 */
+#define LVGL_PORT_TICK_MS 16
 
-/* 渲染缓冲块高度：PARTIAL 模式按行分块刷新（双缓冲，各 8 行，284*16*2≈9KB/个）。
- * ⚠ 40→16（2026-10 WiFi 联调实测）：WiFi 稳态会吃掉约 85KB 内部 RAM，而
- * phy_track_pll_init 的 esp_timer_create 要求 MALLOC_CAP_INTERNAL，内存耗尽
- * 时 NO_MEM 崩溃；draw buffer 是内部 RAM 最大可压缩项（DMA 只读内部 RAM，
- * 不能移 PSRAM）。渲染按 8 行小块提交，帧率略降但显示流水不变。 */
-#define LVGL_PORT_BUF_ROWS 16
+/* 渲染缓冲块高度：PARTIAL 模式按行分块刷新（双缓冲，各 284×N×2 字节）。
+ *
+ * 【v0.6.3 性能】16 → 24 行。分块越小，一帧被切成的块数越多 → 每块的
+ * lv_draw_sw_rotate（软件旋转）+ QSPI 提交开销 × 块数；实测整机 flush
+ * 约 176 次/秒，多数是这种小块。24 行把块数减少约 1/3，旋转与提交的
+ * 固定开销同比降下来，而全部字节数不变。
+ * 内存代价（内部 RAM，DMA 只能读内部 RAM）：双缓冲 + 旋转缓冲共
+ * 3 × 284×24×2 ≈ 40.9KB（原 16 行时约 27.3KB，净增约 13.6KB）。
+ * 实测内部 RAM 空闲约 130KB（v0.6.1 起 ALWAYSINTERNAL=0 后），有余量；
+ * ⚠ 若将来内部 RAM 又变紧张，**优先回调这个值**（它是内部 RAM 里最大的
+ *   可压缩项），而不是把 draw buffer 挪去 PSRAM（DMA 读不到）。 */
+#define LVGL_PORT_BUF_ROWS 24
 /** 软件旋转输出缓冲行数：与主缓冲等大（90/270° 旋转前后像素总数不变） */
 #define LVGL_PORT_SWROT_ROWS LVGL_PORT_BUF_ROWS
 /** LVGL 任务栈大小（字节）与优先级、绑定核（0=交互核） */
 /* 软件旋转（lv_draw_sw_rotate）+ 波形 chart 的渲染调用链较深，
  * 实测 7168 在竖屏渲染波形/设置页时栈溢出（剩 140B 后 CORRUPTED），
- * 12288 余量不足 200B；16384 留足安全余量（内部 RAM 空闲 130KB+）。 */
+ * 12288 余量不足 200B；16384 留足安全余量。 */
 #define LVGL_PORT_TASK_STACK 16384
 /* 台阶1 优化：优先级 4 → 10。LVGL 是交互核的主要负载，低优先级下
  * 频繁被采样/日志等任务抢占，帧率受限；10 让渲染及时获得 CPU。
@@ -256,11 +269,17 @@ esp_err_t lvgl_port_app_init(void)
     cfg.task_affinity = LVGL_PORT_TASK_CORE;
     cfg.task_max_sleep_ms = 500;
     cfg.timer_period_ms = LVGL_PORT_TICK_MS;
-    /* LVGL 任务栈放 PSRAM（task_stack_caps 官方支持）：16KB 大栈是内部 RAM
-     * 大户，WiFi 全开后内部 RAM 仅剩百字节级（phy_track_pll_init 实测
-     * esp_timer_create NO_MEM 崩溃）。LVGL 渲染任务不做 ISR 操作
-     * （flush 的 DMA 完成回调在 ISR 自己的栈上），放 PSRAM 安全。 */
-    cfg.task_stack_caps = MALLOC_CAP_SPIRAM;
+    /* 【v0.6.3 性能】LVGL 任务栈改回**内部 RAM**。
+     * 旧注释（"WiFi 全开后内部 RAM 仅剩百字节级"）是 v0.6.0 当时的事实，
+     * 而 v0.6.1 把 SPIRAM_MALLOC_ALWAYSINTERNAL 降到 0 之后，实机测量
+     * WiFi 已连接时内部 RAM 空闲约 130KB（历史最低 119KB）——有余量了。
+     * 为什么值得改回：栈是被高频访问的内存（函数调用/局部变量），PSRAM 的
+     * 访问延迟明显高于内部 RAM（还要走 cache），渲染与 UI 逻辑都在这些栈上跑。
+     * LVGL 渲染任务不做 ISR 操作（flush 的 DMA 完成回调在 ISR 自己的栈上），
+     * 所以放内部 RAM 只是"更快"，不涉及 ISR 安全性。
+     * ⚠ 若将来内部 RAM 重新吃紧（如新增 WiFi 特性），把这里改回 SPIRAM 即可，
+     *   代价只是栈访问变慢，功能不受影响。 */
+    cfg.task_stack_caps = MALLOC_CAP_INTERNAL;
     esp_err_t err = lvgl_port_init(&cfg);
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "官方 LVGL 移植层初始化失败: %s", esp_err_to_name(err));
@@ -274,17 +293,17 @@ esp_err_t lvgl_port_app_init(void)
      * 面板物理方向永久固定 284x240 横屏（MADCTL 0x68，init 写一次后不再动）。
      * sw_rotate=1：方向切换时 esp_lvgl_port 在 flush 里用 lv_draw_rotate 把
      * 逻辑缓冲旋进物理缓冲，运行期零面板命令，杜绝命令/颜色 DMA 并发冻结。
-     * PARTIAL 模式脏区被 draw buffer 容量切成 ≤20 行小块，284*20*2≈11.4KB
-     * 的旋转输出缓冲就够（与主缓冲同尺寸），放内部 RAM，DMA 快。
+     * PARTIAL 模式脏区被 draw buffer 容量切成 ≤LVGL_PORT_BUF_ROWS 行的小块，
+     * 284×24×2≈13.6KB 的旋转输出缓冲就够（与主缓冲同尺寸），放内部 RAM，DMA 快。
      * ⚠ 旋转缓冲必须与主缓冲等大：90°/270° 时旋转输出按目标行主序写，
      *   行数=源宽、行跨度=源高对应的字节数，像素总数不变。 */
     const lvgl_port_display_cfg_t disp_cfg = {
         .io_handle = lcd_nv3030b_get_io_handle(),
         .panel_handle = lcd_nv3030b_get_panel_handle(),
-        .buffer_size = (uint32_t)LCD_NV3030B_H_RES * LVGL_PORT_BUF_ROWS, /* 40 行块 */
+        .buffer_size = (uint32_t)LCD_NV3030B_H_RES * LVGL_PORT_BUF_ROWS, /* 24 行块 */
         /* 台阶1 优化：双缓冲——LVGL 渲染 buf1 时 DMA 正在搬运 buf2，
          * 渲染与刷屏并行，消除 CPU 等 DMA 的空转（实测帧率提升明显）。
-         * 内存代价：多一个 284×40×2≈22.7KB 内部 RAM 缓冲。 */
+         * 内存代价：多一个 284×24×2≈13.6KB 内部 RAM 缓冲。 */
         .double_buffer = true,
         .hres = (uint32_t)LCD_NV3030B_H_RES, /* 物理 284，永不改变 */
         .vres = (uint32_t)LCD_NV3030B_V_RES, /* 物理 240，永不改变 */

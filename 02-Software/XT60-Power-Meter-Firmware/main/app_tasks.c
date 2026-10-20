@@ -72,49 +72,35 @@ static void task_sys_monitor(void *arg)
         char fault_text[96];
         system_state_fault_to_str(system_state_get_fault_mask(), fault_text, sizeof(fault_text));
 
-        /* --- 内存水位 ---
-         * heap = 当前可用堆；min_heap = 历史最低值。
-         * 若 min_heap 持续下降，说明有内存泄漏。 */
-        ESP_LOGI(TAG, "状态=%s 故障=%s 核=%d 堆=%u 最低堆=%u",
+        /* --- 【v0.6.3 性能】内存与栈水位：合并成一行 ---
+         * 原来这里分 4 条 ESP_LOGI 打印（状态/内部 RAM/PSRAM/巡检栈）。ESP_LOGI
+         * 走同步 UART，而巡检任务与 UI/LVGL 同在 Core0，每条日志都要等串口发完
+         * （115200 下每行约 60~130 字节 ≈ 5~11ms）。实测 60s 内 156 行日志
+         *（约 2.6 行/秒，其中巡检占 84 行），合并为 1 行后信息一条不少、
+         * 串口占用减少约 2/3。
+         *
+         * 判读口径（保留原有语义）：
+         *   堆 = 当前可用堆（内部+PSRAM 合计）；最低 = 历史最低，持续下降提示泄漏；
+         *   内部RAM = 小块分配与 DMA/ISR 必用的那类内存，最需要盯的指标；
+         *   PSRAM = 字体/波形缓冲/大块分配所在，已用% 持续上升要看大块分配；
+         *   巡检栈 = 本任务历史最小剩余字节（经验上应保留 25%~50% 余量）。
+         * ⚠ 栈水位的三个坑（ESP-IDF 与上游 FreeRTOS 的差异）：
+         *   ① uxTaskGetStackHighWaterMark() 单位是「字节」（官方文档写「字」）；
+         *   ② ESP-IDF 里 StackType_t == uint8_t，故 sizeof(StackType_t)==1；
+         *   ③ xTaskCreate() 的栈深度参数同样是「字节」而非「字」。 */
+        const size_t ps_free = heap_caps_get_free_size(MALLOC_CAP_SPIRAM);
+        const size_t ps_total = heap_caps_get_total_size(MALLOC_CAP_SPIRAM);
+        const unsigned ps_used_pct =
+            (ps_total > 0) ? (unsigned)(100u - (ps_free * 100u / ps_total)) : 0u;
+        ESP_LOGI(TAG,
+                 "状态=%s 故障=%s 核=%d | 堆=%u 最低=%u | 内部RAM 空闲=%u 最低=%u | "
+                 "PSRAM 空闲=%u/%u(%u%%) | 巡检栈 剩=%u/%d",
                  system_state_name(system_state_get()), fault_text, xPortGetCoreID(),
-                 (unsigned)esp_get_free_heap_size(), (unsigned)esp_get_minimum_free_heap_size());
-
-        /* --- 内部 RAM 水位（LVGL 改用系统堆后：小块分配仍优先内部 RAM，
-         *     此值可反映"内部 RAM 是否吃紧"；历史最低持续下降同样提示泄漏） --- */
-        ESP_LOGI(TAG, "内部 RAM 空闲 %u 字节（历史最低 %u）",
+                 (unsigned)esp_get_free_heap_size(), (unsigned)esp_get_minimum_free_heap_size(),
                  (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
-                 (unsigned)heap_caps_get_minimum_free_size(MALLOC_CAP_INTERNAL));
-
-        /* --- PSRAM 水位（v0.6.2 新增） ---
-         * 【为什么要单独打印】esp_get_free_heap_size() 是「内部 RAM + PSRAM」的
-         * 合计值，只看它会得出"总堆还有 5MB，内存很宽裕"的错误结论；而 v0.6.0
-         * 那次 UI 卡死/自动复位的真实原因是"合计充裕、内部 RAM 只剩 19KB"。
-         * 两行分开打印后，一眼就能看出是哪一类内存吃紧：
-         *   · 内部 RAM 紧张 → 检查 DMA/ISR 相关与任务栈；
-         *   · PSRAM 紧张   → 检查字体、波形缓冲、LVGL 对象堆积。
-         * heap_caps_get_total_size() 返回该能力内存的总容量（本板 8MB PSRAM）。 */
-        {
-            const size_t ps_free = heap_caps_get_free_size(MALLOC_CAP_SPIRAM);
-            const size_t ps_total = heap_caps_get_total_size(MALLOC_CAP_SPIRAM);
-            const unsigned used_pct =
-                (ps_total > 0) ? (unsigned)(100u - (ps_free * 100u / ps_total)) : 0u;
-            ESP_LOGI(TAG, "PSRAM 空闲 %u / 总计 %u 字节（已用 %u%%）", (unsigned)ps_free,
-                     (unsigned)ps_total, used_pct);
-        }
-
-        /* --- 栈水位 ---
-         * ⚠ 三个容易踩的坑（都是 ESP-IDF 与上游 FreeRTOS 的差异）：
-         *   1. uxTaskGetStackHighWaterMark() 返回单位是「字节」，
-         *      而 FreeRTOS 官方文档写的是「字」——IDF 改了语义；
-         *   2. ESP-IDF 里 StackType_t 被定义成 uint8_t（portSTACK_TYPE），
-         *      所以 sizeof(StackType_t) == 1，
-         *      不能再按上游习惯写 stack * sizeof(StackType_t) 去凑字节；
-         *   3. 同理，xTaskCreate() 的栈深度参数单位也是「字节」而不是「字」，
-         *      所以下面 CONFIG_APP_SYS_MONITOR_STACK = 3072 表示 3072 字节。
-         * 该值是"任务历史上栈剩余空间的最小值"，越小说明越接近栈溢出，
-         * 经验上应保留 25%~50% 余量。 */
-        UBaseType_t stack_free_bytes = uxTaskGetStackHighWaterMark(s_monitor_task);
-        ESP_LOGI(TAG, "巡检任务栈：剩余 %u 字节 / 共 %d 字节", (unsigned)stack_free_bytes,
+                 (unsigned)heap_caps_get_minimum_free_size(MALLOC_CAP_INTERNAL),
+                 (unsigned)ps_free, (unsigned)ps_total, ps_used_pct,
+                 (unsigned)uxTaskGetStackHighWaterMark(s_monitor_task),
                  CONFIG_APP_SYS_MONITOR_STACK);
 
         /* --- LVGL 任务栈水位（关键观测项）---
@@ -179,37 +165,42 @@ static void task_sys_monitor(void *arg)
             }
         }
 
-        /* --- 引擎统计（M5 验收取数口径：drop/超时/δ，见 ads131m02.h）---
-         * 判读：drop 与 超时 应为 0 或极小；δ max 远小于 250µs 转换周期；
-         * crc_fail 持续增长提示帧错位（需重同步）。 */
+        /* --- 引擎统计 + 测量数据链路：合并成一行（v0.6.3 性能）---
+         * 引擎判读（M5 验收取数口径，见 ads131m02.h）：drop 与 超时 应为 0 或极小；
+         *   δ max 远小于 250µs 转换周期；crc_fail 持续增长提示帧错位（需重同步）。
+         * 测量链路：data_store 尚无数据时返回 ESP_ERR_INVALID_STATE，属"测量核还没
+         *   开始工作"的正常表现（不是故障）；此时仍打印同一行，只是数值位以文字占位，
+         *   便于按行对齐地看时间轴。
+         * SOC 结温用 %.1f 输出；NaN（传感器未就绪）显示 --，便于长跑观测主控发热。 */
         {
             ads131m02_stats_t est;
             ads131m02_get_stats(&est);
-            ESP_LOGI(TAG, "引擎: kick=%u drop=%u read_ok=%u crc_fail=%u 超时=%u δ min/avg/max=%u/%u/%uµs",
-                     (unsigned)est.edge_ok, (unsigned)est.edge_busy, (unsigned)est.read_ok,
-                     (unsigned)est.crc_fail, (unsigned)est.read_timeout, (unsigned)est.lat_min_us,
-                     (unsigned)est.lat_avg_us, (unsigned)est.lat_max_us);
-        }
-
-        /* --- 测量数据链路 ---
-         * data_store 尚无数据时返回 ESP_ERR_INVALID_STATE，
-         * 这是"测量核还没开始工作"的正常表现，不算故障。 */
-        data_store_snapshot_t snapshot;
-        if (data_store_get(&snapshot) == ESP_OK) {
-            /* SOC 结温用 %.1f 输出；NaN（传感器未就绪）时显示 --，便于长跑观测
-             * 主控发热情况（v0.5.1 新增，来源为芯片内部温度传感器）。 */
-            char soc[16];
-            if (isfinite(snapshot.soc_temp_c)) {
-                snprintf(soc, sizeof(soc), "%.1f", (double)snapshot.soc_temp_c);
+            data_store_snapshot_t snapshot;
+            if (data_store_get(&snapshot) == ESP_OK) {
+                char soc[16];
+                if (isfinite(snapshot.soc_temp_c)) {
+                    snprintf(soc, sizeof(soc), "%.1f", (double)snapshot.soc_temp_c);
+                } else {
+                    snprintf(soc, sizeof(soc), "--");
+                }
+                ESP_LOGI(TAG,
+                         "引擎: kick=%u drop=%u read_ok=%u crc_fail=%u 超时=%u "
+                         "δ min/avg/max=%u/%u/%uµs | 测量: %.3f V / %.3f A / %.3f W "
+                         "SOC=%s℃（累计更新 %u 次）",
+                         (unsigned)est.edge_ok, (unsigned)est.edge_busy, (unsigned)est.read_ok,
+                         (unsigned)est.crc_fail, (unsigned)est.read_timeout,
+                         (unsigned)est.lat_min_us, (unsigned)est.lat_avg_us,
+                         (unsigned)est.lat_max_us, snapshot.voltage_v, snapshot.current_a,
+                         snapshot.power_w, soc, (unsigned)data_store_update_count());
             } else {
-                snprintf(soc, sizeof(soc), "--");
+                ESP_LOGI(TAG,
+                         "引擎: kick=%u drop=%u read_ok=%u crc_fail=%u 超时=%u "
+                         "δ min/avg/max=%u/%u/%uµs | 测量: 尚未就绪（更新计数 %u）",
+                         (unsigned)est.edge_ok, (unsigned)est.edge_busy, (unsigned)est.read_ok,
+                         (unsigned)est.crc_fail, (unsigned)est.read_timeout,
+                         (unsigned)est.lat_min_us, (unsigned)est.lat_avg_us,
+                         (unsigned)est.lat_max_us, (unsigned)data_store_update_count());
             }
-            ESP_LOGI(TAG, "测量: %.3f V / %.3f A / %.3f W  SOC=%s℃（累计更新 %u 次）",
-                     snapshot.voltage_v, snapshot.current_a, snapshot.power_w, soc,
-                     (unsigned)data_store_update_count());
-        } else {
-            ESP_LOGD(TAG, "测量数据尚未就绪（data_store 更新计数 %u）",
-                     (unsigned)data_store_update_count());
         }
 
         vTaskDelay(pdMS_TO_TICKS(CONFIG_APP_SYS_MONITOR_PERIOD_MS));

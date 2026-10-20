@@ -929,24 +929,48 @@ static esp_err_t api_config_post_handler(httpd_req_t *req)
 #define WS_CMD_MAX 256
 
 /**
+ * @brief WS 异步发送槽：一个常驻缓冲 + 忙标志（v0.6.3 性能：去掉每帧堆分配）
+ *
+ * 【为什么改成常驻槽】旧实现在每次广播里为**每个** WS 客户端
+ * heap_caps_malloc(len+1) 一份缓冲、发送完成后 free——网页端 10Hz 推送时
+ * 即便只有 1 个客户端也是 10 次/秒分配+释放（多客户端线性增长）。虽然走的是
+ * PSRAM，但持续的分配/释放会带来堆碎片与锁开销，且每次都要做 malloc 失败分支。
+ * 现在改为启动时一次性分配 WEB_CONSOLE_MAX_CLIENTS 个槽（8×512B≈4KB PSRAM），
+ * 广播时**取一个空闲槽**写数据、发送完成回调里把它标回空闲。
+ *
+ * 【丢掉一帧而不是等待】槽被占用（上一帧还没发完）时直接跳过本次推送：
+ * 这是 10Hz 的快照流，下一周期自然会带上更新的数据，比排队等待更安全。
+ */
+typedef struct {
+    char buf[WEB_CONSOLE_JSON_BUF_LEN]; /**< 发送缓冲（常驻，避免每帧堆分配） */
+    volatile bool busy;                 /**< true=缓冲正被 httpd 发送占用 */
+} ws_tx_slot_t;
+
+/** 发送槽池（web_console_start 时按需分配到 PSRAM；NULL=未分配） */
+static ws_tx_slot_t *s_ws_slots = NULL;
+
+/**
  * @brief 异步发送完成回调（在 httpd 任务里执行）
  *
  * 失败静默降级：只留 DEBUG 痕迹，不刷屏；顺手让服务器回收该会话，
- * 避免之后每 200ms 都向死连接排一次发送。
+ * 避免之后每 100ms 都向死连接排一次发送。
  *
  * @param err    发送结果
  * @param socket 目标 socket fd
- * @param arg    发送缓冲（由本函数释放）
+ * @param arg    对应的发送槽（由 ws_broadcast 传入，静态对象无需释放）
  */
 static void ws_send_done_cb(esp_err_t err, int socket, void *arg)
 {
+    ws_tx_slot_t *slot = (ws_tx_slot_t *)arg;
+    if (slot != NULL) {
+        slot->busy = false; /* 归还槽位：下一周期可复用 */
+    }
     if (err != ESP_OK) {
         ESP_LOGD(TAG, "WS 发送失败（fd=%d，%s），静默降级", socket, esp_err_to_name(err));
         if (s_server != NULL) {
             httpd_sess_trigger_close(s_server, socket);
         }
     }
-    free(arg);
 }
 
 /**
@@ -954,15 +978,16 @@ static void ws_send_done_cb(esp_err_t err, int socket, void *arg)
  *
  * 必须走 httpd_ws_send_data_async()（内部排入 httpd 工作队列），
  * 因为 socket 写入只能发生在 httpd 任务上下文。
- * payload 每客户端各拷一份堆缓冲，发送完成回调里释放。
+ * payload 指向**常驻发送槽**（下标与客户端列表下标一一对应），
+ * 发送完成回调里只清忙标志、不做释放。
  *
  * @param json JSON 文本（'\0' 结尾）
  */
 static void ws_broadcast(const char *json)
 {
     httpd_handle_t server = s_server;
-    if (server == NULL) {
-        return;
+    if (server == NULL || s_ws_slots == NULL) {
+        return; /* 未启动或槽池分配失败：不发推送（页面会退化为轮询模式） */
     }
 
     int fds[WEB_CONSOLE_MAX_CLIENTS];
@@ -971,32 +996,31 @@ static void ws_broadcast(const char *json)
         return;
     }
 
-    size_t len = strlen(json);
+    const size_t len = strlen(json);
     for (size_t i = 0; i < n_fds; i++) {
         if (httpd_ws_get_fd_info(server, fds[i]) != HTTPD_WS_CLIENT_WEBSOCKET) {
             continue; /* 只推 WS 会话，普通 HTTP 会话跳过 */
         }
-
-        /* 【v0.6.1 内存修复】发送缓冲放 PSRAM：socket 写发生在 httpd 任务
-         * （非 ISR），PSRAM 安全；若用普通 malloc，350B 级缓冲会被
-         * 「内部优先」策略反复 churn 本就紧张的内部 RAM（旧 ALWAYSINTERNAL=512
-         * 时甚至被强制内部，是 v0.6.0 概率复位的帮凶之一）。 */
-        char *copy = (char *)heap_caps_malloc(len + 1, MALLOC_CAP_SPIRAM);
-        if (copy == NULL) {
-            continue; /* 内存紧张就少推一帧，下一个周期自会补上 */
+        if (i >= WEB_CONSOLE_MAX_CLIENTS) {
+            break;
         }
-        memcpy(copy, json, len + 1);
+        ws_tx_slot_t *slot = &s_ws_slots[i];
+        if (slot->busy || (len + 1) > sizeof(slot->buf)) {
+            continue; /* 上一帧未发完 / 单帧超长：跳过本帧，下一周期自会带上新数据 */
+        }
+        memcpy(slot->buf, json, len + 1);
 
         httpd_ws_frame_t frame = {
             .final = true,
             .fragmented = false,
             .type = HTTPD_WS_TYPE_TEXT,
-            .payload = (uint8_t *)copy,
+            .payload = (uint8_t *)slot->buf,
             .len = len,
             .left_len = 0,
         };
-        if (httpd_ws_send_data_async(server, fds[i], &frame, ws_send_done_cb, copy) != ESP_OK) {
-            free(copy); /* 没排进队列，回调不会来，自己收尾 */
+        slot->busy = true;
+        if (httpd_ws_send_data_async(server, fds[i], &frame, ws_send_done_cb, slot) != ESP_OK) {
+            slot->busy = false; /* 没排进队列，回调不会来，自己收尾 */
         }
     }
 }
@@ -1165,6 +1189,16 @@ esp_err_t web_console_start(void)
         s_hist = heap_caps_calloc(HIST_POINTS, sizeof(hist_point_t), MALLOC_CAP_SPIRAM);
         if (s_hist == NULL) {
             ESP_LOGW(TAG, "历史环分配失败（PSRAM 不足）：/api/export.csv 将只返回表头");
+        }
+    }
+    /* v0.6.3 性能：WS 发送槽池一次性分配到 PSRAM（8×512B≈4KB），
+     * 此后每帧广播不再做堆分配/释放（详见 ws_tx_slot_t 的说明）。
+     * 分配失败只是不发推送（页面自动退化为轮询），不影响其它接口。 */
+    if (s_ws_slots == NULL) {
+        s_ws_slots = heap_caps_calloc(WEB_CONSOLE_MAX_CLIENTS, sizeof(ws_tx_slot_t),
+                                      MALLOC_CAP_SPIRAM);
+        if (s_ws_slots == NULL) {
+            ESP_LOGW(TAG, "WS 发送槽分配失败（PSRAM 不足）：/ws 推送不可用，页面将走轮询");
         }
     }
 

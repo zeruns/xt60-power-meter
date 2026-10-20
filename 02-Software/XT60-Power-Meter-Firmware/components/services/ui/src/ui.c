@@ -775,15 +775,20 @@ esp_err_t ui_init(void)
         return ESP_ERR_INVALID_STATE;
     }
 
-    /* xTaskCreatePinnedToCoreWithCaps：创建任务并绑定 Core 0（交互核），栈放 PSRAM。
-     * ⚠ UI 任务不做 ISR 相关操作（按键走事件队列），栈可以放 PSRAM；
-     * WiFi 全开后内部 RAM 仅剩百字节级（phy_track_pll_init 的 esp_timer_create
-     * 实测 NO_MEM 崩溃），12KB 大栈必须让位给 WiFi/PHY 的内部刚性需求。
-     * 测量采样任务仍保持内部 RAM 栈（ISR 在其栈上运行，见架构文档）。 */
+    /* xTaskCreatePinnedToCoreWithCaps：创建任务并绑定 Core 0（交互核）。
+     * 【v0.6.3 性能】栈由 PSRAM 改回**内部 RAM**：v0.6.1 把
+     * SPIRAM_MALLOC_ALWAYSINTERNAL 降到 0 后内部 RAM 空闲约 130KB
+     *（v0.6.0 当时"仅剩百字节级"的情况已不复存在），而 UI 任务栈是
+     * 被高频访问的内存——每轮主循环的局部变量、LVGL 建树递归都在它上面，
+     * 内部 RAM 访问比 PSRAM（走 cache）更快、更确定。
+     * ⚠ UI 任务不做 ISR 相关操作（按键走事件队列），因此**内部 RAM 并非
+     * 安全强制项**，只是更快；若日后内部 RAM 又紧张，改回 MALLOC_CAP_SPIRAM
+     * 即可降级（功能不受影响）。测量采样任务仍必须内部 RAM 栈
+     *（ISR 在其栈上运行，见架构文档）。 */
     BaseType_t ok = xTaskCreatePinnedToCoreWithCaps(task_ui, UI_TASK_NAME,
                                                     UI_TASK_STACK_BYTES, NULL,
                                                     UI_TASK_PRIORITY, NULL,
-                                                    UI_TASK_CORE, MALLOC_CAP_SPIRAM);
+                                                    UI_TASK_CORE, MALLOC_CAP_INTERNAL);
     if (ok != pdPASS) {
         ESP_LOGE(TAG, "创建 UI 任务失败（栈 %d 字节）", UI_TASK_STACK_BYTES);
         return ESP_ERR_NO_MEM;

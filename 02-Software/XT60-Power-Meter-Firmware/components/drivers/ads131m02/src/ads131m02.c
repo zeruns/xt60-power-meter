@@ -829,12 +829,17 @@ esp_err_t ads131m02_read(ads131m02_sample_t *out)
             s_crc_fail_streak = 0;
         }
 
-        /* 每 4096 帧（≈1s @4kHz）打印一次基线统计（M2 验收观测口） */
+        /* 每 4096 帧（≈1s @4kHz）采样一次基线统计（M2 验收观测口）。
+         * 【v0.6.3 性能】由 ESP_LOGI 降为 ESP_LOGD：这行每秒一条、走同步 UART，
+         * 而读帧路径在 Core1 的采样任务里，串口等待会挤占 DRDY 读取窗口。
+         * 默认 log level 为 INFO，故默认**不再输出**；需要验收取数时用
+         *   esp_log_level_set("ads131m02", ESP_LOG_DEBUG)
+         * 打开即可看到完全相同的字段（app_task 的巡检行也长期提供同一组数据）。 */
         const uint32_t n = ++s_read_ok;
         if ((n & 0xFFFu) == 0u) {
             ads_engine_stats_t es;
             ads_engine_get_stats(&es);
-            ESP_LOGI(TAG, "[基线统计] DRDY=%u kick=%u 丢=%u ok=%u crc_fail=%u timeout=%u "
+            ESP_LOGD(TAG, "[基线统计] DRDY=%u kick=%u 丢=%u ok=%u crc_fail=%u timeout=%u "
                           "| δ(DRDY→SPI)µs min/avg/max=%u/%u/%u",
                      (unsigned)es.drdy_count, (unsigned)es.kick_count, (unsigned)es.drop_count,
                      (unsigned)n, (unsigned)s_crc_fail, (unsigned)s_read_timeout,
