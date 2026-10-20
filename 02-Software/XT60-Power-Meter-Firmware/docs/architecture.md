@@ -454,10 +454,19 @@ opcode 封装与约 200 条分页式初始化序列都由组件负责，**驱动
 ### 字体方案（OFL Noto Sans SC，文件系统存放）
 
 - 字体**不嵌入 app**：`tools/fonts/make_fonts.py` 从 google/fonts 下载 Noto Sans SC
-  可变 TTF，实例化 Regular(400)/Bold(700) 两个字重，按 **ASCII + GB2312 一级字库
-  3755 字 + 全角标点/单位符号** 子集化，输出到
-  `components/middleware/fs_storage/spiffs_image/fonts/`（约 1.1MB/个），构建时
-  打入 SPIFFS 镜像随 `idf.py flash` 烧入 `storage` 分区（partitions.csv，7.5MB）。
+  可变 TTF，实例化 Regular(400)/Bold(700) 两个字重，按 **ASCII + GB2312 一级+二级
+  6763 字 + 全角标点/单位符号** 子集化，输出到
+  `components/middleware/fs_storage/spiffs_image/fonts/`（**约 2.09MB/个**），构建时
+  打入 SPIFFS 镜像随 `idf.py flash` 烧入 `storage` 分区（partitions.csv，8MB → 挂载后可用 7346KB）。
+
+  **容量账（v0.6.5 需求 2 实测）**：全量子集共 7078 码点 / 7075 字形，两字重合计约
+  **4175KB**；storage 可用 7346KB、其余内容仅约 18KB → **剩余约 3.1MB（余量 43%），放得下**。
+  运行期两套 TTF 整读入 PSRAM 占约 4.1MB（此前 2.2MB），PSRAM 已用由 38% 升到约 61%，
+  仍有约 3.2MB 空闲（波形缓冲 664KB + LVGL 对象在内）。
+  为什么不扩到 GBK 全量（约 21003 字）：按实测约 0.29KB/字形推算，单字重约 6.0MB、
+  两字重约 12MB，**装不进 8MB 分区**；且 PSRAM 也放不下两套。因此 GB2312 之外的
+  GBK 生僻字（人名用字如「喆」「堃」）与 emoji 仍会缺字——这是已知取舍。
+  扩大字库后必须**全量 `idf.py flash`**（OTA 只更新 app 分区，不含 storage/字体）。
 - `lvgl_port_init`（启动表中位于 fs_storage 之后、测量任务启动之前）用标准
   `fopen` 把两个 TTF **整读入 PSRAM**，再用 `lv_tiny_ttf_create_data()` 建
   7 档字号 ×2 字重；之后渲染只走内存，**运行期对 flash 零访问**。
@@ -561,6 +570,9 @@ v0.6.3 起：API 页签重写为分接口文档（请求/响应示例、字段�
 LVGL 心跳 5→16ms、渲染分块 16→24 行、LVGL/UI 任务栈移回内部 RAM。
 v0.6.4 起：网页控制台打开即从设备回填设置表单；WS 推送提速到 15Hz；新增恒开的
 过温告警（机内 >60℃，DATA_ALERT_OTP）；orientation/web_console_ws/sys_monitor 迁 Core1。
+v0.6.5 起：过温改为**双数据源取高者、阈值 65℃**（SOC 结温 或 AHT20 机内温度）；
+字库由 GB2312 一级扩到**一级+二级 6763 字**（两字重 4175KB，storage 余量 3.1MB）；
+网页实时数据支持**读数刷新帧率**（低档位多帧平均滤波）与 V/I/P 三色区分。
 以下为**尚未实现**的缺口：
 
 | 缺口 | 现状 | 影响 |
