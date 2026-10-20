@@ -435,10 +435,16 @@ esp_err_t app_tasks_start(void)
 
     /* xTaskCreatePinnedToCore 的最后一个参数就是绑定的核编号。
      * 相比 xTaskCreate（由调度器任意分配），显式绑核才能保证
-     * "测量核不被通信任务打扰"这一设计目标。 */
+     * "测量核不被通信任务打扰"这一设计目标。
+     * 【v0.6.4 需求 4】巡检任务由 Core0(APP_CORE_UI) → Core1：它是周期 5s 的
+     * 诊断打印（栈水位/内存水位/冻结三角），一次跑几十毫秒、优先级低，
+     * 在 Core0 上会和 UI/LVGL 抢 CPU 且串口输出拖慢交互核；挪到 Core1 后
+     * pm_sample（prio 24）仍随时抢占它，不影响 4kHz 采样（实测 drdy/drop
+     * 计数与迁移前一致）。它调用的 lvgl_port_lock 探测是互斥锁操作，
+     * 跨核安全。 */
     BaseType_t ok =
         xTaskCreatePinnedToCore(task_sys_monitor, "sys_monitor", CONFIG_APP_SYS_MONITOR_STACK, NULL,
-                                CONFIG_APP_SYS_MONITOR_PRIO, &s_monitor_task, APP_CORE_UI);
+                                CONFIG_APP_SYS_MONITOR_PRIO, &s_monitor_task, 1);
     if (ok != pdPASS) {
         ESP_LOGE(TAG, "创建 sys_monitor 任务失败（栈 %d 字节）", CONFIG_APP_SYS_MONITOR_STACK);
         return ESP_ERR_NO_MEM;

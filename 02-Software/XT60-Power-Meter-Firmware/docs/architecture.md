@@ -204,8 +204,15 @@ ESP32-S3 双核。ESP-IDF 默认把 WiFi 任务钉在 Core 0，因此按"通信�
 
 | 核 | 职责 | 任务 | 优先级 |
 |---|---|---|---|
-| **Core 0**（PRO_CPU） | 交互与通信 | `task_ui`(12)、`lvgl_port`(10)、`event_bus`(6)、`pm_aux`(5)、`orientation`(4)、`sys_monitor`(3)、`cfg_save_task`(2) | 中低 |
-| **Core 1**（APP_CPU） | 测量（独占） | `pm_sample`(22)：采样 + 200ms 块计算 | 高 |
+| **Core 0**（PRO_CPU） | 交互与通信 | `task_ui`(12)、`lvgl_port`(10)、`event_bus`(6)、httpd(默认 5)、`cfg_save_task`(2)、WiFi 协议栈、esp_timer | 中低 |
+| **Core 1**（APP_CPU） | 测量为主 + 低速外围 | `pm_sample`(24)：采样 + 200ms 块计算；`pm_aux`(5)：温湿度/电池；`web_console_ws`(4)：网页 15Hz 推送；`orientation`(4)：重力转屏；`sys_monitor`(3)：巡检诊断 | 高/低混合 |
+
+**v0.6.4 核分工调整（需求 4）**：Core 0 曾挤满 UI/LVGL/httpd/WiFi + 一批低优先级周期任务，交互核负担偏重。把三个**低优先级、非交互**的任务迁到 Core 1：`orientation`（150ms I2C）、`web_console_ws`（66ms 推送）、`sys_monitor`（5s 巡检）。迁移判据：①它们只做 I2C/无锁读/串口打印/互斥锁操作，全部跨核安全；②优先级远低于 `pm_sample`(24)，随时可被抢占，不占采样窗口（实测迁移后 drdy 4000Hz、drop 计数无变化）；③迁移后 Core 0 只剩"真正面向用户"的任务。
+
+**评估过但不迁移的**：
+- `httpd`（URI handler 执行处）：handler 含 NVS 写与 **OTA flash 擦写**——flash 停顿虽是双核全局的（cache 一致性），但把 flash 写入者与 4kHz 采样放在不同核上调度更稳妥；handler 逻辑短平快，留 Core 0 影响可忽略。
+- `event_bus`：订阅者回调（蜂鸣/状态灯）在 Core 0 侧居多，迁移徒增跨核事件。
+- WiFi 协议栈 / esp_timer / IDLE：由 sdkconfig 与系统决定，不动。
 
 优先级遵循**速率单调**原则：周期越短、实时性要求越高，优先级越高。观察/维护类任务（`sys_monitor`、`cfg_save_task`）刻意压低优先级，绝不能影响业务任务。
 
@@ -552,6 +559,8 @@ v0.6.3 起：API 页签重写为分接口文档（请求/响应示例、字段�
 设备端 WiFi 扫描页把「重新扫描」移入标题栏（列表一屏可见 3~4 行）；设置子页滑条/数值
 跟随网页远程下发实时同步；性能侧日志降噪（实测 2.6 → 0.8 行/秒）、WS 推送缓冲常驻化、
 LVGL 心跳 5→16ms、渲染分块 16→24 行、LVGL/UI 任务栈移回内部 RAM。
+v0.6.4 起：网页控制台打开即从设备回填设置表单；WS 推送提速到 15Hz；新增恒开的
+过温告警（机内 >60℃，DATA_ALERT_OTP）；orientation/web_console_ws/sys_monitor 迁 Core1。
 以下为**尚未实现**的缺口：
 
 | 缺口 | 现状 | 影响 |

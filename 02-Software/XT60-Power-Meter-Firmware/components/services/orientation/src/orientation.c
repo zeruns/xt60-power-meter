@@ -7,7 +7,7 @@
  * LVGL 显示与触摸同步旋转到目标角度。
  *
  * 设计要点：
- *   · 独立低优先级任务（Core0，栈 3KB，周期 150ms），I2C 读取阻塞 ≤ 几 ms；
+ *   · 独立低优先级任务（v0.6.4 起绑 Core1，栈 3KB，周期 150ms），I2C 读取阻塞 ≤ 几 ms；
  *   · 去抖：连续 ORIENT_CONFIRM_N 次读到同一姿态才切换（≈450ms 稳定，v0.6.2
  *     由 1.2s 收紧，用户需求 10：原参数要转到接近垂直才切换，太迟钝），
  *     防止转动瞬间抖动导致来回翻转；平放时驱动显式报告 FLAT，本服务
@@ -180,9 +180,14 @@ esp_err_t orientation_init(void)
     }
     BaseType_t ok = xTaskCreatePinnedToCore(task_orientation, "orientation",
                                            ORIENT_TASK_STACK, NULL, ORIENT_TASK_PRIO,
-                                           &s_task, 0);
+                                           &s_task, 1);
     /* ^ 创建 FreeRTOS 任务并绑定到指定 CPU 核：
-     *   参数依次为 任务函数、任务名、栈字节数、入参、优先级、句柄输出、目标核(0)。
+     *   参数依次为 任务函数、任务名、栈字节数、入参、优先级、句柄输出、目标核。
+     *   【v0.6.4 需求 4】绑核 0 → 1：本任务每 150ms 读一次 I2C（阻塞毫秒级）
+     *   + 偶发调 lvgl_port_set_rotation_angle（内部持 LVGL 互斥锁，跨核安全），
+     *   都在低优先级上，Core1 的 pm_sample（prio 24）可随时抢占，不影响采样；
+     *   挪走后 Core0 少一个周期性 I2C 任务，UI/LVGL 调度更从容。
+     *   与 pm_aux 共用 I2C1 总线（i2c_master 驱动自带总线锁，跨任务安全）。
      *   失败通常意味着堆内存不足，返回 pdFAIL */
     if (ok != pdPASS) {
         return ESP_ERR_NO_MEM;
