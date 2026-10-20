@@ -353,6 +353,22 @@ static esp_err_t web_config_handler(const char *key, const char *value)
         ui_set_display_rate_hz((uint8_t)hz);
         return ESP_OK;
     }
+    if (strcmp(key, "screen_off") == 0) {
+        /* 【v0.6.2 需求 11】自动降亮档位（0=永不 1=15s 2=30s 3=60s）。
+         * GET /api/config 会回读这个键，故 POST 侧必须能写，保证读写对称
+         * （实测缺口：只回读不可写时网页下发返回 ESP_ERR_NOT_FOUND）。
+         * 改档后立即回报一次"用户活动"，让降亮计时从当前时刻重新起算，
+         * 避免"刚把档位调短就马上被降亮"。 */
+        int lvl = atoi(value);
+        if (lvl < 0 || lvl > 3) {
+            return ESP_ERR_INVALID_ARG;
+        }
+        esp_err_t e = settings_set_screen_off((uint8_t)lvl);
+        if (e == ESP_OK) {
+            ui_note_user_activity();
+        }
+        return e;
+    }
     (void)cfg;
     return ESP_ERR_NOT_FOUND;
 }
