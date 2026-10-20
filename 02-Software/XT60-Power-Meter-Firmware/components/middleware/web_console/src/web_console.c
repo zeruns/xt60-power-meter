@@ -91,10 +91,12 @@ static const char *TAG = "web_console";
 
 /** HTTP 服务端口 */
 #define WEB_CONSOLE_PORT 80
-/** WS 快照推送周期（ms）。【v0.6.0】200ms(5Hz) → 100ms(10Hz)：网页波形更细腻。
- *  代价是 WS 带宽与 CPU 略增，但单帧 JSON 仅约 350 字节，10Hz 下不足 4KB/s，
- *  对局域网与双核 CPU 都毫无压力（推送任务优先级最低且栈在 PSRAM）。 */
-#define WEB_CONSOLE_PUSH_PERIOD_MS 100
+/** WS 快照推送周期（ms）。【v0.6.0】200ms(5Hz) → 100ms(10Hz)；
+ *  【v0.6.4 需求 2】100ms → 66ms（≈15Hz）：网页波形更细腻。
+ *  单帧 JSON 约 350~500 字节，15Hz 下不足 8KB/s，对局域网无压力；
+ *  CPU 侧该任务只做 snprintf + 拷贝到发送槽 + 异步排队（v0.6.3 起无堆分配），
+ *  且已迁到 Core1（见下方任务创建处），不与 UI/LVGL 抢 Core0。 */
+#define WEB_CONSOLE_PUSH_PERIOD_MS 66
 /** WS 推送任务栈（字节）：只做 snprintf + 异步排发送，4KB 足够 */
 #define WEB_CONSOLE_PUSH_TASK_STACK 4096
 /** WS 推送任务优先级：略高于 idle，不与测量/显示任务抢 CPU */
@@ -932,7 +934,7 @@ static esp_err_t api_config_post_handler(httpd_req_t *req)
  * @brief WS 异步发送槽：一个常驻缓冲 + 忙标志（v0.6.3 性能：去掉每帧堆分配）
  *
  * 【为什么改成常驻槽】旧实现在每次广播里为**每个** WS 客户端
- * heap_caps_malloc(len+1) 一份缓冲、发送完成后 free——网页端 10Hz 推送时
+ * heap_caps_malloc(len+1) 一份缓冲、发送完成后 free——网页端 15Hz 推送时
  * 即便只有 1 个客户端也是 10 次/秒分配+释放（多客户端线性增长）。虽然走的是
  * PSRAM，但持续的分配/释放会带来堆碎片与锁开销，且每次都要做 malloc 失败分支。
  * 现在改为启动时一次性分配 WEB_CONSOLE_MAX_CLIENTS 个槽（8×512B≈4KB PSRAM），
@@ -1211,7 +1213,13 @@ esp_err_t web_console_start(void)
     config.max_resp_headers = 4;
     config.stack_size = 6144;    /* URI 处理器要拼 JSON + 回调上层写 NVS，比默认 4096 留宽些 */
     config.lru_purge_enable = true; /* 连接满时淘汰最久未用的，避免僵尸会话占坑 */
-    config.core_id = 0;          /* 与工程约定一致：Core 0 = 交互与通信 */
+    config.core_id = 0;          /* httpd 留守 Core0（v0.6.4 核分工复查确认）：
+                                  * URI handler 里有 NVS 写（settings 落盘）与 OTA
+                                  * 上传（flash 擦写）——虽然 flash 停顿是双核全局
+                                  * 的（cache 一致性），但把 flash 写入者与 4kHz
+                                  * 采样任务放在不同核上，调度上更稳妥；且 handler
+                                  * 逻辑短平快，留 Core0 对交互核影响可忽略。
+                                  * WS 推送任务已迁 Core1（见上方创建处）。 */
 
     httpd_handle_t server = NULL;
     esp_err_t err = httpd_start(&server, &config);
@@ -1293,12 +1301,16 @@ esp_err_t web_console_start(void)
     s_push_stop_req = false;
     TaskHandle_t task = NULL;
     /* 任务栈放 PSRAM（MALLOC_CAP_SPIRAM）：WS 推送任务不做 ISR 相关操作，
-     * 不需要内部 RAM 栈；内部 RAM 仅剩极少余量（v0.5.0 实测），4KB 内部栈
-     * 会创建失败（ESP_ERR_NO_MEM）。⚠ 测量采样任务仍必须内部 RAM 栈
-     * （见架构文档：ISR 在任务栈上运行且不能访问 PSRAM）。 */
+     * 不需要内部 RAM 栈。⚠ 测量采样任务仍必须内部 RAM 栈
+     * （见架构文档：ISR 在任务栈上运行且不能访问 PSRAM）。
+     * 【v0.6.4 需求 4】绑核 0 → 1：该任务只做 snprintf + data_store 无锁读 +
+     * httpd_ws_send_data_async（把 socket 写排队给 httpd 任务，跨核安全），
+     * 无 LVGL/驱动访问；Core0 已挤满 UI/LVGL/httpd/WiFi，挪到 Core1 与
+     * pm_aux（同 prio 4~5）共处。pm_sample 优先级 24 会随时抢占它，
+     * 实测迁移后 drdy/drop 计数无变化（见架构文档双核分工一节）。 */
     if (xTaskCreatePinnedToCoreWithCaps(ws_push_task, "web_console_ws",
                                         WEB_CONSOLE_PUSH_TASK_STACK, NULL,
-                                        WEB_CONSOLE_PUSH_TASK_PRIO, &task, 0,
+                                        WEB_CONSOLE_PUSH_TASK_PRIO, &task, 1,
                                         MALLOC_CAP_SPIRAM) != pdPASS) {
         ESP_LOGE(TAG, "WS 推送任务创建失败");
         s_server = NULL;
@@ -1312,7 +1324,7 @@ esp_err_t web_console_start(void)
     ESP_LOGI(TAG, "网页控制台已启动：http://<设备IP>:%d/（WS %s）",
              WEB_CONSOLE_PORT,
 #if CONFIG_HTTPD_WS_SUPPORT
-             "已启用，约 5Hz 推送"
+             "已启用，约 15Hz 推送"
 #else
              "未启用（CONFIG_HTTPD_WS_SUPPORT=n），页面将退化为轮询"
 #endif
