@@ -451,6 +451,10 @@ opcode 封装与约 200 条分页式初始化序列都由组件负责，**驱动
   这样避免了渲染中 SPIFFS 读（spi_flash 读会挂起 MSPI cache）与 NVS 擦除/
   LCD DMA 交错的 cache 故障窗口。文件缺失时回退内置 montserrat14（仅 ASCII）。
 - **不要改回 `lv_tiny_ttf_create_file()` 边渲染边读**，除非重新评估 cache 安全。
+- 子集扫描范围（v0.6.2 需求 3）：`make_fonts.py` 与 `tools/fonts/audit_glyphs.py`
+  均扫描**整个 `components/`** 的字符串字面量（此前只扫 `services/ui/src`），避免
+  "上游组件里定义、最终却显示到屏幕上"的文案漏字；内嵌网页 `web_console_page.c`
+  例外——它的字符串由浏览器字体渲染，不经过设备字库（emoji/✔✘ 之类也进不了 CJK TTF）。
 - NVS 定时擦除期间 4kHz DRDY 中断仍持续，故必须开 `CONFIG_GPIO_ISR_IRAM_SAFE`。
 
 ### 测量链路（4kSPS）
@@ -535,6 +539,9 @@ version.txt               固件版本号
 测量链路、三页正式 UI、自动转屏均已实现；`wifi_manager`（STA / AP 配网 + 模式三档 +
 扫描 + RSSI，v0.6.0/0.6.1）与 `web_console`（内嵌网页控制台，v0.6.0 起为
 实时数据 / 波形图 / 设置 / API / 日志五页签，10Hz 推送 + WiFi 扫描配网）已落地。
+v0.6.2 起 web_console 增加 `GET /api/config`（回读配置）与 `GET /api/info`
+（版本 / IP / MAC / 运行时间 / 内存水位）；设备端新增"无操作 15/30/60s 背光降到 10%"
+的自动降亮（触摸与按键均重置计时并恢复亮度）。
 以下为**尚未实现**的缺口：
 
 | 缺口 | 现状 | 影响 |
