@@ -349,6 +349,12 @@ gcc -std=c11 -Wall -Wextra -I components/services/power_measure/include \
 它允许把任务栈放进 PSRAM 以节省内部 RAM。但**中断服务程序运行在当前任务栈上，
 且中断期间不能访问 PSRAM**，因此凡可能被中断打断时正在使用的任务
 （尤其测量采样任务），其栈必须在内部 RAM —— 创建时不要传 `MALLOC_CAP_SPIRAM`。
+v0.6.3 起 LVGL 渲染任务与 UI 任务的栈已由 PSRAM **移回内部 RAM**（原因见下）：
+ALWAYSINTERNAL=0 之后内部 RAM 实测空闲约 130KB，而栈是被高频访问的内存
+（函数调用/局部变量），内部 RAM 访问延迟远低于 PSRAM（免走 cache）。
+非 ISR 安全强制的栈放内部 RAM 只是"更快"，若将来内部 RAM 吃紧可随时改回
+`MALLOC_CAP_SPIRAM` 降级，功能不受影响（实测：同时把渲染分块提到 24 行后
+内部 RAM 历史最低仍有约 71KB）。
 
 **小分配内存策略（v0.6.1 根因修复）**：`CONFIG_SPIRAM_MALLOC_ALWAYSINTERNAL=0`
 ——普通 `malloc` 先从内部 RAM 分配、不足时自动溢出到 PSRAM，分配不会因阈值失败。
@@ -542,6 +548,10 @@ version.txt               固件版本号
 v0.6.2 起 web_console 增加 `GET /api/config`（回读配置）与 `GET /api/info`
 （版本 / IP / MAC / 运行时间 / 内存水位）；设备端新增"无操作 15/30/60s 背光降到 10%"
 的自动降亮（触摸与按键均重置计时并恢复亮度）。
+v0.6.3 起：API 页签重写为分接口文档（请求/响应示例、字段表、错误码总表 + 一键填入测试台）；
+设备端 WiFi 扫描页把「重新扫描」移入标题栏（列表一屏可见 3~4 行）；设置子页滑条/数值
+跟随网页远程下发实时同步；性能侧日志降噪（实测 2.6 → 0.8 行/秒）、WS 推送缓冲常驻化、
+LVGL 心跳 5→16ms、渲染分块 16→24 行、LVGL/UI 任务栈移回内部 RAM。
 以下为**尚未实现**的缺口：
 
 | 缺口 | 现状 | 影响 |
