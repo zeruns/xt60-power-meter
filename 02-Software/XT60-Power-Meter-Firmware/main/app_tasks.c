@@ -360,6 +360,44 @@ static esp_err_t web_config_handler(const char *key, const char *value)
         }
         return e;
     }
+    /* ---- v0.6.6 需求 3：清零电能统计（网页端按钮）----
+     * 与设备端「电能统计 → 清零统计」同一套动作：只置请求标志，测量核在下一个
+     * 200ms 块边界执行，保持"电能值单写者"约定（跨核直接改会撕裂 float）。 */
+    if (strcmp(key, "energy_reset") == 0) {
+        if (atoi(value) != 1) {
+            return ESP_ERR_INVALID_ARG;
+        }
+        return power_measure_reset_energy();
+    }
+    /* ---- v0.6.6 需求 4/5：测量设置（标定）----
+     * cal_v_gain / cal_v_offset / cal_i_gain / cal_i_offset：直接改标定参数；
+     * cal_i_zero=1：发起 3 秒空载块均值自动校零（与设备端「一键清零」同一实现）。
+     * 都用 deferred 版本：httpd 任务上下文绝不能同步写 NVS（数百 ms 卡住服务）。 */
+    if (strcmp(key, "cal_i_zero") == 0) {
+        if (atoi(value) != 1) {
+            return ESP_ERR_INVALID_ARG;
+        }
+        return power_measure_zero_current_start();
+    }
+    if (strcmp(key, "cal_v_gain") == 0 || strcmp(key, "cal_v_offset") == 0 ||
+        strcmp(key, "cal_i_gain") == 0 || strcmp(key, "cal_i_offset") == 0) {
+        const float v = strtof(value, NULL);
+        if (!isfinite(v)) {
+            return ESP_ERR_INVALID_ARG; /* 挡住 nan/inf，避免污染标定 */
+        }
+        power_measure_calib_t cal;
+        power_measure_get_calibration(&cal);
+        if (strcmp(key, "cal_v_gain") == 0) {
+            cal.voltage_gain = v;   /* V/LSB，必须 > 0（deferred 内部校验） */
+        } else if (strcmp(key, "cal_v_offset") == 0) {
+            cal.voltage_offset = v; /* V */
+        } else if (strcmp(key, "cal_i_gain") == 0) {
+            cal.current_gain = v;   /* A/LSB */
+        } else {
+            cal.current_offset = v; /* A */
+        }
+        return power_measure_set_calibration_deferred(&cal);
+    }
     (void)cfg;
     return ESP_ERR_NOT_FOUND;
 }
