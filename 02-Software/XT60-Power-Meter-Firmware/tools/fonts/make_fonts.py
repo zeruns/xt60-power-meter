@@ -49,8 +49,14 @@ def collect_unicodes():
     codes.update(range(0x3000, 0x303F + 1))
     # 全角 ASCII / 标点（含全角冒号 U+FF1A 等）
     codes.update(range(0xFF01, 0xFF5E + 1))
-    # GB2312 一级字库（一级汉字，第一字节 B0~D7，第二字节 A1~FE，约 3755 字）
-    for b1 in range(0xB0, 0xD7 + 1):
+    # 【v0.6.5 需求 2】GB2312 **一级 + 二级**字库（共 6763 字）。
+    # 此前只取一级（区码 B0~D7，3755 字），用户反馈中文 WiFi 名（SSID）里的
+    # 二级汉字（区码 D8~F7，3008 字）显示成方框。
+    # 为什么不上 GBK 全量（约 21003 字）：按当前约 0.27KB/字形的实测密度，
+    # 单字重约 5.6MB、两字重约 11MB，装不进 8MB 的 storage 分区；
+    # GB2312 全量两字重约 3.8MB，可以放下（容量账见 docs/architecture.md）。
+    # 已知取舍：GB2312 之外的 GBK 生僻字（如人名用字"喆""堃"）与 emoji 仍会缺字。
+    for b1 in range(0xB0, 0xF7 + 1):
         for b2 in range(0xA1, 0xFE + 1):
             try:
                 ch = bytes((b1, b2)).decode("gb2312")
