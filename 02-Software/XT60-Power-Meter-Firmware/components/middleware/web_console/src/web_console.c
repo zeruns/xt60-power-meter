@@ -71,12 +71,17 @@
 
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
+#include "esp_app_desc.h" /* v0.6.2：GET /api/info 返回固件版本（app_desc->version） */
 #include "esp_heap_caps.h"
 #include "esp_http_server.h"
+#include "esp_idf_version.h" /* IDF_VER：/api/info 里回报 IDF 版本 */
+#include "esp_mac.h"         /* esp_read_mac：/api/info 里回报设备 MAC */
+#include "esp_system.h"      /* esp_get_free_heap_size / minimum：/api/info 内存水位 */
 #include "esp_timer.h"
 #include "esp_log.h"
 
 #include "data_store.h"
+#include "settings.h"      /* v0.6.2 需求 13：GET /api/config 回读用户配置 */
 #include "wifi_manager.h" /* v0.6.0：/api/state 增 WiFi 状态/RSSI，/api/wifi/scan 封装扫描 */
 
 /** 日志标签 */
@@ -106,6 +111,10 @@ static const char *TAG = "web_console";
 #define WEB_CONSOLE_KEY_MAX 48
 /** 参数值长度上限（字节，含结尾 '\0'） */
 #define WEB_CONSOLE_VALUE_MAX 256
+/** GET /api/config 应答缓冲（字节）：约 220 字节的配置 JSON，留足余量 */
+#define WEB_CONSOLE_CFGJSON_BUF_LEN 384
+/** GET /api/info 应答缓冲（字节）：版本/IP/MAC/内存水位等，约 260 字节 */
+#define WEB_CONSOLE_INFOJSON_BUF_LEN 320
 
 /* ============================ 运行状态 ============================ */
 
@@ -567,6 +576,102 @@ static esp_err_t api_state_get_handler(httpd_req_t *req)
                      "{\"ok\":false,\"code\":\"internal\",\"msg\":\"build json failed\"}");
 }
 
+/**
+ * @brief GET /api/config：回读当前全部可下发设置（v0.6.2 需求 13）
+ *
+ * POST /api/config 是"写"，本接口是配套的"读"：上位机/网页先把设备现有配置
+ * 拉下来，再决定改哪几项，避免"盲写"把没打算动的项一起覆盖。
+ * 键名与 POST 接受的键名**完全一致**（前端可双向复用同一套字段表）。
+ *
+ * @param req 当前请求
+ * @return 应答结果
+ */
+static esp_err_t api_config_get_handler(httpd_req_t *req)
+{
+    settings_t cfg;
+    settings_alarm_t alm;
+    if (settings_get(&cfg) != ESP_OK || settings_get_alarm(&alm) != ESP_OK) {
+        /* settings 未就绪极少发生（属于启动顺序问题），按服务暂不可用回 */
+        return send_json(req, "503 Service Unavailable",
+                         "{\"ok\":false,\"code\":\"no_data\",\"msg\":\"settings not ready\"}");
+    }
+
+    char buf[WEB_CONSOLE_CFGJSON_BUF_LEN];
+    int n = snprintf(buf, sizeof(buf),
+                     "{\"ok\":true,"
+                     "\"lcd_brightness\":%u,\"buzzer_volume\":%u,\"display_rate_hz\":%u,"
+                     "\"screen_off\":%u,\"orientation_auto\":%u,\"orientation_angle\":%u,"
+                     "\"wave_window\":%u,\"wave_mode\":%u,\"wave_smooth\":%u,"
+                     "\"alarm_v_en\":%u,\"alarm_i_en\":%u,\"alarm_p_en\":%u,"
+                     "\"alarm_v_limit\":%.3f,\"alarm_i_limit\":%.3f,\"alarm_p_limit\":%.3f,"
+                     "\"wifi_mode\":%d}",
+                     (unsigned)cfg.lcd_brightness, (unsigned)cfg.buzzer_volume,
+                     (unsigned)cfg.display_rate_hz, (unsigned)cfg.screen_off_s,
+                     (unsigned)cfg.orientation_auto, (unsigned)cfg.orientation_angle,
+                     (unsigned)cfg.wave_window, (unsigned)cfg.wave_mode,
+                     (unsigned)cfg.wave_smooth, (unsigned)alm.v_en, (unsigned)alm.i_en,
+                     (unsigned)alm.p_en, (double)alm.v_limit, (double)alm.i_limit,
+                     (double)alm.p_limit, (int)wifi_manager_get_mode());
+    if (n <= 0 || (size_t)n >= sizeof(buf)) {
+        return send_json(req, HTTPD_500,
+                         "{\"ok\":false,\"code\":\"internal\",\"msg\":\"config json overflow\"}");
+    }
+    return send_json(req, HTTPD_200, buf);
+}
+
+/**
+ * @brief GET /api/info：设备信息与运行态（v0.6.2 需求 13）
+ *
+ * 返回固件版本 / IDF 版本 / IP / MAC / 运行时间 / 堆水位（内部+PSRAM）/
+ * WiFi 状态。做上位机对接时最常用的"握手"接口，也便于远程确认设备内存
+ * 是否健康（内部 RAM 余量是本项目曾踩过的坑，见 app_tasks.c 的水位日志）。
+ *
+ * @param req 当前请求
+ * @return 应答结果
+ */
+static esp_err_t api_info_get_handler(httpd_req_t *req)
+{
+    const esp_app_desc_t *app = esp_app_get_description();
+
+    char ip[16] = "";
+    if (wifi_manager_get_ip(ip, sizeof(ip)) != ESP_OK) {
+        snprintf(ip, sizeof(ip), "--"); /* 未连接路由器时无 IP */
+    }
+    uint8_t mac[6] = { 0 };
+    (void)esp_read_mac(mac, ESP_MAC_WIFI_STA);
+    char macstr[18];
+    snprintf(macstr, sizeof(macstr), "%02X:%02X:%02X:%02X:%02X:%02X", mac[0], mac[1],
+             mac[2], mac[3], mac[4], mac[5]);
+
+    int8_t rssi = 0;
+    char s_rssi[16];
+    if (wifi_manager_get_rssi(&rssi) == ESP_OK) {
+        snprintf(s_rssi, sizeof(s_rssi), "%d", (int)rssi);
+    } else {
+        snprintf(s_rssi, sizeof(s_rssi), "null"); /* 未连接：无信号数据 */
+    }
+
+    char buf[WEB_CONSOLE_INFOJSON_BUF_LEN];
+    int n = snprintf(buf, sizeof(buf),
+                     "{\"ok\":true,\"version\":\"%s\",\"idf\":\"%s\",\"ip\":\"%s\","
+                     "\"mac\":\"%s\",\"uptime_s\":%lld,"
+                     "\"heap_free\":%u,\"heap_min\":%u,"
+                     "\"psram_free\":%u,\"psram_total\":%u,"
+                     "\"wifi_state\":%d,\"wifi_mode\":%d,\"wifi_rssi\":%s}",
+                     (app != NULL) ? app->version : "?", IDF_VER, ip, macstr,
+                     (long long)(esp_timer_get_time() / 1000000LL),
+                     (unsigned)esp_get_free_heap_size(),
+                     (unsigned)esp_get_minimum_free_heap_size(),
+                     (unsigned)heap_caps_get_free_size(MALLOC_CAP_SPIRAM),
+                     (unsigned)heap_caps_get_total_size(MALLOC_CAP_SPIRAM),
+                     (int)wifi_manager_get_state(), (int)wifi_manager_get_mode(), s_rssi);
+    if (n <= 0 || (size_t)n >= sizeof(buf)) {
+        return send_json(req, HTTPD_500,
+                         "{\"ok\":false,\"code\":\"internal\",\"msg\":\"info json overflow\"}");
+    }
+    return send_json(req, HTTPD_200, buf);
+}
+
 /* ============================ 历史记录与 CSV 导出（F9） ============================
  * 分钟级内存环：每 60s 记一帧快照，保留 60 点（1 小时），GET /api/export.csv
  * 逐行分块输出。记录挂在快照 JSON 生成路径上（ws 推送与 /api/state 都会走到），
@@ -578,7 +683,11 @@ typedef struct {
     int64_t ts_us;   /* 记录时刻（esp_timer µs，导出时转分钟相对时） */
     data_store_snapshot_t snap;
 } hist_point_t;
-static hist_point_t s_hist[HIST_POINTS];
+/* 【v0.6.2 内存优化】历史环从 BSS 移到 PSRAM 堆：
+ * 60 点 × sizeof(hist_point_t) ≈ 6KB。它是"一分钟才写一次、导出时才读"的
+ * 冷数据，放在内部 RAM 的 .bss 里纯属浪费——内部 RAM 要留给 DMA/ISR/任务栈。
+ * 分配失败时退化为"不记录历史"（导出接口返回空表），不影响测量与实时数据。 */
+static hist_point_t *s_hist = NULL;
 static int s_hist_head = 0;   /* 下一个写入位 */
 static int s_hist_count = 0;
 static int64_t s_hist_last_us = 0;
@@ -586,6 +695,9 @@ static int64_t s_hist_last_us = 0;
 /** 快照历史记录（墙钟 60s 节拍；由快照生成路径捎带触发） */
 static void hist_tick(void)
 {
+    if (s_hist == NULL) {
+        return; /* PSRAM 分配失败：不记录历史（实时数据仍正常） */
+    }
     data_store_snapshot_t snap;
     if (data_store_get(&snap) != ESP_OK) {
         return;
@@ -617,6 +729,10 @@ static esp_err_t api_export_csv_handler(httpd_req_t *req)
              "soc_temp_c,battery_mv,runtime_s\r\n");
     if (httpd_resp_send_chunk(req, line, HTTPD_RESP_USE_STRLEN) != ESP_OK) {
         return ESP_FAIL;
+    }
+    if (s_hist == NULL) {
+        /* 历史环未分配（PSRAM 不足）：只发表头，前端得到空表而不是 500 */
+        return httpd_resp_send_chunk(req, NULL, 0);
     }
     const int base_idx = (s_hist_head - s_hist_count + HIST_POINTS) % HIST_POINTS;
     const int64_t base = (s_hist_count > 0) ? s_hist[base_idx].ts_us : 0;
@@ -1043,10 +1159,21 @@ esp_err_t web_console_start(void)
         return ESP_ERR_INVALID_STATE;
     }
 
+    /* v0.6.2：历史环按需分配到 PSRAM（冷数据，见 s_hist 定义处说明）。
+     * 只在首次 start 时分配一次（stop/start 循环复用，避免反复申请）。 */
+    if (s_hist == NULL) {
+        s_hist = heap_caps_calloc(HIST_POINTS, sizeof(hist_point_t), MALLOC_CAP_SPIRAM);
+        if (s_hist == NULL) {
+            ESP_LOGW(TAG, "历史环分配失败（PSRAM 不足）：/api/export.csv 将只返回表头");
+        }
+    }
+
     httpd_config_t config = HTTPD_DEFAULT_CONFIG();
     config.server_port = WEB_CONSOLE_PORT;
     config.max_open_sockets = WEB_CONSOLE_MAX_CLIENTS;
-    config.max_uri_handlers = 6; /* / 、/ws 、/api/state 、/api/config 、/api/export.csv 、/api/wifi/scan */
+    /* 处理器槽位：/ 、/ws 、/api/state 、/api/config(POST) 、/api/config(GET) 、
+     * /api/export.csv 、/api/wifi/scan 、/api/info（v0.6.2 需求 13 新增后两个） */
+    config.max_uri_handlers = 8;
     config.max_resp_headers = 4;
     config.stack_size = 6144;    /* URI 处理器要拼 JSON + 回调上层写 NVS，比默认 4096 留宽些 */
     config.lru_purge_enable = true; /* 连接满时淘汰最久未用的，避免僵尸会话占坑 */
@@ -1081,6 +1208,17 @@ esp_err_t web_console_start(void)
         .method = HTTP_POST,
         .handler = api_config_post_handler,
     };
+    /* v0.6.2 需求 13：同一路径的"读"（GET 回读配置）与设备信息 */
+    static const httpd_uri_t uri_config_get = {
+        .uri = "/api/config",
+        .method = HTTP_GET,
+        .handler = api_config_get_handler,
+    };
+    static const httpd_uri_t uri_info = {
+        .uri = "/api/info",
+        .method = HTTP_GET,
+        .handler = api_info_get_handler,
+    };
     /* v0.6.0：WiFi 扫描（网页设置页的「搜索 WiFi」用它） */
     static const httpd_uri_t uri_wifi_scan = {
         .uri = "/api/wifi/scan",
@@ -1106,6 +1244,8 @@ esp_err_t web_console_start(void)
         httpd_register_uri_handler(server, &uri_ws) != ESP_OK ||
         httpd_register_uri_handler(server, &uri_state) != ESP_OK ||
         httpd_register_uri_handler(server, &uri_config) != ESP_OK ||
+        httpd_register_uri_handler(server, &uri_config_get) != ESP_OK ||
+        httpd_register_uri_handler(server, &uri_info) != ESP_OK ||
         httpd_register_uri_handler(server, &uri_export) != ESP_OK ||
         httpd_register_uri_handler(server, &uri_wifi_scan) != ESP_OK) {
         ESP_LOGE(TAG, "URI 注册失败");
