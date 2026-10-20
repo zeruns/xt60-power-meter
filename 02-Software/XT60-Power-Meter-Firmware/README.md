@@ -123,6 +123,23 @@ idf.py -p COMx monitor   # 查看串口日志（115200）
 
 烧录速率可设环境变量 `ESPBAUD`（约定 921600）：`$env:ESPBAUD="921600"`。
 
+**固件由 5 个镜像组成，各烧到固定偏移**（`idf.py flash` 会按 `build/flash_args` 自动处理）：
+
+| 文件 | 偏移 | 作用 |
+|---|---|---|
+| `bootloader.bin` | `0x0` | 二级引导程序 |
+| `partition-table.bin` | `0x8000` | 分区表 |
+| `ota_data_initial.bin` | `0xf000` | OTA 槽位初始选择 |
+| `XT60-Power-Meter-Firmware.bin` | `0x20000` | 应用固件（代码 + 内嵌网页，约 1.5MB） |
+| `storage.bin` | `0x830000` | SPIFFS 字体镜像（中文字体约 4.2MB） |
+
+> **改字库必须全量烧录**：字体在独立的 `storage` 分区，**OTA 只更新 app**，
+> 只走 OTA 会出现"升级成功但中文仍显示方框"。
+>
+> 不装 ESP-IDF 也可以用网页工具 **ESPConnect**（Chrome/Edge + Web Serial）烧录，
+> 支持单文件 `XT60-Power-Meter-full.bin`（偏移 `0x0`）或按上表分文件烧。
+> 详细步骤、参数与排错见 **[docs/build_and_flash.md](docs/build_and_flash.md)**。
+
 ## 目录结构
 
 ```
@@ -155,6 +172,7 @@ sdkconfig.defaults        配置基线（sdkconfig 不入库，克隆后自动�
 | 文档 | 内容 |
 |---|---|
 | [docs/architecture.md](docs/architecture.md) | **固件架构**：分层结构、状态机、启动容错、双核分工、seqlock、QSPI 踩坑记录、测量链路 |
+| [docs/build_and_flash.md](docs/build_and_flash.md) | **固件组成与烧录**：5 个镜像各自作用/偏移、分区表、`idf.py` / 网页 ESPConnect 两种烧法、OTA 限制与排错 |
 | [docs/hardware_pinout.md](docs/hardware_pinout.md) | **引脚分配表**：GPIO 映射、总线分配、Strapping 约束、中断与内存约束 |
 | [tools/ui_sim/README.md](tools/ui_sim/README.md) | **UI 模拟器**：PC 上运行真机同源界面，烧录前走查与回归 |
 | [CONTRIBUTING.md](CONTRIBUTING.md) | **贡献指南**：开发环境、构建烧录、UI 回归、代码规范与提交规范 |

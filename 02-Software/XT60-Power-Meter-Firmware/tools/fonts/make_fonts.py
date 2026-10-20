@@ -3,12 +3,17 @@
 make_fonts.py — 生成 SPIFFS 用中文字体子集（Regular + Bold）
 
 数据源：Noto Sans SC（SIL OFL 1.1 开源授权）可变 TTF（google/fonts 仓库）。
-流程：下载 VF → 按字重实例化（400/700）→ 子集化（ASCII + GB2312 一级字库
-3755 字 + 全角标点/单位符号）→ 输出到 fs_storage/spiffs_image/fonts/。
+流程：下载 VF → 按字重实例化（500/700，见 WEIGHTS 注释）→ 子集化
+（ASCII + CJK 标点 + 全角符号 + **GB2312 一级+二级 6763 汉字** + components/
+源码里出现的所有字符）→ 输出到 fs_storage/spiffs_image/fonts/。
+
+产出体积（v0.6.5 实测）：约 7078 码点 / 7075 字形，单字重约 2.09MB、两字重约 4.18MB；
+storage 分区可用 7346KB，烧录后已用约 4208KB（剩余约 3.1MB）。
+⚠ 字体在 storage 分区，**OTA 升级不更新它**，改字库后必须全量 `idf.py flash`。
 
 为什么不用 simhei.ttf / msyhbd.ttc：二者为微软版权字体，随固件分发有授权风险。
-为什么自己子集：全量 Noto SC 单字重约 10MB+，子集后约 1~2MB，8MB SPIFFS 分区
-可轻松容纳两个字重，且覆盖几乎所有常用汉字，不会再出方框。
+为什么自己子集：全量 Noto SC 单字重约 10MB+，两个字重装不进 8MB 分区；
+GB2312 全量已覆盖绝大多数常用汉字（含二级字，解决中文 WiFi 名缺字）。
 
 用法：
     python make_fonts.py

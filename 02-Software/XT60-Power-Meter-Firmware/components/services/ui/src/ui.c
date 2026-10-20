@@ -663,7 +663,11 @@ static void task_ui(void *arg)
                 if (cur != 0 && cur != s_alert_shown_mask) {
                     /* 上升沿（或越限项变化）：弹窗（替换旧弹窗，不堆叠） */
                     alert_box_close();
-                    char msg[96] = "";
+                    /* 缓冲 96 → 160 字节（v0.6.5）：四条告警各约 12~16 字节，
+                     * 加上过温那条"主控 xx℃ / 机内 xx℃"+ 两行降温提示约 60 字节，
+                     * 96 字节在最坏组合（四项同时越限）下会被 snprintf 截断——
+                     * 截断虽安全（不越界）但会丢提示文字，故放大到 160。 */
+                    char msg[160] = "";
                     if (cur & DATA_ALERT_OVP) {
                         snprintf(msg + strlen(msg), sizeof(msg) - strlen(msg), "过压 %.2fV\n",
                                  (double)latest.voltage_v);

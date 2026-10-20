@@ -29,6 +29,12 @@ export IDF_PATH=/path/to/esp-idf
 
 已加载 IDF 环境的终端也可直接 `idf.py build` / `idf.py flash`。
 
+**烧录范围提醒**（详见 [docs/build_and_flash.md](docs/build_and_flash.md)）：
+`idf.py flash` 会烧 5 个镜像（bootloader / 分区表 / otadata / app / storage）。
+其中 `storage.bin` 装的是 SPIFFS 中文字体，**OTA 不会更新它**——
+只要改过字库（`tools/fonts/make_fonts.py`），就必须**插 USB 全量烧录**，
+否则会出现"升级成功但中文仍显示方框"。只改业务代码时可用 `idf.py app-flash` 省时间。
+
 ## UI 改动必须先跑模拟器回归
 
 改动 `components/services/ui/` 或界面相关代码后，**先跑 PC 模拟器回归再上实机**：

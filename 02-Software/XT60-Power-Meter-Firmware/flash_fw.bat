@@ -14,6 +14,11 @@ rem NOTE: keep this file ASCII-only. cmd.exe reads .bat in the OEM
 rem codepage (e.g. GBK); UTF-8 multibyte sequences can swallow the
 rem line ending and corrupt parsing. Chinese docs live in README.md
 rem / CONTRIBUTING.md instead.
+rem
+rem Flashing writes 5 images (bootloader / partition table / otadata /
+rem app / storage). The storage image holds the SPIFFS CJK fonts and is
+rem NOT touched by OTA, so re-flash fully after regenerating fonts.
+rem See docs/build_and_flash.md for offsets and the ESPConnect guide.
 rem ============================================================
 
 if defined IDF_PATH goto :have_idf
