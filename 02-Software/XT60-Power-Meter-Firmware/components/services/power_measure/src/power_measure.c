@@ -235,6 +235,22 @@ static atomic_bool s_persist_dirty = false;
 /** 电能清零请求（UI 核 → 测量核）：由采样任务在块边界消费，保持电能值单写者 */
 static atomic_bool s_reset_energy_req = false;
 
+/* ---- 电流零点自动校准（v0.6.6 需求 5：改为采样 3 秒平均）----
+ * 为什么放到测量核而不是 UI/网页侧：
+ *   · 原实现是 UI 用 lv_timer 每 40ms 读一次 data_store 快照、采样 1 秒求平均。
+ *     快照是"40Hz 显示帧"，已经过显示平滑，且 1 秒仅约 25~40 帧；
+ *   · 测量核每 200ms 产出的**块均值**才是电流的权威口径（与正式测量同源），
+ *     在块边界累计不会引入读快照的时序抖动，3 秒 = 15 块样本也更抗毛刺；
+ *   · UI 与网页控制台共用这一份实现，避免两处口径不一致。
+ * 跨核约定：请求/运行/完成状态用 C11 原子量；累计变量只在测量核内读写，无需加锁。 */
+#define PM_ZERO_CURRENT_SEC 3u /**< 零点采样时长（秒）；块周期 200ms → 15 块 */
+static atomic_bool s_zero_req = false;     /**< 校准请求（任意核置位，测量核消费） */
+static atomic_bool s_zero_running = false; /**< 采样进行中（测量核写，外部只读） */
+static atomic_bool s_zero_done = false;    /**< 最近一次采样已完成（外部据此判结束） */
+static float s_zero_sum = 0.0f;            /**< 采样电流累计（A，仅测量核访问） */
+static uint32_t s_zero_blocks = 0;         /**< 已累计块数（仅测量核访问） */
+static float s_zero_avg = 0.0f;            /**< 最近一次采样均值（A，完成时写） */
+
 /** 辅助量（温湿度/电池）：task_aux 写、task_sample 合并进快照，用互斥锁保护 */
 static struct {
     SemaphoreHandle_t mutex;   /**< 保护本结构体的互斥锁 */
@@ -1102,6 +1118,35 @@ static void task_sample(void *arg)
                 s_alert_mask = new_mask;
             }
 
+            /* ---- 电流零点自动校准采样（v0.6.6 需求 5：3 秒块均值）----
+             * 放在块边界消费请求：i_mean 是 200ms 的权威块均值，累计 15 块
+             * 恰为 3 秒；比 UI 侧读 40Hz 显示快照更干净（无平滑/抽取影响）。
+             * 完成时把零偏按"抵消均值"调整（物理量 = raw×gain + offset），
+             * 并走 deferred 落盘——本函数在测量核里，绝不能同步写 NVS
+             * （nvs_commit 数百 ms 会直接吃掉采样窗口、导致丢帧）。 */
+            if (atomic_exchange(&s_zero_req, false)) {
+                s_zero_sum = 0.0f;
+                s_zero_blocks = 0;
+                atomic_store(&s_zero_done, false);
+                atomic_store(&s_zero_running, true);
+            }
+            if (atomic_load(&s_zero_running)) {
+                s_zero_sum += i_mean;
+                s_zero_blocks++;
+                if (s_zero_blocks >= (PM_ZERO_CURRENT_SEC * PM_BLOCK_PER_SEC)) {
+                    s_zero_avg = s_zero_sum / (float)s_zero_blocks;
+                    power_measure_calib_t cal;
+                    power_measure_get_calibration(&cal);
+                    cal.current_offset -= s_zero_avg;
+                    (void)power_measure_set_calibration_deferred(&cal);
+                    atomic_store(&s_zero_running, false);
+                    atomic_store(&s_zero_done, true);
+                    ESP_LOGI(TAG, "电流零点校准完成：%u 块（%u 秒）均值 %.5f A，零偏已更新",
+                             (unsigned)s_zero_blocks, (unsigned)PM_ZERO_CURRENT_SEC,
+                             (double)s_zero_avg);
+                }
+            }
+
             /* 显示平滑：一阶低通（EMA），避免数值高频跳动。
              * alpha 越小越平滑、响应越慢，0.25 约 0.8s 时间常数。 */
             if (!disp_init) {
@@ -1485,6 +1530,53 @@ esp_err_t power_measure_reset_energy(void)
      * atomic_store：C11 原子写，跨核可见且不会写出"半个值" */
     atomic_store(&s_reset_energy_req, true);
     return ESP_OK;
+}
+
+/**
+ * @brief 发起一次电流零点自动校准（v0.6.6 需求 5）
+ *
+ * 由测量核在块边界执行：累计 PM_ZERO_CURRENT_SEC(3) 秒的电流块均值，结束后把
+ * current_offset 按"抵消均值"调整并 deferred 落盘（不阻塞采样）。
+ * 非阻塞接口：只置请求标志立即返回；进度与结果用下面两个查询函数读取。
+ *
+ * 为什么在测量核做：块均值是电流的权威口径，且 3 秒 = 15 块样本比 UI 侧读
+ * 40Hz 显示快照的 1 秒 25 帧更稳；UI 与网页共用同一实现，口径一致。
+ *
+ * @return ESP_OK 请求已受理；ESP_ERR_INVALID_STATE 组件未初始化；
+ *         ESP_ERR_INVALID_STATE 已有一次采样在进行中（不重复排队）
+ */
+esp_err_t power_measure_zero_current_start(void)
+{
+    if (!s_inited) {
+        return ESP_ERR_INVALID_STATE;
+    }
+    if (atomic_load(&s_zero_running)) {
+        return ESP_ERR_INVALID_STATE; /* 已在采样：忽略重复请求 */
+    }
+    atomic_store(&s_zero_req, true);
+    return ESP_OK;
+}
+
+/**
+ * @brief 查询电流零点校准是否仍在采样
+ * @return true=采样中（约 3 秒）；false=空闲或已完成
+ */
+bool power_measure_zero_current_is_running(void)
+{
+    return atomic_load(&s_zero_running);
+}
+
+/**
+ * @brief 读取最近一次电流零点采样的均值（A）
+ *
+ * 仅在 power_measure_zero_current_is_running() 变 false 且曾经发起过校准时有效；
+ * 未做过校准时返回 0。
+ *
+ * @return 采样期间的平均电流（A）
+ */
+float power_measure_zero_current_last_avg(void)
+{
+    return s_zero_avg;
 }
 
 /**
