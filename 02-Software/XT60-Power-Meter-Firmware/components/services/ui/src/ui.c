@@ -33,6 +33,8 @@
 #include <stdint.h>
 #include <string.h>
 
+#include <math.h> /* isfinite：过温告警框判断 soc_temp 是否有效（v0.6.4 需求 3） */
+
 #include "freertos/FreeRTOS.h"
 #include "freertos/queue.h"
 #include "freertos/task.h"
@@ -673,6 +675,18 @@ static void task_ui(void *arg)
                     if (cur & DATA_ALERT_OPP) {
                         snprintf(msg + strlen(msg), sizeof(msg) - strlen(msg), "过功率 %.2fW\n",
                                  (double)latest.power_w);
+                    }
+                    if (cur & DATA_ALERT_OTP) {
+                        /* v0.6.4 需求 3：过温恒开告警；soc_temp 为 NaN 时
+                         * （理论上不会——无有效读数不置位）显示"--"兜底 */
+                        char t[16];
+                        if (isfinite(latest.soc_temp_c)) {
+                            snprintf(t, sizeof(t), "%.1f℃", (double)latest.soc_temp_c);
+                        } else {
+                            snprintf(t, sizeof(t), "--");
+                        }
+                        snprintf(msg + strlen(msg), sizeof(msg) - strlen(msg),
+                                 "机内温度 %s\n请断开负载降温后再用\n", t);
                     }
                     lv_obj_t *box = lv_msgbox_create(NULL);
                     /* v0.6.2 需求 3：全项目移除 U+26A0（⚠），改用全角"！"，

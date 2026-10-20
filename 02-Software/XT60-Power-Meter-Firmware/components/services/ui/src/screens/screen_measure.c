@@ -452,10 +452,11 @@ void screen_measure_refresh(const data_store_snapshot_t *snap)
     if (s_lbl_alert != NULL) {
         if (snap->alert_mask != 0) {
             char alert[48];
-            snprintf(alert, sizeof(alert), "！%s%s%s",
+            snprintf(alert, sizeof(alert), "！%s%s%s%s",
                      (snap->alert_mask & DATA_ALERT_OVP) ? " 过压" : "",
                      (snap->alert_mask & DATA_ALERT_OCP) ? " 过流" : "",
-                     (snap->alert_mask & DATA_ALERT_OPP) ? " 过功率" : "");
+                     (snap->alert_mask & DATA_ALERT_OPP) ? " 过功率" : "",
+                     (snap->alert_mask & DATA_ALERT_OTP) ? " 过温" : "");
             lv_label_set_text(s_lbl_alert, alert);
             lv_obj_clear_flag(s_lbl_alert, LV_OBJ_FLAG_HIDDEN); /* LVGL：取消隐藏 */
         } else {

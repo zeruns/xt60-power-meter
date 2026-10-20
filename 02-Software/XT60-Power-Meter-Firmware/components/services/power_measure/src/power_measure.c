@@ -1054,6 +1054,20 @@ static void task_sample(void *arg)
                         new_mask |= DATA_ALERT_OPP;
                     }
                 }
+                /* 【v0.6.4 需求 3】过温告警：机内温度（SOC 结温）> 60℃ 即置位。
+                 * 恒定生效（不读使能开关）：前三项是用户可关的"测量告警"，
+                 * 过温是硬件保护——关乎主控寿命与电池安全，不允许关闭。
+                 * · 数据源：pm_aux 每 2s 更新的 s_aux_data.soc_temp_c（SOC
+                 *   内部温度传感器）；未读到有效值（soc_temp_valid=false，
+                 *   如温度驱动初始化失败）时不判，避免拿 0/NaN 误报。
+                 * · 阈值 60℃：S3 结温上限约 105℃，60℃ 预警留出处理余量；
+                 *   置位后设备端弹"机内温度"告警框、网页端横幅显示"过温"。
+                 * · 读侧竞态说明：soc_temp_valid 在 soc_temp_c 之后写入
+                 *   （见 task_aux），最坏读到旧一两拍的温度，告警延迟 ≤2s，
+                 *   对 60℃ 级预警完全可接受。 */
+                if (s_aux_data.soc_temp_valid && s_aux_data.soc_temp_c > 60.0f) {
+                    new_mask |= DATA_ALERT_OTP;
+                }
                 if (new_mask != 0 && new_mask != s_alert_mask) {
                     /* 上升沿（含换项）：广播告警事件（不阻塞；丢弃可观测） */
                     app_event_t ev = {
