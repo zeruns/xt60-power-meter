@@ -38,6 +38,7 @@
 #include "freertos/task.h"
 
 #include "esp_log.h"
+#include "esp_heap_caps.h" /* v0.6.2：heap_caps_calloc 把快照环分配到 PSRAM */
 #include "esp_timer.h"
 #include "esp_task_wdt.h" /* 看门狗：UI 任务订阅它以便卡死时能打印调用栈（v0.6.0） */
 
@@ -80,6 +81,7 @@ static const char *TAG = "ui";
 #define UI_WAVE_PERIOD_US 40000       /**< 波形页固定 25Hz（图面流畅，独立于测量页） */
 #define UI_STATUSBAR_PERIOD_US 200000 /**< 状态栏/设置页 5Hz */
 #define UI_BACKLIGHT_PERCENT 100      /**< 背光兜底默认值（用户已保存亮度时以 NVS 值为准） */
+#define UI_DIM_PERCENT 10             /**< 自动降亮后的背光百分比（v0.6.2 需求 11） */
 #define UI_INPUT_QUEUE_LEN 16         /**< 按键消息队列深度（FreeRTOS 队列，满则丢弃新事件） */
 
 static bool s_ui_inited = false; /**< ui_init 防重复初始化标志 */
@@ -108,7 +110,12 @@ static volatile uint8_t s_rate_hz = UI_REFRESH_DEFAULT_HZ;
 /* 快照历史环：40Hz 采样（测量核的快速显示帧），供测量页各档位做窗口平均。
  * 单写者是测量核；这里只读，seqlock 保证帧自洽。 */
 #define SNAP_HIST UI_RING_SIZE            /**< 历史环帧数（= 1 秒 @40Hz） */
-static data_store_snapshot_t s_hist[SNAP_HIST]; /**< 快照环形缓冲：新帧覆盖最旧帧 */
+/* 【v0.6.2 内存优化】快照环从 BSS 移到 PSRAM 堆：40 × sizeof(snapshot) ≈ 4KB。
+ * 它每秒被读写 40 次但每次只拷 ~96 字节（约 4KB/s），PSRAM 带宽完全够；
+ * 换来的是内部 RAM 的 4KB 静态占用（.bss）改为按需堆分配。
+ * 分配失败时退化为"没有历史环"：UI 直接读最新快照，只是低刷新率档位
+ * 失去多帧平均的平滑效果，不影响正确性。 */
+static data_store_snapshot_t *s_hist = NULL; /**< 快照环形缓冲：新帧覆盖最旧帧 */
 static int s_hist_pos = 0;   /**< 下一个写入位置 */
 static int s_hist_count = 0; /**< 已填充帧数（≤ SNAP_HIST） */
 static int64_t s_last_sample_us = 0;   /**< 上次采样时刻（µs，下同）：40Hz 快照环节拍 */
@@ -161,9 +168,13 @@ typedef struct {
 
 static QueueHandle_t s_key_queue = NULL; /**< 按键消息队列（FreeRTOS queue，task_ui 内创建） */
 
-/* ---- 自动息屏（F4） ---- */
-static int64_t s_last_input_us = 0; /**< 最近一次按键输入时刻（µs；超时即息屏） */
-static bool s_screen_off = false;   /**< true=背光已熄（息屏态）；任意按键唤醒 */
+/* ---- 自动降亮（F4，v0.6.2 语义调整） ----
+ * 旧行为：无操作到点直接熄背光（set_backlight 0）。
+ * 新行为（用户需求 11）：无操作到点把背光**降到 10%**（变暗但不黑屏，
+ * 夜间看时间/读数仍可见），任何触摸或按键立即恢复到用户设置的亮度。
+ * 档位含义同步改为 1=15s / 2=30s / 3=60s（见 settings.h）。 */
+static int64_t s_last_input_us = 0; /**< 最近一次用户活动时刻（µs；按键与触摸都刷新） */
+static bool s_dimmed = false;       /**< true=已降亮到 10%；触摸/按键恢复原亮度 */
 
 static void screen_off_wake(void); /* 前向声明（定义见 apply_backlight 之后） */
 
@@ -189,6 +200,50 @@ static void button_cb(button_id_t id, button_event_t event, void *ctx)
 static lv_obj_t *s_alert_box = NULL;
 /** 上次已弹过窗的告警位图：仅在上升沿弹窗，持续越限不重复弹 */
 static uint32_t s_alert_shown_mask = 0;
+
+/**
+ * @brief 把对话框的标题/正文/底部按钮文字统一换成中文字体
+ *
+ * 【为什么必须显式设字体（v0.6.2 需求 3）】lv_msgbox_create(NULL) 把弹窗建在
+ * lv_layer_top()（LVGL 顶层图层）上，它**不一定继承**当前屏幕主题里的中文字体；
+ * LVGL 内置主题的默认字体是 montserrat_14，只含 ASCII、没有汉字。若不显式
+ * 换成 lvgl_port 的中文字库，弹窗里的中文会逐个渲染成"方框"——2026-10 实机
+ * 现象正是"预置告警弹窗的字大多是方框"。因此凡是用 lv_msgbox 显示中文处，
+ * 建好后都应调用本函数（设置页另有同名思路的 style_msgbox()）。
+ *
+ * @param box lv_msgbox_create 返回的对话框对象
+ */
+static void ui_msgbox_style_cjk(lv_obj_t *box)
+{
+    if (box == NULL) {
+        return;
+    }
+    /* lv_msgbox_get_title/content/footer：分别取对话框的标题栏、正文区、
+     * 底部按钮区三段子对象（LVGL 9 的 msgbox 就是由这三块组成）。 */
+    lv_obj_t *title = lv_msgbox_get_title(box);
+    if (title != NULL) {
+        /* 标题用粗体中文字号 16（与设置页标题风格一致） */
+        lv_obj_set_style_text_font(title, lvgl_port_get_font_bold(LVGL_PORT_FONT_16), 0);
+    }
+    lv_obj_t *content = lv_msgbox_get_content(box);
+    if (content != NULL) {
+        /* 正文容器里挂着若干 label，逐个换成中文字号 14 */
+        for (uint32_t i = 0; i < lv_obj_get_child_count(content); i++) {
+            lv_obj_set_style_text_font(lv_obj_get_child(content, i),
+                                       lvgl_port_get_font(LVGL_PORT_FONT_14), 0);
+        }
+    }
+    lv_obj_t *footer = lv_msgbox_get_footer(box);
+    if (footer != NULL) {
+        /* 底部按钮区里每个按钮的第一个子对象是它的文字 label */
+        for (uint32_t i = 0; i < lv_obj_get_child_count(footer); i++) {
+            lv_obj_t *lbl = lv_obj_get_child(lv_obj_get_child(footer, i), 0);
+            if (lbl != NULL) {
+                lv_obj_set_style_text_font(lbl, lvgl_port_get_font(LVGL_PORT_FONT_14), 0);
+            }
+        }
+    }
+}
 
 /**
  * @brief 关闭告警弹窗（调用时持有 LVGL 锁）
@@ -222,10 +277,9 @@ static void drain_key_queue(void)
     /* xQueueReceive：从队列取一条消息；超时 0 = 队列空立刻返回 pdFALSE，
      * 于是 while 循环在取空时退出，不会拖慢主循环节拍。 */
     while (xQueueReceive(s_key_queue, &msg, 0) == pdTRUE) {
-        /* F4 自动息屏：任何按键都表明"用户在操作"——更新最后输入时刻；
-         * 息屏中则立即唤醒（恢复 cfg.lcd_brightness 背光，见 screen_off_wake）。 */
-        s_last_input_us = esp_timer_get_time();
-        screen_off_wake();
+        /* F4 自动降亮：任何按键都表明"用户在操作"——更新最后活动时刻；
+         * 已降亮则立即恢复（见 screen_off_wake）。 */
+        ui_note_user_activity();
         /* 告警弹窗优先于一切按键路由：弹窗期间任意按键=确认关闭
          * （与启动故障弹窗"任意按键放行"同语义——触摸排线故障时也能关） */
         if (s_alert_box != NULL) {
@@ -287,19 +341,36 @@ static void apply_backlight(void)
 }
 
 /**
- * @brief 自动息屏唤醒（F4）：息屏态下恢复用户设置的背光亮度（幂等）
+ * @brief 自动降亮唤醒（F4 / v0.6.2）：已降亮则恢复用户设置的背光亮度（幂等）
  *
- * 无参数无返回值。已亮屏时什么都不做，因此按键/告警弹窗等唤醒点可放心调用。
- * 调用时通常持有 LVGL 锁，但本函数只碰 settings 缓存与 LCD 背光驱动，
- * 不访问 LVGL 对象树。
+ * 无参数无返回值。未降亮时什么都不做，因此按键/触摸/告警弹窗等唤醒点
+ * 可放心调用。本函数只碰 settings 缓存与 LCD 背光驱动，不访问 LVGL 对象树。
  */
 static void screen_off_wake(void)
 {
-    if (!s_screen_off) {
+    if (!s_dimmed) {
         return;
     }
-    s_screen_off = false;
+    s_dimmed = false;
     apply_backlight(); /* 恢复 cfg.lcd_brightness（settings 缓存里的用户亮度） */
+}
+
+/**
+ * @brief 记录一次"用户活动"（v0.6.2 需求 11）
+ *
+ * 按键与**触摸**都算用户活动：旧实现只认按键，导致"手指一直在操作屏幕
+ * 却被降亮"（触摸不刷新 s_last_input_us，也不唤醒）。本函数把两件事合一：
+ *   ① 刷新最后活动时刻 → 自动降亮计时重新起算；
+ *   ② 若已降亮 → 立即恢复用户亮度。
+ *
+ * 由 ui_nav 的触摸处理与 drain_key_queue 调用；线程安全前提：调用方
+ * 通常持有 LVGL 锁（触摸事件本就在 LVGL 任务上下文），内部只写两个
+ * 简单变量 + 调背光驱动，无 LVGL 对象访问。
+ */
+void ui_note_user_activity(void)
+{
+    s_last_input_us = esp_timer_get_time();
+    screen_off_wake();
 }
 
 /**
@@ -324,6 +395,12 @@ static void task_ui(void *arg)
     /* xQueueCreate：创建 FreeRTOS 队列（容量 16 条按键消息）。
      * 有了队列就能削峰：UI 任务忙时消息先排队，忙完一次性 drain。 */
     s_key_queue = xQueueCreate(UI_INPUT_QUEUE_LEN, sizeof(ui_key_msg_t));
+
+    /* v0.6.2：快照环分配到 PSRAM（见 s_hist 定义处说明）。失败则降级运行。 */
+    s_hist = heap_caps_calloc(SNAP_HIST, sizeof(data_store_snapshot_t), MALLOC_CAP_SPIRAM);
+    if (s_hist == NULL) {
+        ESP_LOGW(TAG, "快照环 PSRAM 分配失败：退化为直接读最新快照（无多帧平均）");
+    }
 
     /* 按键事件回调：此时按键驱动已在启动表中初始化。
      * button_register_callback：注册按键事件回调（回调运行在 esp_timer 任务，
@@ -432,25 +509,11 @@ static void task_ui(void *arg)
             lv_msgbox_add_title(box, "启动提示"); /* 添加标题栏文字 */
             lv_msgbox_add_text(box, msg);         /* 添加正文文字 */
             lv_obj_set_width(box, 250);           /* 设置弹窗宽度（px） */
-            /* 中文字体：LVGL 默认字体不含汉字，必须显式换成 lvgl_port 的中文字库 */
-            lv_obj_t *ttl = lv_msgbox_get_title(box); /* 取标题 label 对象 */
-            if (ttl != NULL) {
-                /* lv_obj_set_style_text_font：设置文字字体（part=0 表示默认部分） */
-                lv_obj_set_style_text_font(ttl, lvgl_port_get_font_bold(LVGL_PORT_FONT_16), 0);
-            }
-            lv_obj_t *content = lv_msgbox_get_content(box); /* 取正文容器对象 */
-            if (content != NULL) {
-                /* 遍历正文容器的子 label，逐个换中文字体 */
-                for (uint32_t i = 0; i < lv_obj_get_child_count(content); i++) {
-                    /* lv_obj_get_child：按下标取第 i 个子对象 */
-                    lv_obj_set_style_text_font(lv_obj_get_child(content, i),
-                                               lvgl_port_get_font(LVGL_PORT_FONT_14), 0);
-                }
-            }
             /* lv_msgbox_add_footer_button：在弹窗底部加一个按钮（这里"确定"） */
             lv_obj_t *ok = lv_msgbox_add_footer_button(box, "确定");
-            lv_obj_set_style_text_font(lv_obj_get_child(ok, 0),
-                                       lvgl_port_get_font(LVGL_PORT_FONT_14), 0);
+            /* 中文字体：LVGL 默认字体不含汉字，必须显式换成 lvgl_port 的中文字库
+             * （否则中文渲染成方框），详见 ui_msgbox_style_cjk 的说明 */
+            ui_msgbox_style_cjk(box);
             lv_obj_center(box); /* 把弹窗摆到屏幕正中 */
             /* 确定按钮回调：设置应答标志（运行在 LVGL 任务上下文）。
              * lv_obj_add_event_cb：给对象挂事件回调；LV_EVENT_CLICKED = 被点击时触发；
@@ -518,7 +581,7 @@ static void task_ui(void *arg)
      *   · 设置页：5Hz（校准向导读数/电能统计等少量实时值）。
      * 数据源恒定 40Hz 快拍 + 200ms 权威块（电能/真 RMS 不受显示设置影响）。 */
     last = xTaskGetTickCount();
-    s_last_input_us = esp_timer_get_time(); /* 输入计时起点＝进主循环时刻（防开机即息屏） */
+    s_last_input_us = esp_timer_get_time(); /* 输入计时起点＝进主循环时刻（防开机即降亮） */
 
     /* 【v0.6.0 卡死取证】把 UI 任务订阅到任务看门狗（TWDT）。
      * 背景：UI 主循环整轮持有 LVGL 锁，若某个事件回调里出现阻塞（NVS 写、
@@ -545,18 +608,18 @@ static void task_ui(void *arg)
 
             const int64_t now_us = esp_timer_get_time();
 
-            /* ⓪ 自动息屏（F4）：距上次按键超过档位时长（档位×30s：1→30s
-             * 2→60s 3→120s；0=永不）→ 背光置 0。只在熄灭瞬间写一次驱动
-             * （s_screen_off 防重复设 PWM）；息屏中任意按键由 drain_key_queue
-             * 更新时间戳并唤醒。 */
+            /* ⓪ 自动降亮（F4 / v0.6.2）：距上次**用户活动**（按键或触摸）超过
+             * 档位时长（1→15s 2→30s 3→60s；0=永不）→ 背光降到 10%。
+             * 只在降亮瞬间写一次驱动（s_dimmed 防重复设 PWM）；
+             * 触摸由 ui_note_user_activity 唤醒，按键由 drain_key_queue 唤醒。 */
             settings_t socfg;
-            if (settings_get(&socfg) == ESP_OK && socfg.screen_off_s > 0 && !s_screen_off) {
-                const int64_t off_after_us = (int64_t)socfg.screen_off_s * 30LL * 1000000LL;
-                if (now_us - s_last_input_us >= off_after_us) {
-                    (void)lcd_nv3030b_set_backlight(0);
-                    s_screen_off = true;
-                    ESP_LOGI(TAG, "自动息屏：无输入超过 %us，背光已关闭",
-                             (unsigned)socfg.screen_off_s * 30u);
+            if (settings_get(&socfg) == ESP_OK && socfg.screen_off_s > 0 && !s_dimmed) {
+                const int64_t dim_after_us = (int64_t)socfg.screen_off_s * 15LL * 1000000LL;
+                if (now_us - s_last_input_us >= dim_after_us) {
+                    (void)lcd_nv3030b_set_backlight(UI_DIM_PERCENT);
+                    s_dimmed = true;
+                    ESP_LOGI(TAG, "自动降亮：无操作超过 %us，背光降至 %u%%",
+                             (unsigned)socfg.screen_off_s * 15u, (unsigned)UI_DIM_PERCENT);
                 }
             }
 
@@ -566,7 +629,7 @@ static void task_ui(void *arg)
             if (now_us - s_last_sample_us >= UI_SAMPLE_PERIOD_US) {
                 s_last_sample_us = now_us;
                 data_store_snapshot_t s0;
-                if (data_store_get(&s0) == ESP_OK) {
+                if (s_hist != NULL && data_store_get(&s0) == ESP_OK) {
                     s_hist[s_hist_pos] = s0;
                     s_hist_pos = (s_hist_pos + 1) % SNAP_HIST; /* 取模实现环形覆盖 */
                     if (s_hist_count < SNAP_HIST) {
@@ -579,10 +642,15 @@ static void task_ui(void *arg)
              * (s_hist_pos - 1 + SNAP_HIST) % SNAP_HIST：环形缓冲里"最新一帧"
              * 的下标——pos 指向下一个写入位，前一格就是最新帧；加 SNAP_HIST
              * 再取模防止 pos=0 时下标为负。 */
-            const bool have_data = (s_hist_count > 0);
+            bool have_data = false;
             data_store_snapshot_t latest;
-            if (have_data) {
+            if (s_hist != NULL && s_hist_count > 0) {
                 latest = s_hist[(s_hist_pos - 1 + SNAP_HIST) % SNAP_HIST];
+                have_data = true;
+            } else if (data_store_get(&latest) == ESP_OK) {
+                /* 无历史环（PSRAM 分配失败）：直接读最新快照兜底，
+                 * 保证测量页/状态栏仍能刷新，只是没有多帧平均 */
+                have_data = true;
             }
 
             /* ②b 告警上升沿检测（v0.2.0 仪器功能批 F3）：
@@ -607,13 +675,16 @@ static void task_ui(void *arg)
                                  (double)latest.power_w);
                     }
                     lv_obj_t *box = lv_msgbox_create(NULL);
-                    lv_msgbox_add_title(box, "⚠ 测量告警");
+                    /* v0.6.2 需求 3：全项目移除 U+26A0（⚠），改用全角"！"，
+                     * 原因见文件头/字体工具的说明（源字体可能无该字形）。 */
+                    lv_msgbox_add_title(box, "！测量告警");
                     lv_msgbox_add_text(box, msg);
                     lv_obj_t *ok = lv_msgbox_add_footer_button(box, "确认");
+                    ui_msgbox_style_cjk(box); /* 显式中文字体：否则中文渲染成方框 */
                     lv_obj_add_event_cb(ok, alert_ok_cb, LV_EVENT_CLICKED, NULL);
                     s_alert_box = box;
-                    /* F4：告警是安全信息，息屏中弹出也必须点亮屏幕让用户看到；
-                     * 顺带重置输入时刻，保证弹窗至少完整展示一个息屏周期 */
+                    /* F4：告警是安全信息，降亮中弹出也必须恢复到正常亮度让用户看到；
+                     * 顺带重置输入时刻，保证弹窗至少完整展示一个降亮周期 */
                     s_last_input_us = now_us;
                     screen_off_wake();
                 } else if (cur == 0 && s_alert_box != NULL) {
@@ -641,12 +712,16 @@ static void task_ui(void *arg)
                     if (win < 1) {
                         win = 1;
                     }
-                    if (win > s_hist_count) {
+                    if (s_hist == NULL) {
+                        win = 1; /* 无历史环：只能直接用最新快照，不做多帧平均 */
+                    } else if (win > s_hist_count) {
                         win = s_hist_count; /* 开机初期环里帧数不足，窗口取已有帧数 */
                     }
+                    /* out 初值优先取历史环最新帧；无环时用上面已读到的 latest */
                     data_store_snapshot_t out =
-                        s_hist[(s_hist_pos - 1 + SNAP_HIST) % SNAP_HIST];
-                    if (win >= 2) {
+                        (s_hist != NULL) ? s_hist[(s_hist_pos - 1 + SNAP_HIST) % SNAP_HIST]
+                                         : latest;
+                    if (win >= 2 && s_hist != NULL) {
                         /* 对最近 win 帧做算术平均，抹平瞬时抖动：刷新率越低、
                          * 窗口越长、读数越稳（这也是低档位"数字不跳"的原因）。 */
                         double sv = 0, si = 0, sp = 0;

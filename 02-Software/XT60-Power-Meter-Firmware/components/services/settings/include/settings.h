@@ -62,10 +62,15 @@ typedef struct {
     uint8_t orientation_auto; /**< 屏幕是否随重力自动旋转（1=自动，0=手动，出厂默认 0） */
     uint16_t orientation_angle; /**< 手动方向角度（0/90/180/270，默认 0=横屏） */
     uint8_t wave_smooth; /**< 波形曲线平滑（1=开启，0=关闭，出厂默认 0） */
-    /* ---- v0.5.0 新增（B20 波形持久化 / F4 息屏）---- */
+    /* ---- v0.5.0 新增（B20 波形持久化 / F4 自动降亮）---- */
     uint8_t wave_window; /**< 波形时间窗档位（0=1s 1=10s 2=30s 3=60s 4=120s 5=10min，默认 1=10s） */
     uint8_t wave_mode;   /**< 波形显示模式（0~4 与 PM_WAVE_MODE_* 对应，默认 0） */
-    uint8_t screen_off_s; /**< 自动息屏时长档位（0=永不 1=30s 2=60s 3=120s，默认 0） */
+    /* 自动降亮时长档位（v0.6.2 语义调整，需求 11）：
+     * 0=永不 1=15s 2=30s 3=60s（档位×15s 即对应秒数）。
+     * 无操作到点后背光降到 10%（变暗不黑屏）；触摸或按键立即恢复原亮度。
+     * 注意：旧固件存的是 0=永不/1=30s/2=60s/3=120s，本版**不做旧值迁移**——
+     * 用户升级后档位按新语义重新解释（如需旧行为重新点选即可），默认 0=永不。 */
+    uint8_t screen_off_s;
 } settings_t;
 
 /**
@@ -213,8 +218,8 @@ esp_err_t settings_set_wave_window(uint8_t window);
 esp_err_t settings_set_wave_mode(uint8_t mode);
 
 /**
- * @brief 更新自动息屏档位（F4）
- * @param level 0=永不 1=30s 2=60s 3=120s
+ * @brief 更新自动降亮档位（F4；v0.6.2 语义调整）
+ * @param level 0=永不 1=15s 2=30s 3=60s（无操作到点后背光降至 10%，触摸/按键恢复）
  */
 esp_err_t settings_set_screen_off(uint8_t level);
 

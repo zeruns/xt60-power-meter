@@ -56,3 +56,12 @@ int64_t ui_get_last_loop_us(void);
  * 高档（30Hz=取最新帧）响应更快。该设置只影响测量页，波形页固定 25Hz。
  */
 void ui_set_display_rate_hz(uint8_t hz);
+
+/**
+ * @brief 记录一次用户活动（v0.6.2 需求 11：自动降亮）
+ *
+ * 按键与触摸都应调用：刷新"最后活动时刻"以重置自动降亮计时，
+ * 若屏幕已降亮到 10% 则立即恢复用户设置亮度。
+ * 触摸侧由 ui_nav 的 indev 事件回调调用（那里本就处在 LVGL 锁内）。
+ */
+void ui_note_user_activity(void);

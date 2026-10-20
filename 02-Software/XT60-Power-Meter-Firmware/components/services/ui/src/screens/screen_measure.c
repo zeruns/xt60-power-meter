@@ -20,7 +20,7 @@
  *   │   V 14.10/13.88  I 2.05/0.12   │ 峰谷小字行 1（V/I，斜杠前峰后谷）
  *   │  P 28.9/1.6  32.5℃ 45%RH      │ 小字行 2：P 峰谷 + 温湿度
  *   └────────────────────────────────┘
- *   （告警横幅：alert_mask 非 0 时顶部红条 "⚠ 过压 过流"，覆盖状态栏下沿）
+ *   （告警横幅：alert_mask 非 0 时顶部红条 "！过压 过流"，覆盖状态栏下沿）
  *
  * 设计说明：
  *   · 数字用 36px Bold 白字填满 44px 行高（"贴近容器大小"，远看可读）；
@@ -293,7 +293,7 @@ void screen_measure_create(lv_obj_t *tile)
     /* 告警横幅：顶部红条（覆盖在状态栏区域上层），alert_mask 为 0 时隐藏。
      * 用绝对定位压在 row_top 之上，不挤动四行数据条布局。 */
     s_lbl_alert = lv_label_create(tile);
-    lv_label_set_text(s_lbl_alert, "⚠ 告警");
+    lv_label_set_text(s_lbl_alert, "！告警");
     lv_obj_set_style_text_font(s_lbl_alert, lvgl_port_get_font_bold(LVGL_PORT_FONT_14), 0);
     lv_obj_set_style_text_color(s_lbl_alert, lv_color_white(), 0);
     lv_obj_set_style_bg_color(s_lbl_alert, COL_ALERT, 0);
@@ -452,7 +452,7 @@ void screen_measure_refresh(const data_store_snapshot_t *snap)
     if (s_lbl_alert != NULL) {
         if (snap->alert_mask != 0) {
             char alert[48];
-            snprintf(alert, sizeof(alert), "⚠%s%s%s",
+            snprintf(alert, sizeof(alert), "！%s%s%s",
                      (snap->alert_mask & DATA_ALERT_OVP) ? " 过压" : "",
                      (snap->alert_mask & DATA_ALERT_OCP) ? " 过流" : "",
                      (snap->alert_mask & DATA_ALERT_OPP) ? " 过功率" : "");
@@ -496,6 +496,9 @@ static lv_obj_t *s_menu = NULL;  /**< 快速菜单滑板容器 */
 static bool s_menu_open = false; /**< 菜单是否完全展开（动画结束后置位） */
 static bool s_menu_animating = false; /**< 滑板升降动画进行中（防重入） */
 static int s_focus = 0;          /**< 按键焦点行：0=清除行，1=刷新率行 */
+/** 【v0.6.2 需求 8】焦点框可见性门控：菜单刚打开（触摸路径）不显示蓝框，
+ *  只有用户按 K1/K2 导航后才显示。 */
+static bool s_menu_focus_visible = false;
 static lv_obj_t *s_clear_btn = NULL; /**< 焦点行 0：清除电能按钮 */
 static lv_obj_t *s_rate_row = NULL;  /**< 焦点行 1：刷新率档位行（焦点描边画在它身上） */
 static lv_obj_t *s_rate_btns[5];     /**< 五个档位按钮 */
@@ -542,14 +545,16 @@ static lv_obj_t *menu_btn(lv_obj_t *parent, const char *text, int32_t w, int32_t
  */
 static void menu_focus_refresh(void)
 {
-    const lv_coord_t fw = s_focus == 0 ? 2 : 1;
-    lv_color_t fc = s_focus == 0 ? COL_PRIMARY : COL_BORDER;
+    /* 【v0.6.2 需求 8】同样加可见性门控：菜单刚弹出（触摸打开）不画焦点框，
+     * 只有用户按过 K1/K2 导航后才显示，避免把"焦点"误当"选中"。 */
+    const lv_coord_t fw = (s_menu_focus_visible && s_focus == 0) ? 2 : 1;
+    lv_color_t fc = (s_menu_focus_visible && s_focus == 0) ? COL_PRIMARY : COL_BORDER;
     if (s_clear_btn != NULL) {
         lv_obj_set_style_border_width(s_clear_btn, fw, 0);
         lv_obj_set_style_border_color(s_clear_btn, fc, 0);
     }
     if (s_rate_row != NULL) {
-        lv_obj_set_style_border_width(s_rate_row, s_focus == 1 ? 2 : 0, 0);
+        lv_obj_set_style_border_width(s_rate_row, (s_menu_focus_visible && s_focus == 1) ? 2 : 0, 0);
         lv_obj_set_style_border_color(s_rate_row, COL_PRIMARY, 0);
     }
 }
@@ -837,6 +842,7 @@ void screen_measure_open_menu(void)
     }
     measure_geom_t g = measure_geom();
     s_focus = 0; /* 每次打开焦点回到第一行 */
+    s_menu_focus_visible = false; /* 需求 8：打开时不显示焦点框，首次按键后才显示 */
     menu_rate_refresh();
     menu_focus_refresh();
     lv_obj_set_hidden(s_menu, false); /* 先显示再动画，否则升起来看不见 */
@@ -888,6 +894,7 @@ bool screen_measure_menu_key(button_id_t id, button_event_t ev)
 
     if (ev == BUTTON_EVENT_SINGLE_CLICK) {
         /* K1 = 焦点上移，K2 = 焦点下移（循环）；按键音由外层统一响 */
+        s_menu_focus_visible = true; /* 开始按键导航：显示焦点框（需求 8） */
         if (id == BUTTON_ID_BOOT) {
             s_focus = (s_focus - 1 + MENU_FOCUS_CNT) % MENU_FOCUS_CNT; /* 负数取模防溢出 */
         } else {

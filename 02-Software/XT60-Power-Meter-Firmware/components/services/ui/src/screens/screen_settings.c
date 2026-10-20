@@ -44,7 +44,7 @@
  * ────────────────────────────────────────────────────────────
  *   首页 2×4 网格 → 点击进入对应二级页：
  *   · 测量设置  → 校准向导（通道选择 → 标准值输入 → 完成提示，三级）
- *   · 显示设置  → 亮度滑条 + 自动旋转开关 + 自动息屏档位（F4）+ 角度按钮
+ *   · 显示设置  → 亮度滑条 + 自动旋转开关 + 自动降亮档位（F4）+ 角度按钮
  *   · 蜂鸣器    → 响度滑条 + 试听按钮
  *   · WiFi      → 状态页（状态/IP 或热点名 + 忘记网络，F7）
  *   · 电能统计  → 累计电能/运行时间 + 确认框清零
@@ -618,6 +618,11 @@ static int s_focus_cnt = 0;                  /**< 焦点链有效长度 */
 static int s_focus_idx = 0;                  /**< 当前焦点下标 */
 static lv_obj_t *s_focus_back = NULL;        /**< 本页"返回"按钮（长按 K1 等效点击它） */
 static bool s_slider_edit = false; /**< true=滑条调节模式（K1/K2 变减/加步进） */
+/** 【v0.6.2 需求 8】焦点框可见性门控：
+ *  false = 刚进入子页（触摸用户），不画蓝框；
+ *  true  = 用户按过 K1/K2 进行按键导航，开始显示焦点框。
+ *  这样"触摸进入带蓝框"的误判消失，而纯按键用户第一次按键后立刻看到焦点。 */
+static bool s_focus_visible = false;
 
 /**
  * @brief 重绘焦点高亮（当前控件 2px 蓝框；滑条调节中改绿框示意）
@@ -635,7 +640,10 @@ static void focus_paint(void)
         if (w == NULL) {
             continue;
         }
-        bool on = (i == s_focus_idx);
+        /* 【v0.6.2 需求 8】焦点框只在"用户真的用按键导航"后才显示：
+         * 触摸用户没有"焦点"概念，一进子页就套蓝框会误以为是选中态。
+         * s_focus_visible 由 focus_move()/focus_activate() 首次按键时置 true。 */
+        bool on = s_focus_visible && (i == s_focus_idx);
         lv_obj_set_style_outline_width(w, on ? (edit ? 3 : 2) : 0, 0);
         lv_obj_set_style_outline_color(w, (edit && on) ? COL_OK : COL_PRIMARY, 0);
         lv_obj_set_style_outline_pad(w, 2, 0);
@@ -688,6 +696,7 @@ static void focus_end(void)
     s_focus_idx = 0;
     s_focus_back = NULL;
     s_slider_edit = false;
+    s_focus_visible = false; /* 每次进出子页都重新从"不显示焦点框"开始 */
 }
 
 /**
@@ -710,9 +719,8 @@ static void focus_add(lv_obj_t *w)
         return;
     }
     s_focus_widgets[s_focus_cnt++] = w;
-    /* 每登记一项立即重画焦点框：子页建完的最后一项登记后，焦点框已就位
-     * （焦点默认停在第 0 项），纯按键用户一进页面就看得见"操作对象是谁"。
-     * 建页是一次性动作，6 项以内的样式重设开销可忽略。 */
+    /* 登记后只做"清框"的绘制（s_focus_visible 此时为 false，全链 outline 宽 0）。
+     * 旧版在这里无条件画第 0 项蓝框，导致触摸进入子页也带选中框（v0.6.2 需求 8）。 */
     focus_paint();
 }
 
@@ -725,11 +733,14 @@ static void focus_move(int dir)
     if (s_focus_cnt <= 0) {
         return;
     }
+    s_focus_visible = true; /* 首次按键导航：从此刻起显示焦点框（需求 8） */
     s_focus_idx = (s_focus_idx + dir + s_focus_cnt) % s_focus_cnt;
     focus_paint();
-    /* lv_obj_scroll_to_view：焦点控件若被内容区滚动裁掉，自动滚到可见
-     * （LV_ANIM_ON 平滑滚动）；已可见时无动作。 */
-    lv_obj_scroll_to_view(s_focus_widgets[s_focus_idx], LV_ANIM_ON);
+    /* 【v0.6.2 需求 9】必须用 **recursive** 版本：普通 lv_obj_scroll_to_view()
+     * 只对"直接父对象"生效，且父对象不可滚动时立即返回；本页大量控件挂在
+     * plain_container（显式 scrollable=false）组成的行里，走普通版本等于不滚。
+     * recursive 版逐级向上，把真正可滚的内容容器 s_sub_content 一并滚动。 */
+    lv_obj_scroll_to_view_recursive(s_focus_widgets[s_focus_idx], LV_ANIM_ON);
 }
 
 /**
@@ -798,6 +809,7 @@ static void focus_activate(void)
     if (s_focus_cnt <= 0) {
         return;
     }
+    s_focus_visible = true; /* 按键激活也算"在用按键"，显示焦点框（需求 8） */
     lv_obj_t *w = s_focus_widgets[s_focus_idx];
     if (lv_obj_check_type(w, &lv_slider_class)) {
         s_slider_edit = true;
@@ -1050,9 +1062,11 @@ static void calib_ui_menu(void)
     lv_obj_set_flex_flow(row, LV_FLEX_FLOW_ROW);
     lv_obj_set_style_pad_column(row, 8, 0);
 
-    lv_obj_t *bv = plain_button(row, "电压校准", LV_PCT(50), 44);
+    lv_obj_t *bv = plain_button(row, "电压校准", LV_PCT(47), 44);
+    lv_obj_set_flex_grow(bv, 1); /* v0.6.2：均分（50%+50%+8px 会溢出被裁） */
     lv_obj_add_event_cb(bv, calib_channel_clicked_cb, LV_EVENT_CLICKED, (void *)(intptr_t)1);
-    lv_obj_t *bi = plain_button(row, "电流校准", LV_PCT(50), 44);
+    lv_obj_t *bi = plain_button(row, "电流校准", LV_PCT(47), 44);
+    lv_obj_set_flex_grow(bi, 1);
     lv_obj_add_event_cb(bi, calib_channel_clicked_cb, LV_EVENT_CLICKED, (void *)(intptr_t)0);
 
     /* 焦点链：电压 → 电流（用户操作顺序；纯按键走这两格即可进校准） */
@@ -1502,16 +1516,18 @@ static void bright_slider_cb(lv_event_t *e)
     }
 }
 
-/** 自动息屏档位名称表（下标 = settings.screen_off_s：0=永不 1=30s 2=60s 3=120s） */
-static const char *const s_scr_off_names[4] = { "永不", "30 秒", "60 秒", "120 秒" };
+/** 自动降亮档位名称表（下标 = settings.screen_off_s：0=永不 1=15s 2=30s 3=60s） */
+static const char *const s_scr_off_names[4] = { "永不", "15 秒", "30 秒", "60 秒" };
 
 /**
- * @brief "自动息屏"按钮：档位循环切换（永不 → 30s → 60s → 120s → 永不）
+ * @brief "自动降亮"按钮：档位循环切换（永不 → 15s → 30s → 60s → 永不）
  *
- * 档位含义见 settings.screen_off_s（F4）：ui.c 主循环按"档位×30s 无输入"熄背光，
- * 任意按键唤醒。与"步长"按钮同款做法：直接改按钮自己的文字标签。
+ * 档位含义见 settings.screen_off_s（F4；v0.6.2 语义调整）：ui.c 主循环在
+ * "档位对应秒数（档位×15s，即 15/30/60s）无输入"后把背光**降到 10%**——
+ * 变暗但**不黑屏**，夜间仍能看清读数；任意触摸或按键立即恢复用户设置亮度。
+ * 与"步长"按钮同款做法：直接改按钮自己的文字标签，不重建控件。
  *
- * @param e LVGL 点击事件（目标是"自动息屏"按钮）
+ * @param e LVGL 点击事件（目标是"自动降亮"按钮）
  */
 static void screen_off_cycle_cb(lv_event_t *e)
 {
@@ -1521,13 +1537,13 @@ static void screen_off_cycle_cb(lv_event_t *e)
     if (settings_get(&cfg) == ESP_OK) {
         level = (cfg.screen_off_s < 4u) ? cfg.screen_off_s : 0u;
     }
-    level = (uint8_t)((level + 1u) % 4u); /* 取模循环：永不→30→60→120→永不 */
+    level = (uint8_t)((level + 1u) % 4u); /* 取模循环：永不→15→30→60→永不 */
     (void)settings_set_screen_off(level);
     (void)settings_request_save(); /* 【v0.6.0】非阻塞落盘，防在 LVGL 锁内冻屏 */
     lv_obj_t *lbl = lv_obj_get_child(btn, 0); /* 按钮内第 0 个子对象 = 文字标签 */
     if (lbl != NULL) {
         char buf[32];
-        snprintf(buf, sizeof(buf), "自动息屏：%s", s_scr_off_names[level]);
+        snprintf(buf, sizeof(buf), "自动降亮：%s", s_scr_off_names[level]);
         lv_label_set_text(lbl, buf);
     }
 }
@@ -1607,16 +1623,16 @@ static void display_open_cb(void)
     lv_obj_add_event_cb(s_auto_switch, auto_switch_cb, LV_EVENT_VALUE_CHANGED, NULL);
     focus_add(s_auto_switch); /* 焦点链第 2 项：自动旋转开关（长按 K2 切换） */
 
-    /* ---- 自动息屏（F4）：档位循环切换按钮（永不/30s/60s/120s） ---- */
+    /* ---- 自动降亮（F4）：档位循环切换按钮（永不/15s/30s/60s） ---- */
     uint8_t off_level = 0;
     if (settings_get(&cfg) == ESP_OK) {
         off_level = (cfg.screen_off_s < 4u) ? cfg.screen_off_s : 0u;
     }
     char off_buf[32];
-    snprintf(off_buf, sizeof(off_buf), "自动息屏：%s", s_scr_off_names[off_level]);
+    snprintf(off_buf, sizeof(off_buf), "自动降亮：%s", s_scr_off_names[off_level]);
     lv_obj_t *off_btn = plain_button(c, off_buf, LV_PCT(60), 30);
     lv_obj_add_event_cb(off_btn, screen_off_cycle_cb, LV_EVENT_CLICKED, NULL);
-    focus_add(off_btn); /* 焦点链第 3 项：自动息屏档位（长按 K2 循环切换） */
+    focus_add(off_btn); /* 焦点链第 3 项：自动降亮档位（长按 K2 循环切换） */
 
     lv_obj_t *cap2 = plain_label(c, "屏幕方向", LVGL_PORT_FONT_16, COL_INK, false);
     lv_obj_set_width(cap2, LV_PCT(100));
@@ -1891,7 +1907,8 @@ static void wifi_render_ap_list(void)
 
     for (uint16_t i = 0; i < n; i++) {
         lv_obj_t *row = lv_button_create(s_wifi_list);
-        lv_obj_set_size(row, LV_PCT(100), 32);
+        /* v0.6.2：行高 32 → 40（触摸目标更大；列表已可滚动，一屏 4~5 行仍够用） */
+        lv_obj_set_size(row, LV_PCT(100), 40);
         press_feedback_styles(row);
         lv_obj_set_style_radius(row, 6, 0);
         lv_obj_set_style_pad_hor(row, 8, 0);
@@ -1924,6 +1941,8 @@ static void wifi_render_ap_list(void)
                             (void *)(intptr_t)i);
         focus_add(row); /* 焦点链：逐行可选中（长按 K2 = 打开密码框） */
     }
+    /* v0.6.2：新结果从顶部开始显示（否则会停在上一轮的滚动位置） */
+    lv_obj_scroll_to_y(s_wifi_list, 0, LV_ANIM_OFF);
 }
 
 /**
@@ -2037,8 +2056,17 @@ static void wifi_scan_page_open(bool auto_start)
     lv_obj_add_event_cb(s_wifi_scan_btn, wifi_rescan_clicked_cb, LV_EVENT_CLICKED, NULL);
     focus_add(s_wifi_scan_btn);
 
-    /* ③ 结果列表（占满剩余高度，行内滚动；行由 wifi_render_ap_list 动态建） */
-    s_wifi_list = plain_container(c);
+    /* ③ 结果列表（占满剩余高度，行内滚动；行由 wifi_render_ap_list 动态建）
+     *
+     * 【v0.6.2 修复"列表拖不动、只能看到前 2 个"】
+     * 旧代码用 plain_container() 创建 —— 它内部 lv_obj_set_scrollable(o,false)；
+     * 之后调 lv_obj_set_scroll_dir(VER)**并不会**把对象重新变成可滚动
+     * （LVGL 9 的 set_scroll_dir 只写方向字段）。结果：列表内容被裁剪，
+     * 手势冒泡到父内容容器，而父容器没有可滚余量 → 永远滑不动。
+     * 因此这里必须直接 lv_obj_create + 显式 set_scrollable(true)。 */
+    s_wifi_list = lv_obj_create(c);
+    lv_obj_remove_style_all(s_wifi_list);
+    lv_obj_set_scrollable(s_wifi_list, true); /* ← 关键：恢复滚动能力 */
     lv_obj_set_width(s_wifi_list, LV_PCT(100));
     lv_obj_set_height(s_wifi_list, 0);
     lv_obj_set_flex_grow(s_wifi_list, 1);
@@ -2240,9 +2268,11 @@ static void passkey_open(const char *ssid)
     lv_obj_set_size(row, LV_PCT(100), 32);
     lv_obj_set_flex_flow(row, LV_FLEX_FLOW_ROW);
     lv_obj_set_style_pad_column(row, 8, 0);
-    lv_obj_t *cancel = plain_button(row, "取消", LV_PCT(50), 32);
+    lv_obj_t *cancel = plain_button(row, "取消", LV_PCT(47), 32);
+    lv_obj_set_flex_grow(cancel, 1); /* v0.6.2：均分防溢出 */
     lv_obj_add_event_cb(cancel, passkey_cancel_cb, LV_EVENT_CLICKED, NULL);
-    lv_obj_t *ok = plain_button(row, "连接", LV_PCT(50), 32);
+    lv_obj_t *ok = plain_button(row, "连接", LV_PCT(47), 32);
+    lv_obj_set_flex_grow(ok, 1);
     lv_obj_set_style_bg_color(ok, COL_PRIMARY, 0);
     lv_obj_set_style_border_color(ok, COL_PRIMARY, 0);
     lv_obj_t *okl = lv_obj_get_child(ok, 0);
@@ -2315,9 +2345,17 @@ static void wifi_update_status(void)
 
     if (s_wifi_hint_label != NULL) {
         if (st == WIFI_MANAGER_STATE_AP_MODE) {
-            /* 配网指引：AP 模式下手机连热点 → 浏览器开 192.168.4.1 配网页 */
-            lv_label_set_text(s_wifi_hint_label,
-                              "手机连接上述热点后，\n浏览器打开 192.168.4.1 完成配网。");
+            /* 配网指引：AP 模式下手机连热点 → 浏览器开 192.168.4.1 配网页。
+             * 【v0.6.2 需求 4】热点是 WPA2 加密的，必须把**密码**显示出来，
+             * 否则用户不知道密码、连不上热点，配网流程直接走不通（旧版只
+             * 提示"连接上述热点"却没给密码，属于功能性缺陷）。 */
+            char pw[WIFI_MANAGER_PASS_MAX_LEN] = "";
+            (void)wifi_manager_get_ap_pass(pw, sizeof(pw));
+            char hint[128];
+            snprintf(hint, sizeof(hint),
+                     "热点密码 %s\n浏览器打开 192.168.4.1 完成配网。",
+                     (pw[0] != '\0') ? pw : "--");
+            lv_label_set_text(s_wifi_hint_label, hint);
         } else if (st == WIFI_MANAGER_STATE_FAILED &&
                    wifi_manager_get_mode() != WIFI_MANAGER_MODE_AP) {
             /* 仅 STA / 自动但无凭据：热点未开，提示先切到热点模式才能配网 */
@@ -2439,26 +2477,35 @@ static void wifi_open_cb(void)
     /* ---- ② 模式三档：自动 / 仅 STA / 热点（v0.6.0 需求 2） ----
      * 点击即 wifi_manager_set_mode（非阻塞），高亮由 wifi_mode_btns_refresh 维护。
      * 三档语义见 wifi_manager.h：自动=有凭据连路由器、无凭据开热点；
-     * 仅 STA=不开热点（纯客户端）；热点=强制配网热点。 */
+     * 仅 STA=不开热点（纯客户端）；热点=强制配网热点。
+     *
+     * 【v0.6.2 修复"按钮右侧被截断"】旧写法三个按钮各 LV_PCT(33) 再加
+     * pad_column 6×2 = 12px，总宽 99%+12px > 100%，第三格被父容器裁掉右半。
+     * 改用 flex_grow(1) 让 layout 自己均分剩余宽度（减去间距后的空间），
+     * 无论横屏 284 还是竖屏 240 都不会溢出。 */
     lv_obj_t *mrow = plain_container(c);
-    lv_obj_set_size(mrow, LV_PCT(100), 30);
+    lv_obj_set_size(mrow, LV_PCT(100), 34);
     lv_obj_set_flex_flow(mrow, LV_FLEX_FLOW_ROW);
     lv_obj_set_style_pad_column(mrow, 6, 0);
     static const char *const mode_names[3] = { "自动", "仅 STA", "热点" };
     for (int i = 0; i < 3; i++) {
-        lv_obj_t *b = plain_button(mrow, mode_names[i], LV_PCT(33), 30);
+        lv_obj_t *b = plain_button(mrow, mode_names[i], LV_PCT(30), 34);
+        lv_obj_set_flex_grow(b, 1); /* 均分剩余宽度：不再依赖百分比相加 */
         lv_obj_add_event_cb(b, wifi_mode_clicked_cb, LV_EVENT_CLICKED, (void *)(intptr_t)i);
         focus_add(b); /* 焦点链：三档模式按钮在最前（最常用） */
         s_wifi_mode_btns[i] = b;
     }
 
-    /* ---- ③ 操作行：搜索 Wi-Fi / 忘记网络 ---- */
+    /* ---- ③ 操作行：搜索 Wi-Fi / 忘记网络 ----
+     * 【v0.6.2】同样改为 flex_grow 均分：旧写法 50%+50%+8px 间距 > 100%，
+     * "忘记网络"右侧被裁掉。 */
     lv_obj_t *arow = plain_container(c);
-    lv_obj_set_size(arow, LV_PCT(100), 32);
+    lv_obj_set_size(arow, LV_PCT(100), 34);
     lv_obj_set_flex_flow(arow, LV_FLEX_FLOW_ROW);
     lv_obj_set_style_pad_column(arow, 8, 0);
 
-    s_wifi_scan_btn = plain_button(arow, "搜索 Wi-Fi", LV_PCT(50), 32);
+    s_wifi_scan_btn = plain_button(arow, "搜索 Wi-Fi", LV_PCT(46), 34);
+    lv_obj_set_flex_grow(s_wifi_scan_btn, 1);
     lv_obj_set_style_bg_color(s_wifi_scan_btn, COL_PRIMARY, 0);
     lv_obj_set_style_border_color(s_wifi_scan_btn, COL_PRIMARY, 0);
     {
@@ -2471,7 +2518,8 @@ static void wifi_open_cb(void)
     lv_obj_add_event_cb(s_wifi_scan_btn, wifi_scan_btn_clicked_cb, LV_EVENT_CLICKED, NULL);
     focus_add(s_wifi_scan_btn);
 
-    lv_obj_t *fbtn = plain_button(arow, "忘记网络", LV_PCT(50), 32);
+    lv_obj_t *fbtn = plain_button(arow, "忘记网络", LV_PCT(46), 34);
+    lv_obj_set_flex_grow(fbtn, 1);
     lv_obj_set_style_border_color(fbtn, COL_DANGER, 0);
     {
         lv_obj_t *l = lv_obj_get_child(fbtn, 0);
@@ -2743,9 +2791,11 @@ static void numkey_open(const char *title, const char *unit, float init, float m
     lv_obj_set_size(row, LV_PCT(100), 32);
     lv_obj_set_flex_flow(row, LV_FLEX_FLOW_ROW);
     lv_obj_set_style_pad_column(row, 8, 0);
-    lv_obj_t *cancel = plain_button(row, "取消", LV_PCT(50), 32);
+    lv_obj_t *cancel = plain_button(row, "取消", LV_PCT(47), 32);
+    lv_obj_set_flex_grow(cancel, 1); /* v0.6.2：均分防溢出 */
     lv_obj_add_event_cb(cancel, numkey_cancel_cb, LV_EVENT_CLICKED, NULL);
-    lv_obj_t *ok = plain_button(row, "确定", LV_PCT(50), 32);
+    lv_obj_t *ok = plain_button(row, "确定", LV_PCT(47), 32);
+    lv_obj_set_flex_grow(ok, 1);
     lv_obj_set_style_bg_color(ok, COL_PRIMARY, 0);
     lv_obj_set_style_border_color(ok, COL_PRIMARY, 0);
     {
@@ -3185,7 +3235,7 @@ static void cell_clicked_cb(lv_event_t *e)
 /**
  * @brief 创建一个网格单元（图标 + 名称，点击进入 cb）
  *
- * 单元格宽随行 flex_grow 均分，高固定 CELL_HEIGHT(48px)——触摸目标标准。
+ * 单元格宽随行 flex_grow 均分，高固定 CELL_HEIGHT(40px)——触摸目标标准。
  *
  * @param row   行容器（一行两格）
  * @param icon  LVGL 内置符号（LV_SYMBOL_*）

@@ -46,6 +46,8 @@
 #include "screen_measure.h"
 #include "screen_settings.h"
 #include "screen_wave.h"
+/* ui.h：触摸活动上报（ui_note_user_activity），用于自动降亮计时重置（v0.6.2 需求 11） */
+#include "ui.h"
 /* wifi_manager：状态栏 WiFi 图标要显示真实连接状态与信号强度（v0.6.0 需求 4） */
 #include "wifi_manager.h"
 
@@ -443,6 +445,11 @@ static void indev_swipe_event_cb(lv_event_t *e)
     }
     lv_event_code_t code = lv_event_get_code(e); /* 取事件类型（PRESSED/RELEASED） */
     if (code == LV_EVENT_PRESSED) {
+        /* 【v0.6.2 需求 11】把触摸登记为"用户活动"：重置自动降亮计时，
+         * 并在已降亮时立即恢复用户亮度。旧实现只认按键，手指一直在操作
+         * 屏幕却仍会被降亮。 */
+        ui_note_user_activity();
+
         /* lv_indev_get_point：读当前触点坐标（按下瞬间记为起点） */
         lv_indev_get_point(indev, &s_swipe_start);
         s_swipe_valid = true;

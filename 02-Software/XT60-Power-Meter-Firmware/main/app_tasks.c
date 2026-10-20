@@ -10,7 +10,9 @@
 #include <string.h>
 
 #include "ads131m02.h"
+#include "buzzer.h"        /* v0.6.2 需求 12：网页下发音量后要真正驱动蜂鸣器 */
 #include "data_store.h"
+#include "lcd_nv3030b.h"   /* v0.6.2 需求 12：网页下发亮度后要真正驱动背光 */
 #include "lvgl_port.h"
 #include "power_measure.h"
 #include "settings.h"
@@ -82,6 +84,23 @@ static void task_sys_monitor(void *arg)
         ESP_LOGI(TAG, "内部 RAM 空闲 %u 字节（历史最低 %u）",
                  (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
                  (unsigned)heap_caps_get_minimum_free_size(MALLOC_CAP_INTERNAL));
+
+        /* --- PSRAM 水位（v0.6.2 新增） ---
+         * 【为什么要单独打印】esp_get_free_heap_size() 是「内部 RAM + PSRAM」的
+         * 合计值，只看它会得出"总堆还有 5MB，内存很宽裕"的错误结论；而 v0.6.0
+         * 那次 UI 卡死/自动复位的真实原因是"合计充裕、内部 RAM 只剩 19KB"。
+         * 两行分开打印后，一眼就能看出是哪一类内存吃紧：
+         *   · 内部 RAM 紧张 → 检查 DMA/ISR 相关与任务栈；
+         *   · PSRAM 紧张   → 检查字体、波形缓冲、LVGL 对象堆积。
+         * heap_caps_get_total_size() 返回该能力内存的总容量（本板 8MB PSRAM）。 */
+        {
+            const size_t ps_free = heap_caps_get_free_size(MALLOC_CAP_SPIRAM);
+            const size_t ps_total = heap_caps_get_total_size(MALLOC_CAP_SPIRAM);
+            const unsigned used_pct =
+                (ps_total > 0) ? (unsigned)(100u - (ps_free * 100u / ps_total)) : 0u;
+            ESP_LOGI(TAG, "PSRAM 空闲 %u / 总计 %u 字节（已用 %u%%）", (unsigned)ps_free,
+                     (unsigned)ps_total, used_pct);
+        }
 
         /* --- 栈水位 ---
          * ⚠ 三个容易踩的坑（都是 ESP-IDF 与上游 FreeRTOS 的差异）：
@@ -209,6 +228,13 @@ static esp_err_t web_config_handler(const char *key, const char *value)
     if (key == NULL || value == NULL) {
         return ESP_ERR_INVALID_ARG;
     }
+    /* 【v0.6.2 需求 14】把网页下发的**具体参数**打进设备日志，便于排障对账；
+     * wifi_pass 是密码，不回显明文（只显示掩码）。 */
+    if (strcmp(key, "wifi_pass") == 0) {
+        ESP_LOGI(TAG, "网页下发配置：wifi_pass = ****");
+    } else {
+        ESP_LOGI(TAG, "网页下发配置：%s = %s", key, value);
+    }
     settings_alarm_t alm;
     settings_t cfg;
 
@@ -293,13 +319,39 @@ static esp_err_t web_config_handler(const char *key, const char *value)
         return settings_set_alarm(&alm);
     }
     if (strcmp(key, "buzzer_volume") == 0) {
-        return settings_set_buzzer_volume((uint8_t)atoi(value));
+        /* 【v0.6.2 需求 12】settings_set_* 只写内存缓存 + 标脏，**不驱动硬件**；
+         * 必须再调一次驱动接口，设置才会真正生效——旧版漏了这一步，表现为
+         * "网页下发音量无效"。合法范围由 settings 校验（1~100），越界则不碰硬件。 */
+        uint8_t vol = (uint8_t)atoi(value);
+        esp_err_t e = settings_set_buzzer_volume(vol);
+        if (e == ESP_OK) {
+            (void)buzzer_set_volume(vol);
+        }
+        return e;
     }
     if (strcmp(key, "lcd_brightness") == 0) {
-        return settings_set_lcd_brightness((uint8_t)atoi(value));
+        /* 同音量：写完缓存后必须调 lcd_nv3030b_set_backlight() 才真正改亮度
+         * （合法范围 10~100，下限 10 由 settings 保证，避免调到全黑没法恢复）。 */
+        uint8_t bright = (uint8_t)atoi(value);
+        esp_err_t e = settings_set_lcd_brightness(bright);
+        if (e == ESP_OK) {
+            (void)lcd_nv3030b_set_backlight(bright);
+            /* 顺带回报一次"用户活动"：若此刻屏幕已自动降亮到 10%，这一步会把
+             * 背光恢复到刚写入的用户亮度并重置降亮计时（见 ui.c）。 */
+            ui_note_user_activity();
+        }
+        return e;
     }
     if (strcmp(key, "display_rate_hz") == 0) {
-        return settings_set_display_rate_hz((uint8_t)atoi(value));
+        /* 【v0.6.2 需求 12】刷新率必须走 ui_set_display_rate_hz()：它内部既写
+         * settings 又同步 UI 任务的运行时值，是"立即生效"的唯一入口；只调
+         * settings_set_display_rate_hz() 则 UI 侧读的还是旧值，网页改了没反应。 */
+        int hz = atoi(value);
+        if (hz != 1 && hz != 5 && hz != 10 && hz != 20 && hz != 30) {
+            return ESP_ERR_INVALID_ARG; /* 与 settings 的合法档位保持一致 */
+        }
+        ui_set_display_rate_hz((uint8_t)hz);
+        return ESP_OK;
     }
     (void)cfg;
     return ESP_ERR_NOT_FOUND;

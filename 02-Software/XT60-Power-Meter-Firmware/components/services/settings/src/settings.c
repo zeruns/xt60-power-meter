@@ -62,7 +62,7 @@ static const char *TAG = "settings";
 #define SETTINGS_KEY_ALARM "alarm_cfg" /**< 告警阈值（settings_alarm_t blob） */
 #define SETTINGS_KEY_WAVE_WIN "wave_win"   /**< 波形时间窗档位（B20） */
 #define SETTINGS_KEY_WAVE_MODE "wave_mode" /**< 波形显示模式（B20） */
-#define SETTINGS_KEY_SCR_OFF "scr_off"     /**< 自动息屏档位（F4） */
+#define SETTINGS_KEY_SCR_OFF "scr_off"     /**< 自动降亮档位（F4，v0.6.2：0=永不 1=15s 2=30s 3=60s） */
 
 /** 告警阈值出厂默认（全部关闭，阈值按前端满量程给合理上限） */
 #define SETTINGS_ALARM_V_LIMIT_DEF 15.0f
@@ -172,7 +172,7 @@ static void load_defaults(settings_t *cfg)
     cfg->wave_smooth = 0; /* 波形曲线平滑默认关（忠实反映原始趋势） */
     cfg->wave_window = 1;    /* 波形默认 10s 窗（B20） */
     cfg->wave_mode = 3;      /* 波形默认电压+电流模式（PM_WAVE_MODE_VI=3，与旧版 UI 一致） */
-    cfg->screen_off_s = 0;   /* 默认永不自动息屏（F4） */
+    cfg->screen_off_s = 0;   /* 默认永不自动降亮（F4；0=永不 1=15s 2=30s 3=60s） */
 }
 
 /**
@@ -293,7 +293,7 @@ static void load_from_nvs(void)
         s_cache.wave_smooth = smooth ? 1u : 0u;
     }
 
-    /* ---- 波形时间窗/显示模式 + 息屏档位（B20/F4）---- */
+    /* ---- 波形时间窗/显示模式 + 自动降亮档位（B20/F4）---- */
     uint8_t ww = 0;
     if (nvs_get_u8(handle, SETTINGS_KEY_WAVE_WIN, &ww) == ESP_OK && ww <= 5u) {
         s_cache.wave_window = ww;

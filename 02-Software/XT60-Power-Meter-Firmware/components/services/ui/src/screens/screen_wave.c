@@ -203,6 +203,8 @@ static lv_obj_t *s_panel = NULL;
 static lv_obj_t *s_roller_win = NULL;
 static lv_obj_t *s_roller_mode = NULL;
 static int8_t s_focus_idx = 0;
+/** 【v0.6.2 需求 8】焦点框可见性门控（同设置页/测量菜单）。 */
+static bool s_panel_focus_visible = false;
 static bool s_menu_open = false;
 static bool s_panel_animating = false;
 /** roller 触控两阶段状态：-1=无（不可滑动）/0=时间窗选中/1=波形模式选中。
@@ -387,11 +389,12 @@ static void update_focus_style(void)
 {
     lv_obj_t *targets[2] = { s_roller_win, s_roller_mode };
     for (int i = 0; i < 2; i++) {
-        /* lv_obj_set_style_* 的第 3 个参数 0 = 仅默认状态（不带 state 掩码的样式） */
-        lv_obj_set_style_border_color(targets[i],
-                                     (i == s_focus_idx) ? lv_color_hex(0x0066CC) : COL_CARD_BD,
-                                     0);
-        lv_obj_set_style_border_width(targets[i], (i == s_focus_idx) ? 2 : 1, 0);
+        /* 【v0.6.2 需求 8】焦点框门控：滑板刚打开（触摸路径）不画蓝框，
+         * 用户按 K1/K2 导航后才显示，避免把"焦点"误认为"已选中"。
+         * lv_obj_set_style_* 的第 3 个参数 0 = 仅默认状态（不带 state 掩码）。 */
+        const bool on = s_panel_focus_visible && (i == s_focus_idx);
+        lv_obj_set_style_border_color(targets[i], on ? lv_color_hex(0x0066CC) : COL_CARD_BD, 0);
+        lv_obj_set_style_border_width(targets[i], on ? 2 : 1, 0);
     }
 }
 
@@ -571,6 +574,7 @@ void screen_wave_open_menu(void)
     wave_geom_t g = wave_geom();
     lv_obj_set_hidden(s_panel, false);
     s_panel_animating = true;
+    s_panel_focus_visible = false; /* 需求 8：打开时不显示焦点框，首次按键后才显示 */
     update_focus_style();
 
     lv_anim_t anim;
@@ -663,6 +667,7 @@ bool screen_wave_menu_key(button_id_t id, button_event_t ev)
     }
     case BUTTON_EVENT_DOUBLE_CLICK:
         if (id == BUTTON_ID_USER) {
+            s_panel_focus_visible = true; /* 按键导航：显示焦点框（需求 8） */
             s_focus_idx = (int8_t)((s_focus_idx + 1) % 2);
             update_focus_style();
         }

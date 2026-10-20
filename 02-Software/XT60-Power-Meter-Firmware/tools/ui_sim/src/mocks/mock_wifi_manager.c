@@ -136,6 +136,16 @@ esp_err_t wifi_manager_get_ap_ssid(char *out, size_t out_len)
     return ESP_OK;
 }
 
+/* v0.6.2 需求 4：WiFi 设置页在配网模式下显示热点密码，需该接口 */
+esp_err_t wifi_manager_get_ap_pass(char *out, size_t out_len)
+{
+    if ((out == NULL) || (out_len < 12)) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    snprintf(out, out_len, "xt60config");
+    return ESP_OK;
+}
+
 esp_err_t wifi_manager_get_rssi(int8_t *out_rssi)
 {
     if (out_rssi == NULL) {

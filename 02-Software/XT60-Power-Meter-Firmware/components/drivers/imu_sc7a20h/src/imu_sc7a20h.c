@@ -123,15 +123,17 @@ static esp_err_t imu_read_xyz(int16_t *x, int16_t *y, int16_t *z)
 }
 
 /**
- * @brief 由重力主导轴与符号判定朝向（重力主导轴法）
+ * @brief 由重力主导轴与符号判定朝向（重力主导轴法 + 带权阈值，v0.6.2 提高灵敏度）
  *
  * 取绝对值最大的轴为主导轴：
- *   · |Z| 最大 -> 设备近乎平放，无法区分横竖 -> 显式返回 FLAT，
- *     由调用方决定"保持现状"（2026-10 修复：此前平放返回的是驱动初始
- *     默认值 PORTRAIT，导致"平放开机 + 自动旋转开启"时被误判为竖屏，
- *     开机约 1.2s 后自动旋转 90° 并触发全 UI 重建——实机 UI 冻结的
+ *   · 平放判据（v0.6.2 需求 10）：|z| × 10 ≥ max(|x|,|y|) × 14 才算平放，
+ *     等价"离开水平面约 35° 即认为已竖起"（旧版为 Z 分量最大，等效 45°）。
+ *     平放时显式返回 FLAT，由调用方决定"保持现状"（2026-10 修复：此前平放
+ *     返回驱动初始默认值 PORTRAIT，导致"平放开机 + 自动旋转开启"时被误判为
+ *     竖屏，开机约 1.2s 后自动旋转 90° 并触发全 UI 重建——实机 UI 冻结的
  *     触发路径之一）；
- *   · 否则按主导轴与符号映射到四种朝向。
+ *   · 横竖判据（v0.6.2 需求 10）：|x| × 10 ≥ |y| × 7 判横屏，即水平分量偏向
+ *     X 轴 35° 以内即判横屏（旧版为 |x| ≥ |y|，等效 45°），转动更易触发切换。
  *
  * 符号到朝向的映射与屏幕/芯片安装方向强相关，若反向请按实际装配调整
  * （见文件头「上板调试要点」）。
@@ -139,19 +141,23 @@ static esp_err_t imu_read_xyz(int16_t *x, int16_t *y, int16_t *z)
 static void classify_orientation(int16_t x, int16_t y, int16_t z,
                                  imu_sc7a20h_orientation_t *out)
 {
-    int16_t ax = abs(x), ay = abs(y), az = abs(z);
+    int32_t ax = abs(x), ay = abs(y), az = abs(z);
+    int32_t hmax = (ax > ay) ? ax : ay; /* 水平面（XY）最大分量 */
 
-    if (az >= ax && az >= ay) {
-        /* 平放：显式告知调用方"姿态不确定"，不替它做任何默认假设 */
+    /* 平放判据：|z| < 1.4 × 水平最大分量 才视为平放（等效倾斜角约 35°）。
+     * 例：水平放置 az≈g、hmax≈0 → 平放；竖起 40° 时 hmax=g·sin40°≈0.64g、
+     * az=g·cos40°≈0.77g，0.77g < 1.4×0.64g=0.90g → 判定为已竖起。
+     * 全部整数运算（×10 / ×14）：量程 ±32768，×14 后约 ±459k，int32_t 不溢出。 */
+    if (az * 10 >= hmax * 14) {
         *out = IMU_SC7A20H_ORIENT_FLAT;
         return;
     }
 
-    if (ax >= ay) {
-        /* 重力主要落在 X 轴 -> 横屏 */
+    if (ax * 10 >= ay * 7) {
+        /* 水平分量主要落在 X 轴（偏离横屏 35° 以内）-> 横屏 */
         *out = (x > 0) ? IMU_SC7A20H_ORIENT_LANDSCAPE : IMU_SC7A20H_ORIENT_LANDSCAPE_INV;
     } else {
-        /* 重力主要落在 Y 轴 -> 竖屏 */
+        /* 水平分量主要落在 Y 轴 -> 竖屏 */
         *out = (y > 0) ? IMU_SC7A20H_ORIENT_PORTRAIT : IMU_SC7A20H_ORIENT_PORTRAIT_INV;
     }
 }

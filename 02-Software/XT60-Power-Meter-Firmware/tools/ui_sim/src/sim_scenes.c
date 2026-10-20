@@ -106,40 +106,43 @@ static void click_obj(lv_obj_t *o)
     sim_click((a.x1 + a.x2) / 2, (a.y1 + a.y2) / 2);
 }
 
-/** @brief 查找"有垂直滚动余量"的容器（内容溢出屏幕时用于滚动回退） */
-static lv_obj_t *find_scrollable_rec(lv_obj_t *root)
+/**
+ * @brief 把所有"有垂直滚动余量"的容器都滚到底
+ *
+ * 【为什么不只滚一个】深度优先只取第一个可滚容器时，当屏幕里同时存在多个
+ * （tileview 的页 + 二级页浮层的内容区），可能选到不含目标控件的那个，导致
+ * "目标明明存在却点不到"。遍历全部并逐个滚到底，可覆盖任意一处溢出
+ * （如"显示设置"页被挤出首屏的角度按钮）。
+ */
+static void scroll_all_to_bottom(lv_obj_t *root)
 {
     if (root == NULL || lv_obj_is_hidden(root)) {
-        return NULL;
+        return;
     }
     if ((lv_obj_get_scroll_dir(root) & LV_DIR_VER) && lv_obj_get_scroll_bottom(root) > 4) {
-        return root;
+        lv_obj_scroll_to_y(root, 10000, LV_ANIM_OFF);
     }
     uint32_t n = lv_obj_get_child_count(root);
     for (uint32_t i = 0; i < n; i++) {
-        lv_obj_t *r = find_scrollable_rec(lv_obj_get_child(root, i));
-        if (r != NULL) {
-            return r;
-        }
+        scroll_all_to_bottom(lv_obj_get_child(root, i));
     }
-    return NULL;
 }
 
 /** @brief 按文本点击（返回是否命中，未命中会打印告警——即"验收失败"）
  *
- * 找不到时先做一次"滚动回退"：把当前页中垂直有滚动余量的容器滚到底，
- * 以覆盖"核心按钮被挤出首屏、需要滚动才能点"的页面（如校准编辑页）。
+ * 找不到时先做一次"滚动回退"：把当前页中所有垂直有滚动余量的容器滚到底，
+ * 以覆盖"核心按钮被挤出首屏、需要滚动才能点"的页面（如校准编辑页、
+ * 显示设置页的角度按钮）。
  */
 static bool click_text(const char *text)
 {
     lv_obj_t *o = find_text(text);
     if (o == NULL) {
-        lv_obj_t *sc = find_scrollable_rec(lv_screen_active());
-        if (sc != NULL) {
-            lv_obj_scroll_to_y(sc, 10000, LV_ANIM_OFF);
-            sim_step(60);
-            o = find_text(text);
-        }
+        /* 滚动回退：把所有可纵向滚动的容器都滚到底（含二级页浮层里的内容区），
+         * 再找一次——覆盖"核心按钮被挤出首屏"的页面 */
+        scroll_all_to_bottom(lv_screen_active());
+        sim_step(60);
+        o = find_text(text);
     }
     if (o == NULL) {
         printf("[scene] !! 未找到可点击文本: %s\n", text);

@@ -7,8 +7,9 @@
  * LVGL 显示与触摸同步旋转到目标角度。
  *
  * 设计要点：
- *   · 独立低优先级任务（Core0，栈 3KB，周期 200ms），I2C 读取阻塞 ≤ 几 ms；
- *   · 去抖：连续 ORIENT_CONFIRM_N 次读到同一姿态才切换（≈1.2s 稳定），
+ *   · 独立低优先级任务（Core0，栈 3KB，周期 150ms），I2C 读取阻塞 ≤ 几 ms；
+ *   · 去抖：连续 ORIENT_CONFIRM_N 次读到同一姿态才切换（≈450ms 稳定，v0.6.2
+ *     由 1.2s 收紧，用户需求 10：原参数要转到接近垂直才切换，太迟钝），
  *     防止转动瞬间抖动导致来回翻转；平放时驱动显式报告 FLAT，本服务
  *     直接跳过（保持当前方向），不会用任何默认朝向去猜测；
  *   · 只在角度真正变化时调 lvgl_port_set_rotation_angle()，避免无谓刷屏；
@@ -37,8 +38,10 @@ static const char *TAG = "orientation";
 
 #define ORIENT_TASK_STACK 3072      /**< 监测任务栈（字节）：只需放姿态变量与日志缓冲 */
 #define ORIENT_TASK_PRIO 4          /**< 任务优先级（数值越大越高），低于 UI 任务 */
-#define ORIENT_PERIOD_MS 200        /**< 姿态采样周期（毫秒） */
-#define ORIENT_CONFIRM_N 6 /**< 连续同向次数确认（6×200ms ≈ 1.2s） */
+#define ORIENT_PERIOD_MS 150        /**< 姿态采样周期（毫秒；v0.6.2 由 200 收紧到 150，
+                                     *   提高采样密度，让姿态变化更快被捕捉） */
+#define ORIENT_CONFIRM_N 3 /**< 连续同向次数确认（v0.6.2 由 6 降到 3：3×150ms ≈ 450ms
+                            *   稳定窗口，用户反馈原 ≈1.2s 太迟钝，切向迟滞明显） */
 #define ORIENT_INVALID_ANG 0xFFFFu  /**< 哨兵值：该姿态无法映射为屏幕角度（如 FLAT） */
 
 static bool s_inited = false;            /**< 是否已创建监测任务（防重复创建） */
