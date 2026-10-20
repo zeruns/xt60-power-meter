@@ -81,6 +81,7 @@
 #include "esp_log.h"
 
 #include "data_store.h"
+#include "power_measure.h" /* v0.6.6：/api/config 读写标定（电压/电流增益与零偏） */
 #include "settings.h"      /* v0.6.2 需求 13：GET /api/config 回读用户配置 */
 #include "wifi_manager.h" /* v0.6.0：/api/state 增 WiFi 状态/RSSI，/api/wifi/scan 封装扫描 */
 
@@ -113,8 +114,8 @@ static const char *TAG = "web_console";
 #define WEB_CONSOLE_KEY_MAX 48
 /** 参数值长度上限（字节，含结尾 '\0'） */
 #define WEB_CONSOLE_VALUE_MAX 256
-/** GET /api/config 应答缓冲（字节）：约 220 字节的配置 JSON，留足余量 */
-#define WEB_CONSOLE_CFGJSON_BUF_LEN 384
+/** GET /api/config 应答缓冲（字节）：v0.6.6 新增 5 个标定字段后约 420 字节，留足余量 */
+#define WEB_CONSOLE_CFGJSON_BUF_LEN 640
 /** GET /api/info 应答缓冲（字节）：版本/IP/MAC/内存水位等，约 260 字节 */
 #define WEB_CONSOLE_INFOJSON_BUF_LEN 320
 
@@ -599,6 +600,13 @@ static esp_err_t api_config_get_handler(httpd_req_t *req)
     }
 
     char buf[WEB_CONSOLE_CFGJSON_BUF_LEN];
+    /* v0.6.6 需求 4：把标定参数（电压/电流增益与零偏）一并回读，供网页设置页
+     * 显示与修改；并给出「电流零点采样是否进行中」，让前端能轮询等待 3 秒结束。
+     * 增益是很小的数（V/LSB 约 1.4e-5），用 %.9g 保证有效位；零偏用 %.6g。 */
+    power_measure_calib_t cal;
+    power_measure_get_calibration(&cal);
+    const bool zero_running = power_measure_zero_current_is_running();
+
     int n = snprintf(buf, sizeof(buf),
                      "{\"ok\":true,"
                      "\"lcd_brightness\":%u,\"buzzer_volume\":%u,\"display_rate_hz\":%u,"
@@ -606,6 +614,9 @@ static esp_err_t api_config_get_handler(httpd_req_t *req)
                      "\"wave_window\":%u,\"wave_mode\":%u,\"wave_smooth\":%u,"
                      "\"alarm_v_en\":%u,\"alarm_i_en\":%u,\"alarm_p_en\":%u,"
                      "\"alarm_v_limit\":%.3f,\"alarm_i_limit\":%.3f,\"alarm_p_limit\":%.3f,"
+                     "\"cal_v_gain\":%.9g,\"cal_v_offset\":%.6g,"
+                     "\"cal_i_gain\":%.9g,\"cal_i_offset\":%.6g,"
+                     "\"cal_zero_running\":%s,"
                      "\"wifi_mode\":%d}",
                      (unsigned)cfg.lcd_brightness, (unsigned)cfg.buzzer_volume,
                      (unsigned)cfg.display_rate_hz, (unsigned)cfg.screen_off_s,
@@ -613,7 +624,9 @@ static esp_err_t api_config_get_handler(httpd_req_t *req)
                      (unsigned)cfg.wave_window, (unsigned)cfg.wave_mode,
                      (unsigned)cfg.wave_smooth, (unsigned)alm.v_en, (unsigned)alm.i_en,
                      (unsigned)alm.p_en, (double)alm.v_limit, (double)alm.i_limit,
-                     (double)alm.p_limit, (int)wifi_manager_get_mode());
+                     (double)alm.p_limit, (double)cal.voltage_gain, (double)cal.voltage_offset,
+                     (double)cal.current_gain, (double)cal.current_offset,
+                     zero_running ? "true" : "false", (int)wifi_manager_get_mode());
     if (n <= 0 || (size_t)n >= sizeof(buf)) {
         return send_json(req, HTTPD_500,
                          "{\"ok\":false,\"code\":\"internal\",\"msg\":\"config json overflow\"}");

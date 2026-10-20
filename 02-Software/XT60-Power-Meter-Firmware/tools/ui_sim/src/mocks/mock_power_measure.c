@@ -78,6 +78,29 @@ esp_err_t power_measure_reset_energy(void)
     return ESP_OK;
 }
 
+/* ---- v0.6.6 需求 5：电流零点自动校准（UI 与网页共用测量核实现）----
+ * 模拟器没有真实采样核，用"立即完成 + 固定均值"代替：UI 侧只关心
+ * "发起成功 → 轮询看到结束 → 弹结果"，这样能完整走通交互路径。
+ * 真机行为见 power_measure.c（累计 3 秒 200ms 块均值后调整零偏）。 */
+static float s_zero_avg_mock = 0.00042f;
+
+esp_err_t power_measure_zero_current_start(void)
+{
+    ESP_LOGI(TAG, "电流零点校准已发起（模拟：立即完成，均值 %.5f A）",
+             (double)s_zero_avg_mock);
+    return ESP_OK;
+}
+
+bool power_measure_zero_current_is_running(void)
+{
+    return false; /* 模拟器：发起即完成，UI 轮询首拍就能拿到结果 */
+}
+
+float power_measure_zero_current_last_avg(void)
+{
+    return s_zero_avg_mock;
+}
+
 uint32_t power_measure_sample_rate_hz(void)
 {
     return 4000;

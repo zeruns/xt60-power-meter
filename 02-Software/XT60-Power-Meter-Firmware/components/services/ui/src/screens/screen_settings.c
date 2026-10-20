@@ -1245,68 +1245,37 @@ static void calib_apply_cb(lv_event_t *e)
 }
 
 /**
- * @brief 电流零点一键清零（空载校零，采样按下后 1 秒内的平均值）
+ * @brief 电流零点一键清零（空载校零，v0.6.6：改为采样 **3 秒块均值**）
  *
  * 输出空载时点击：把电流零偏 offset 调到「抵消采样平均值」的位置，使显示
- * 立即归零。物理量 = raw×gain + offset，故
- *   offset_new = offset_old − 采样平均值
+ * 立即归零。物理量 = raw×gain + offset，故 offset_new = offset_old − 采样均值。
  *
- * 【2026-10 需求更新】原先用点击瞬间的单帧快照当清零值——单帧含噪声，
- * 偶发的坏帧/毛刺会被永久烧进零偏。改为「按下后 1 秒内的平均值」：
- *   · 异步实现（lv_timer 轮询 data_store），不阻塞 UI 任务/LVGL 锁；
- *   · 采样期间显示"正在采样"提示，结束弹结果（触摸/按键共用本回调）；
- *   · 均值约 40 帧（40Hz 快照），配合快照本身的掐头去尾，鲁棒性远高于单帧。
+ * 【v0.6.6 需求 5 的实现变更】
+ *   旧版在 UI 侧用 lv_timer 每 40ms 读一次 data_store 快照、累计 1 秒求平均。
+ *   现在统一交给**测量核**：`power_measure_zero_current_start()` 在 200ms 块边界
+ *   累计电流块均值，满 3 秒（15 块）后调整零偏并 deferred 落盘。
+ *   为什么更好：
+ *     · 块均值是电流的权威口径（与正式测量同源），不受显示平滑/抽取影响；
+ *     · 3 秒 15 块样本比 1 秒约 25 个显示帧更抗毛刺；
+ *     · 网页控制台的「电流清零」按钮调用同一接口，两边口径一致。
+ *   UI 侧只保留一个 100ms 轮询定时器，用来在采样结束后弹结果提示。
  *
  * @param e LVGL 点击事件（未使用）
  */
-/* 清零采样定时器声明见文件前部（s_close_timer 旁） */
-static float s_zero_sum = 0.0f;          /**< 清零采样电流累计（A） */
-static uint32_t s_zero_n = 0;            /**< 清零采样帧数 */
-static int64_t s_zero_start_us = 0;      /**< 清零采样起点（µs） */
-
+/* 清零轮询定时器声明见文件前部（s_close_timer 旁） */
 static void zero_sample_timer_cb(lv_timer_t *t)
 {
     (void)t;
-    const int64_t now_us = esp_timer_get_time();
-
-    /* 采样窗口内：累计每帧电流快照（seqlock 读，非阻塞） */
-    data_store_snapshot_t snap;
-    if (data_store_get(&snap) == ESP_OK) {
-        s_zero_sum += snap.current_a;
-        s_zero_n++;
+    if (power_measure_zero_current_is_running()) {
+        return; /* 测量核还在累计 3 秒块均值 */
     }
-
-    if (now_us - s_zero_start_us < 1000000) {
-        return; /* 1 秒窗口未满，继续 */
-    }
-
-    /* 窗口结束：自删定时器（lv_timer 删除自身在回调内是合法的） */
+    /* 采样结束：自删定时器（lv_timer 删除自身在回调内合法） */
     lv_timer_del(s_zero_timer);
     s_zero_timer = NULL;
 
-    if (s_zero_n == 0) {
-        show_notice("清零失败", "采样期间无数据，请重试。");
-        return;
-    }
-    const float avg = s_zero_sum / (float)s_zero_n;
-
-    /* offset 调整：抵消采样平均值 */
-    power_measure_calib_t cal;
-    power_measure_get_calibration(&cal);
-    cal.current_offset -= avg;
-    /* 【v0.6.0 卡死修复】必须用 deferred 版本：本回调是 **LVGL 定时器回调**，
-     * 运行在持有 LVGL 锁的 UI 主循环里。同步版 power_measure_set_calibration()
-     * 会在锁内直接写 NVS（nvs_commit 可达数百 ms，还会与 task_aux 的周期落盘
-     * 抢同一把 s_save_mutex 而叠加成秒级等待），期间 LVGL 渲染任务拿不到锁 →
-     * 整屏冻结，而指示灯由独立 esp_timer 驱动照常闪烁。deferred 版只改内存
-     * 标定值并置"待落盘"原子标志，真正的 Flash 写入交给 task_aux 异步完成。 */
-    if (power_measure_set_calibration_deferred(&cal) != ESP_OK) {
-        show_notice("清零失败", "参数保存失败，请重试。");
-        return;
-    }
+    const float avg = power_measure_zero_current_last_avg();
     char text[96];
-    snprintf(text, sizeof(text), "电流零点已校准。\n（采样 %.1fs / %u 帧均值\n %.4f A → 0）",
-             (double)((now_us - s_zero_start_us) / 1000) / 1000.0, (unsigned)s_zero_n,
+    snprintf(text, sizeof(text), "电流零点已校准。\n（3 秒块均值\n %.4f A → 0）",
              (double)avg);
     show_notice("已清零", text);
 }
@@ -1318,12 +1287,13 @@ static void calib_zero_cb(lv_event_t *e)
     if (s_zero_timer != NULL) {
         return;
     }
-    s_zero_sum = 0.0f;
-    s_zero_n = 0;
-    s_zero_start_us = esp_timer_get_time();
-    /* 40ms 轮询（≈40Hz 快照节奏，1 秒约 25 帧） */
-    s_zero_timer = lv_timer_create(zero_sample_timer_cb, 40, NULL);
-    show_notice("正在清零", "采样空载电流中…\n请保持空载约 1 秒。");
+    if (power_measure_zero_current_start() != ESP_OK) {
+        show_notice("无法清零", "采样服务忙或未就绪，请稍后重试。");
+        return;
+    }
+    /* 100ms 轮询：3 秒采样 + 最多 200ms 块边界延迟，观察是否结束 */
+    s_zero_timer = lv_timer_create(zero_sample_timer_cb, 100, NULL);
+    show_notice("正在清零", "采样空载电流中…\n请保持空载约 3 秒。");
 }
 
 /**

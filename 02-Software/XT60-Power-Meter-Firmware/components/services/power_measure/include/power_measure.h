@@ -123,6 +123,32 @@ void power_measure_get_calibration(power_measure_calib_t *out);
 esp_err_t power_measure_reset_energy(void);
 
 /**
+ * @brief 发起一次电流零点自动校准（v0.6.6 需求 5：采样 3 秒平均）
+ *
+ * 非阻塞：只置请求标志，测量核在块边界开始累计电流块均值，满 3 秒后把
+ * current_offset 按"抵消均值"调整并 deferred 落盘（不阻塞 4kHz 采样）。
+ *
+ * 为什么由测量核做而不是 UI 读快照：200ms 块均值是电流的权威口径，3 秒=15 块
+ * 样本比 UI 侧读 40Hz 显示帧的 1 秒均值更稳；且 UI 与网页控制台共用同一实现。
+ * 调用前应保持**空载**（无负载电流），否则会把负载电流当成零点抹掉。
+ *
+ * @return ESP_OK 已受理
+ *         ESP_ERR_INVALID_STATE 测量服务未初始化，或已有一次采样在进行中
+ */
+esp_err_t power_measure_zero_current_start(void);
+
+/**
+ * @brief 查询电流零点校准是否仍在采样（约 3 秒）
+ * @return true=采样中；false=空闲或已完成
+ */
+bool power_measure_zero_current_is_running(void);
+
+/**
+ * @brief 读取最近一次电流零点采样的均值（A）；未做过校准时为 0
+ */
+float power_measure_zero_current_last_avg(void);
+
+/**
  * @brief 查询采样率（Hz，当前固定 4000，与 ADS131M02 配置一致）
  */
 uint32_t power_measure_sample_rate_hz(void);
