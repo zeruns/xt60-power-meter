@@ -68,8 +68,9 @@ typedef enum {
  * 行为：
  *   · NVS 中有凭据 → STA 模式自动连接（有限次指数退避重试，
  *     重试耗尽进入 FAILED 状态，不重启设备）；
- *   · 无凭据 → AP 配网模式（开放热点 "XT60-Meter-XXXX"，XXXX 为
- *     芯片 MAC 后两字节；APSTA 模式，STA 保持可扫描供配网页列出热点）。
+ *   · 无凭据 → AP 配网模式（WPA2-PSK 加密热点 "XT60-Meter-XXXX"，XXXX 为
+ *     芯片 MAC 后两字节，密码见 wifi_manager_get_ap_pass()；APSTA 模式，
+ *     STA 保持可扫描供配网页列出热点）。
  *
  * 本函数只负责“把 WiFi 拉起来并发起动作”，不等待连接结果——
  * 连接进度由 wifi_manager_get_state() 异步查询。
@@ -162,6 +163,19 @@ esp_err_t wifi_manager_get_ssid(char *out, size_t out_len);
  *         ESP_ERR_INVALID_ARG 参数非法或缓冲区太小
  */
 esp_err_t wifi_manager_get_ap_ssid(char *out, size_t out_len);
+
+/**
+ * @brief 查询配网热点密码（v0.6.2 需求 4：设备端把密码显示给用户才能连接）
+ *
+ * 当前实现返回编译期常量 WIFI_MANAGER_AP_PASS（WPA2-PSK）。设备 UI 的
+ * WiFi 设置页在配网模式下显示"热点名 + 密码"，用户照此输入即可连接热点。
+ *
+ * @param out 输出缓冲区，不可为 NULL
+ * @param out_len 输出缓冲区长度（至少 sizeof(WIFI_MANAGER_AP_PASS)，约 12 字节）
+ * @return ESP_OK 成功
+ *         ESP_ERR_INVALID_ARG 参数非法或缓冲区太小
+ */
+esp_err_t wifi_manager_get_ap_pass(char *out, size_t out_len);
 
 /**
  * @brief 触发一次 STA 热点扫描（AP 配网模式下同样可用，供配网页列热点）

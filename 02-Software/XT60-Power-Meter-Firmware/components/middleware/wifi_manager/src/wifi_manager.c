@@ -493,7 +493,7 @@ static esp_err_t enter_ap_mode(void)
     ap_cfg.ap.channel = WIFI_MANAGER_AP_CHANNEL;
     /* WPA2-PSK 加密（不再用开放热点）：① Windows 对开放网络常静默拒绝连接
      * （2026-10 实测扫描不到/连接即断）；② 开放热点会把配网通道暴露给任何
-     * 旁人。⚠ 量产应改为设备唯一密码（贴机身），此处为开发期统一密码。 */
+     * 旁人。！量产应改为设备唯一密码（贴机身），此处为开发期统一密码。 */
     ap_cfg.ap.authmode = WIFI_AUTH_WPA2_PSK;
     strncpy((char *)ap_cfg.ap.password, WIFI_MANAGER_AP_PASS, sizeof(ap_cfg.ap.password) - 1);
     ap_cfg.ap.max_connection = WIFI_MANAGER_AP_MAX_CONN;
@@ -511,7 +511,8 @@ static esp_err_t enter_ap_mode(void)
     }
 
     set_state(WIFI_MANAGER_STATE_AP_MODE);
-    ESP_LOGI(TAG, "已进入 AP 配网模式（热点 %s，开放）", s_ap_ssid);
+    ESP_LOGI(TAG, "已进入 AP 配网模式（热点 %s，WPA2 密码 %s）", s_ap_ssid,
+             WIFI_MANAGER_AP_PASS);
     return ESP_OK;
 }
 
@@ -1536,6 +1537,31 @@ esp_err_t wifi_manager_get_ap_ssid(char *out, size_t out_len)
     out[out_len - 1] = '\0';
     portEXIT_CRITICAL(&s_lock);
 
+    return ESP_OK;
+}
+
+/**
+ * @brief 查询配网热点密码（v0.6.2 需求 4：设备端需把密码显示给用户才能连接）
+ *
+ * 当前热点密码是编译期常量 WIFI_MANAGER_AP_PASS（WPA2-PSK，量产应改设备
+ * 唯一码并贴机身）。本函数把它拷给调用方，供设备 UI 在 WiFi 设置页显示
+ * "热点名 + 密码"，用户照着输密码即可手机连接热点完成配网。
+ * 若将来密码改为运行期可配（例如从 NVS 读取），只需改本函数内部取值来源，
+ * 调用方无需改动。
+ *
+ * @param out 输出缓冲区，不可为 NULL
+ * @param out_len 输出缓冲区长度（至少 sizeof(WIFI_MANAGER_AP_PASS)）
+ * @return ESP_OK 成功
+ *         ESP_ERR_INVALID_ARG 参数非法或缓冲区太小
+ */
+esp_err_t wifi_manager_get_ap_pass(char *out, size_t out_len)
+{
+    if ((out == NULL) || (out_len < sizeof(WIFI_MANAGER_AP_PASS))) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    /* sizeof(WIFI_MANAGER_AP_PASS) 含结尾 0，故 out_len 必然 ≥ strlen+1 */
+    strncpy(out, WIFI_MANAGER_AP_PASS, out_len - 1);
+    out[out_len - 1] = '\0';
     return ESP_OK;
 }
 

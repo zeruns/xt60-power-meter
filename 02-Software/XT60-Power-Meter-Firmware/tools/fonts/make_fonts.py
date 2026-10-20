@@ -72,15 +72,27 @@ def collect_unicodes():
     return codes
 
 
-UI_SRC = os.path.abspath(os.path.join(HERE, "..", "..", "components", "services", "ui", "src"))
+# 【v0.6.2 需求 3】扫描范围由 components/services/ui/src 扩大到整个 components：
+# 之前只扫 UI 目录，导致"字库缺字"——任何**上游组件**里定义、最终却显示到屏幕上的
+# 字符串都可能被漏掉（例如 power_measure/settings 的告警名、wifi_manager 的提示语）。
+# 扩到 components 根后，凡是 .c/.h 里的字符串字面量全部纳入子集，从源头消除缺字。
+UI_SRC = os.path.abspath(os.path.join(HERE, "..", "..", "components"))
 _STR_PAT = re.compile(r'"((?:[^"\\]|\\.)*)"')
+
+# 不参与设备字库子集的文件：内嵌网页（HTML/JS 源码里的大段字符串）最终由
+# **浏览器字体**渲染，而不是 LVGL 的 CJK TTF，因此其中的 emoji（🔒/🔓）、
+# ✔/✘ 等符号既不需要也无法子集进本 TTF（源字体 Noto Sans SC 也没有这些字形）。
+# 排除后，字体子集与缺字审计的口径都只覆盖"真正会画到设备屏幕上"的文案。
+_SCAN_EXCLUDE_FILES = { "web_console_page.c" }
 
 
 def _scan_ui_source_chars():
-    """扫描 UI 源码的字符串字面量，返回其中出现的字符码点集合。"""
+    """扫描 components 下 C 源码的字符串字面量，返回其中出现的字符码点集合。"""
     codes = set()
     for ext in ("*.c", "*.h"):
         for path in glob.glob(os.path.join(UI_SRC, "**", ext), recursive=True):
+            if os.path.basename(path) in _SCAN_EXCLUDE_FILES:
+                continue
             try:
                 with open(path, encoding="utf-8") as f:
                     src = f.read()
