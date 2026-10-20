@@ -21,7 +21,9 @@
 #include "lvgl_port.h"
 #include "screens/splash.h"
 #include "screen_measure.h"
+#include "screen_settings.h" /* v0.6.3：场景直接调用 screen_settings_refresh() 复现 5Hz 刷新一拍 */
 #include "screen_wave.h"
+#include "settings.h"        /* v0.6.3：用 settings_set_* 模拟"网页控制台下发" */
 #include "ui.h"
 #include "ui_nav.h"
 
@@ -445,6 +447,12 @@ void sim_run_scenes(void)
 {
     printf("=== XT60 模拟器场景开始 ===\n");
 
+    /* 【v0.6.3】先初始化配置服务（真机在启动表第 5 步做）。
+     * mock_settings 的 s_ready 为 false 时所有 get/set 都返回
+     * ESP_ERR_INVALID_STATE，UI 就会走"取不到设置"的兜底默认值——那样
+     * "外部下发 → 子页同步"这类场景根本跑不到真实分支，会得出假结论。 */
+    (void)settings_init();
+
     /* 与真机台架一致的初始数据 */
     sim_set_measurement(19.97670f, 0.018860f, 0.37683f, 0.11800f, 32.5f, 30.0f, 3920, 12345);
 
@@ -527,6 +535,76 @@ void sim_run_scenes(void)
     click_text("试听");
     sim_step(200);
     close_subpage_if_open();
+
+    /* ============================================================
+     * v0.6.3 需求 2：外部（网页控制台）下发设置 → 设备子页实时同步
+     *
+     * 真机上"外部改动"由网页 POST /api/config 写入 settings，再由 UI 主循环
+     * 的 5Hz 分派调用 screen_settings_refresh() 同步到滑条/数值。模拟器不跑
+     * ui.c 主循环，故这里直接调用**同一个** screen_settings_refresh()，
+     * 等价地复现"刷新一拍"。
+     * ============================================================ */
+    {
+        /* 44：停「显示设置」页时外部改亮度 → 滑条与数值必须跟随 */
+        open_sub_page("显示设置");
+        (void)settings_set_lcd_brightness(35);   /* 等价网页 POST lcd_brightness=35 */
+        screen_settings_refresh(sim_get_measurement()); /* 等价真机 5Hz 刷新一拍 */
+        sim_step(120);
+        shot("44_display_remote_bright");
+        {
+            lv_obj_t *sl = find_slider_rec(lv_screen_active());
+            const int v = (sl != NULL) ? (int)lv_slider_get_value(sl) : -1;
+            printf("[scene] 显示设置页外部下发后滑条值=%d（期望 35）\n", v);
+            if (v != 35) {
+                printf("[scene] !! 显示设置页亮度滑条未跟随外部下发值\n");
+            }
+        }
+
+        /* 46：手指按住滑条期间外部下发不得把滑条拉走；松手后一拍才跟随 */
+        {
+            lv_obj_t *sl = find_slider_rec(lv_screen_active());
+            if (sl == NULL) {
+                printf("[scene] !! 找不到亮度滑条，无法验证拖动冲突\n");
+            } else {
+                lv_slider_set_value(sl, 70, LV_ANIM_OFF);
+                lv_obj_add_state(sl, LV_STATE_PRESSED);      /* 模拟手指按住 */
+                (void)settings_set_lcd_brightness(20);       /* 远端下发 */
+                screen_settings_refresh(sim_get_measurement());
+                sim_step(120);
+                shot("46_slider_drag_not_overridden");
+                const int held = (int)lv_slider_get_value(sl);
+                printf("[scene] 按住滑条期间外部下发后滑条值=%d（期望仍为 70）\n", held);
+                if (held != 70) {
+                    printf("[scene] !! 按住滑条被外部下发值覆盖（拖动冲突）\n");
+                }
+                lv_obj_remove_state(sl, LV_STATE_PRESSED);   /* 松手 */
+                screen_settings_refresh(sim_get_measurement()); /* 松手后一拍 */
+                sim_step(120);
+                const int after = (int)lv_slider_get_value(sl);
+                printf("[scene] 松手后一拍滑条值=%d（期望跟到 20）\n", after);
+                if (after != 20) {
+                    printf("[scene] !! 松手后未跟随外部下发值\n");
+                }
+            }
+        }
+        close_subpage_if_open();
+
+        /* 45：停「蜂鸣器」页时外部改音量 → 滑条与数值必须跟随 */
+        open_sub_page("蜂鸣器");
+        (void)settings_set_buzzer_volume(25);    /* 等价网页 POST buzzer_volume=25 */
+        screen_settings_refresh(sim_get_measurement());
+        sim_step(120);
+        shot("45_buzzer_remote_volume");
+        {
+            lv_obj_t *sl = find_slider_rec(lv_screen_active());
+            const int v = (sl != NULL) ? (int)lv_slider_get_value(sl) : -1;
+            printf("[scene] 蜂鸣器页外部下发后滑条值=%d（期望 25）\n", v);
+            if (v != 25) {
+                printf("[scene] !! 蜂鸣器响度滑条未跟随外部下发值\n");
+            }
+        }
+        close_subpage_if_open();
+    }
 
     /* ---- WiFi 路线图 ---- */
     open_sub_page("WiFi 与热点");
@@ -687,6 +765,23 @@ void sim_run_scenes(void)
     sim_step(200);
     close_subpage_if_open();
     sim_step(150);
+
+    /* ---- v0.6.3 需求 1：竖屏下的扫描页布局 ----
+     * 横屏 240px 高时列表约 138px（可见 3 行），竖屏 284px 高时约 182px（可见 4 行）。
+     * 截图用于确认"重扫按钮移入标题栏"后列表确实吃到了更多高度。 */
+    rotate_to_angle(90, 2); /* 转 90° 竖屏（240×284） */
+    ensure_page(2);
+    open_sub_page("WiFi 与热点");
+    mock_wifi_set_scan_list(5);
+    click_text("搜索 Wi-Fi");
+    mock_wifi_scan_finish(); /* 模拟 SCAN_DONE */
+    sim_step(450);
+    shot("43_wifi_scan_portrait"); /* 竖屏扫描页：标题栏右侧「重新扫描」+ 列表 */
+    close_subpage_if_open();
+    sim_step(150);
+    rotate_to_angle(0, 2); /* 恢复 0° 横屏 */
+    ensure_page(2);
+    close_subpage_if_open();
 
     /* ---- 状态栏 WiFi 信号条四态（测量页截图即可看到状态栏） ---- */
     ensure_page(0);

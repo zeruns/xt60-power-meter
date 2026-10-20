@@ -163,6 +163,10 @@ typedef enum {
 static lv_obj_t *s_tile = NULL;      /**< 设置页 tile（二级页浮层的父级） */
 static lv_obj_t *s_subpage = NULL;   /**< 二级页浮层；NULL = 未打开 */
 static lv_obj_t *s_sub_content = NULL; /**< 二级页内容容器 */
+/** 二级页标题栏（subpage_open 里创建，供个别子页在标题栏右侧挂操作按钮用）。
+ *  为什么要留指针：内容区高度在横屏只有约 164px，"把操作按钮挂到标题栏"
+ *  是给列表/内容腾高度的关键手段（v0.6.3 WiFi 扫描页即用它换出 42px）。 */
+static lv_obj_t *s_sub_topbar = NULL;
 static sub_kind_t s_sub_kind = SUB_NONE; /**< 当前二级页类型（刷新分发的依据） */
 static bool s_layer_hooked = false;  /**< 对话框样式与关闭处理是否已安装 */
 static lv_obj_t *s_msgbox_scrim = NULL; /**< 当前对话框的压暗遮罩（随框删除） */
@@ -180,6 +184,12 @@ static lv_obj_t *s_energy_wh_label = NULL;    /**< 电能统计：累计电能 *
 static lv_obj_t *s_energy_rt_label = NULL;    /**< 电能统计：运行时间 */
 static lv_obj_t *s_bright_value_label = NULL; /**< 显示设置：亮度数值 */
 static lv_obj_t *s_vol_value_label = NULL;    /**< 蜂鸣器：响度数值 */
+/* 【v0.6.3 需求 2】滑条对象也要留指针：网页控制台可远程改亮度/响度，
+ * 用户停留在本子页时需把滑条位置与数值一起同步过来（此前只存了数值
+ * label，滑条指针丢失 → 页面停留期间永远看不到外部改动）。 */
+static lv_obj_t *s_bright_slider = NULL;      /**< 显示设置：亮度滑条 */
+static lv_obj_t *s_vol_slider = NULL;         /**< 蜂鸣器：响度滑条 */
+static lv_obj_t *s_scr_off_btn = NULL;        /**< 显示设置：自动降亮档位按钮（文案随档位变） */
 static lv_obj_t *s_wifi_state_label = NULL;   /**< WiFi 页：状态行（5Hz 刷新，F7） */
 static lv_obj_t *s_wifi_hint_label = NULL;    /**< WiFi 页：配网提示行（随状态切换） */
 
@@ -886,6 +896,7 @@ static void subpage_close(void)
     }
     s_subpage = NULL;
     s_sub_content = NULL;
+    s_sub_topbar = NULL;
     s_sub_kind = SUB_NONE;
     focus_end(); /* 焦点链指针随浮层失效，清空下标/调节模式 */
     s_cal_read_label = NULL;
@@ -894,6 +905,9 @@ static void subpage_close(void)
     s_energy_rt_label = NULL;
     s_bright_value_label = NULL;
     s_vol_value_label = NULL;
+    s_bright_slider = NULL;   /* v0.6.3：滑条指针随页失效，防刷新时野指针 */
+    s_vol_slider = NULL;
+    s_scr_off_btn = NULL;
     s_wifi_state_label = NULL;
     s_wifi_hint_label = NULL;
     memset(s_alarm_value_labels, 0, sizeof(s_alarm_value_labels));
@@ -957,6 +971,7 @@ static lv_obj_t *subpage_open(sub_kind_t kind, const char *title)
 
     /* ---- 标题栏 ---- */
     lv_obj_t *bar = lv_obj_create(s_subpage);
+    s_sub_topbar = bar; /* 供子页在标题栏右侧挂操作按钮（如 WiFi 扫描页的"重新扫描"） */
     lv_obj_remove_style_all(bar);
     lv_obj_set_size(bar, LV_PCT(100), SUB_TOPBAR_H);
     lv_obj_set_scrollable(bar, false);
@@ -1483,6 +1498,53 @@ static void auto_switch_cb(lv_event_t *e)
     (void)buzzer_play(BUZZER_TONE_CLICK);
 }
 
+/* ---- 【v0.6.3 需求 2】外部设置值 → 子页滑条/数值的实时同步 ----
+ * 背景：亮度/响度可由网页控制台远程下发（main/app_tasks.c 的 web_config_handler）。
+ * 设备端若正停留在「显示设置」/「蜂鸣器」子页，滑条与数值必须跟着动，否则用户
+ * 只能退出再进才看到新值（旧实现的滑条只在开页时读一次 settings）。
+ * 实现：在 screen_settings_refresh() 的 5Hz 分派里对比 settings 值并同步。
+ * 何时不同步：用户正按住滑条拖动（LV_STATE_PRESSED）时只更新数值、不回写滑条，
+ * 否则会出现"手指还在拖、值被远端刷新抢走"的打架现象。 */
+static bool s_syncing = false; /**< true=正在程序化写滑条，抑制滑条回调（防回环） */
+
+/**
+ * @brief 把外部传入的设置值同步到子页滑条与数值标签（幂等、最小重绘）
+ *
+ * 三个防御点：
+ *  ① 用户按住滑条时**不回写滑条**（只更新数值），避免与手指拖动打架；
+ *  ② 值未变化时直接返回，不做任何 LVGL 调用（5Hz 下省掉无意义的无效化与重绘）；
+ *  ③ 写滑条期间置 s_syncing，滑条回调见到即直接返回——LVGL 9.6 的
+ *     lv_bar_set_value(LV_ANIM_OFF) 实测不派发 VALUE_CHANGED（见本文件
+ *     「滑动条值不会自动通知」的注释），但加这层防御可免疫 LVGL 版本行为变化，
+ *     确保不会因此重复写 NVS。
+ *
+ * @param sl  滑条对象（可为 NULL：页已关）
+ * @param lbl 数值 label 对象（可为 NULL）
+ * @param v   目标值
+ * @param fmt 数值标签格式（如 "%u%%"）
+ */
+static void sync_slider_ui(lv_obj_t *sl, lv_obj_t *lbl, int32_t v, const char *fmt)
+{
+    if (sl == NULL && lbl == NULL) {
+        return;
+    }
+    const bool pressing = (sl != NULL) && lv_obj_has_state(sl, LV_STATE_PRESSED);
+    if (sl != NULL && !pressing && lv_slider_get_value(sl) != v) {
+        s_syncing = true;
+        lv_slider_set_value(sl, v, LV_ANIM_OFF);
+        s_syncing = false;
+    }
+    /* 按住时数值标签跟随手指（滑条当前值），否则跟随外部值 */
+    const int32_t shown = pressing ? lv_slider_get_value(sl) : v;
+    if (lbl != NULL) {
+        char buf[16];
+        snprintf(buf, sizeof(buf), fmt, (unsigned)shown);
+        if (strcmp(lv_label_get_text(lbl), buf) != 0) {
+            lv_label_set_text(lbl, buf); /* 仅文本变化才 set：省一次无效重绘 */
+        }
+    }
+}
+
 /**
  * @brief 亮度滑条变化/松手 → 立即调光 + 更新数值标签 + 落盘
  *
@@ -1493,6 +1555,9 @@ static void auto_switch_cb(lv_event_t *e)
  */
 static void bright_slider_cb(lv_event_t *e)
 {
+    if (s_syncing) {
+        return; /* 程序化同步写入触发的回调：不回写 settings，防回环 */
+    }
     lv_obj_t *slider = lv_event_get_target(e);
     /* lv_slider_get_value()：读滑动条当前值（范围由 lv_slider_set_range 事先限定） */
     uint8_t val = (uint8_t)lv_slider_get_value(slider);
@@ -1575,6 +1640,7 @@ static void display_open_cb(void)
     s_bright_value_label = plain_label(cap, buf, LVGL_PORT_FONT_16, COL_PRIMARY, true);
 
     lv_obj_t *slider = lv_slider_create(c); /* lv_slider_create：LVGL 滑动条部件 */
+    s_bright_slider = slider; /* v0.6.3 需求 2：留指针，供 5Hz 刷新同步外部（网页）下发值 */
     /* 内缩到 84%：旋钮在两端时仍离面板边缘约 30px，拇指不会按不到；
        也避开圆角侵入区（两端各多留 8px 内边距）。
        这就是项目约定"滑条预留可触摸区域"的落点。 */
@@ -1631,6 +1697,7 @@ static void display_open_cb(void)
     char off_buf[32];
     snprintf(off_buf, sizeof(off_buf), "自动降亮：%s", s_scr_off_names[off_level]);
     lv_obj_t *off_btn = plain_button(c, off_buf, LV_PCT(60), 30);
+    s_scr_off_btn = off_btn; /* v0.6.3 需求 2：留指针，供刷新时跟随外部改动的档位 */
     lv_obj_add_event_cb(off_btn, screen_off_cycle_cb, LV_EVENT_CLICKED, NULL);
     focus_add(off_btn); /* 焦点链第 3 项：自动降亮档位（长按 K2 循环切换） */
 
@@ -1675,6 +1742,9 @@ static void display_open_cb(void)
  */
 static void volume_slider_cb(lv_event_t *e)
 {
+    if (s_syncing) {
+        return; /* 程序化同步写入触发的回调：不回写 settings，防回环 */
+    }
     lv_obj_t *slider = lv_event_get_target(e);
     uint8_t val = (uint8_t)lv_slider_get_value(slider);
 
@@ -1734,6 +1804,7 @@ static void buzzer_open_cb(void)
     s_vol_value_label = plain_label(cap, buf, LVGL_PORT_FONT_16, COL_PRIMARY, true);
 
     lv_obj_t *slider = lv_slider_create(c); /* LVGL 滑动条 */
+    s_vol_slider = slider; /* v0.6.3 需求 2：留指针，供 5Hz 刷新同步外部（网页）下发值 */
     lv_obj_set_width(slider, LV_PCT(84)); /* 与亮度滑条一致内缩，两端旋钮可触摸 */
     lv_slider_set_range(slider, VOLUME_MIN, VOLUME_MAX); /* 限定合法音量范围 */
     lv_slider_set_value(slider, vol, LV_ANIM_OFF);
@@ -1907,7 +1978,8 @@ static void wifi_render_ap_list(void)
 
     for (uint16_t i = 0; i < n; i++) {
         lv_obj_t *row = lv_button_create(s_wifi_list);
-        /* v0.6.2：行高 32 → 40（触摸目标更大；列表已可滚动，一屏 4~5 行仍够用） */
+        /* v0.6.2：行高 32 → 40（触摸目标更大，列表可滚动）。
+         * v0.6.3：重扫按钮移入标题栏后列表变高，横屏可见 3 行 / 竖屏 4 行。 */
         lv_obj_set_size(row, LV_PCT(100), 40);
         press_feedback_styles(row);
         lv_obj_set_style_radius(row, 6, 0);
@@ -1970,8 +2042,12 @@ static void wifi_scan_timer_cb(lv_timer_t *t)
     }
     wifi_render_ap_list();
     if (s_wifi_hint_label != NULL) {
-        lv_label_set_text(s_wifi_hint_label, "点选热点后输入密码即可连接；"
-                                              "也可用手机连热点配网。");
+        /* 【v0.6.3 需求 1】提示行只有 1 行预算，文案必须短：
+         * 带结果数量的短句既能当状态、又不会换行吃掉列表高度。 */
+        char hint[64]; /* 64 字节：容纳最坏情况（%u 十位数）下这条中文串，避免 -Wformat-truncation */
+        snprintf(hint, sizeof(hint), "找到 %u 个热点，点选后输密码连接。",
+                 (unsigned)s_wifi_ap_copy_n);
+        lv_label_set_text(s_wifi_hint_label, hint);
     }
 }
 
@@ -2001,7 +2077,7 @@ static void wifi_scan_begin(void)
         lv_obj_add_state(s_wifi_scan_btn, LV_STATE_DISABLED);
         lv_obj_t *l = lv_obj_get_child(s_wifi_scan_btn, 0);
         if (l != NULL) {
-            lv_label_set_text(l, "扫描中…");
+            lv_label_set_text(l, "扫描中");
         }
     }
     if (s_wifi_hint_label != NULL) {
@@ -2035,26 +2111,44 @@ static void wifi_scan_page_open(bool auto_start)
 {
     lv_obj_t *c = subpage_open(SUB_WIFI_SCAN, "WiFi 扫描");
 
-    /* ① 状态/提示行（扫描中 → 结果摘要），复用 s_wifi_hint_label */
+    /* ① 【v0.6.3 需求 1】"重新扫描"按钮移到**标题栏右侧**，不再占内容区一行。
+     *
+     * 空间账（横屏 240px 高）：内容区可用约 164px；旧版把「提示行 18px + 间距 8
+     * + 按钮 34px + 间距 8 = 68px」放在内容区里，列表只剩约 92px，行高 40+间距 4
+     * → 只放得下 2 行，用户抱怨"按钮和提示占比太大"。
+     * 把按钮挂到标题栏后，内容区只留 1 行提示（26px），列表得约 138px → 可见 3 行；
+     * 竖屏（284px 高）列表约 182px → 可见 4 行。
+     *
+     * 宽度按屏幕宽自适应：竖屏（240 宽）用 72px 以避让左侧"< 返回"(72px) 与居中标题；
+     * 横屏（284 宽）用 84px 更好按。高度 28px 与标题栏"返回"按钮一致。 */
+    const lv_coord_t scr_w = (s_tile != NULL) ? lv_obj_get_width(s_tile) : 284;
+    const lv_coord_t btn_w = (scr_w < 260) ? 72 : 84;
+    if (s_sub_topbar != NULL) {
+        /* 先 plain_button（内含 press_feedback_styles：白底/描边/按下反馈），
+         * 再**在其后**覆盖成品牌蓝——顺序不能颠倒，否则被 press_feedback 刷回白底。 */
+        s_wifi_scan_btn = plain_button(s_sub_topbar, "重新扫描", btn_w, 28);
+        lv_obj_align(s_wifi_scan_btn, LV_ALIGN_RIGHT_MID, -2, 0);
+        lv_obj_set_style_bg_color(s_wifi_scan_btn, COL_PRIMARY, 0);
+        lv_obj_set_style_border_color(s_wifi_scan_btn, COL_PRIMARY, 0);
+        lv_obj_set_style_radius(s_wifi_scan_btn, 6, 0);
+        lv_obj_t *bl = lv_obj_get_child(s_wifi_scan_btn, 0);
+        if (bl != NULL) {
+            lv_obj_set_style_text_color(bl, lv_color_white(), 0);
+            lv_obj_set_style_text_font(bl, lvgl_port_get_font_bold(LVGL_PORT_FONT_12), 0);
+        }
+        lv_obj_add_event_cb(s_wifi_scan_btn, wifi_rescan_clicked_cb, LV_EVENT_CLICKED, NULL);
+        /* 焦点链顺序：subpage_open 内已 focus_begin(返回) → 本按钮 → 结果行，
+         * 保持"返回 → 重扫 → 逐行选择"的可预期遍历顺序 */
+        focus_add(s_wifi_scan_btn);
+    }
+
+    /* ② 状态/提示行（扫描中 → 结果摘要），复用 s_wifi_hint_label。
+     * 只保留 1 行（12px，居中）：文案须短，避免换行吃掉列表高度。 */
     s_wifi_hint_label = plain_label(c, auto_start ? "正在扫描附近热点…（约 3 秒）"
-                                                  : "点「重新扫描」列出附近热点。",
+                                                  : "点选热点后输入密码即可连接。",
                                     LVGL_PORT_FONT_12, COL_GRAY, false);
     lv_obj_set_width(s_wifi_hint_label, LV_PCT(100));
     lv_obj_set_style_text_align(s_wifi_hint_label, LV_TEXT_ALIGN_CENTER, 0);
-
-    /* ② 重新扫描按钮（主动态，品牌蓝） */
-    s_wifi_scan_btn = plain_button(c, "重新扫描", LV_PCT(60), 34);
-    lv_obj_set_style_bg_color(s_wifi_scan_btn, COL_PRIMARY, 0);
-    lv_obj_set_style_border_color(s_wifi_scan_btn, COL_PRIMARY, 0);
-    {
-        lv_obj_t *l = lv_obj_get_child(s_wifi_scan_btn, 0);
-        if (l != NULL) {
-            lv_obj_set_style_text_color(l, lv_color_white(), 0);
-            lv_obj_set_style_text_font(l, lvgl_port_get_font_bold(LVGL_PORT_FONT_14), 0);
-        }
-    }
-    lv_obj_add_event_cb(s_wifi_scan_btn, wifi_rescan_clicked_cb, LV_EVENT_CLICKED, NULL);
-    focus_add(s_wifi_scan_btn);
 
     /* ③ 结果列表（占满剩余高度，行内滚动；行由 wifi_render_ap_list 动态建）
      *
@@ -2082,16 +2176,13 @@ static void wifi_scan_page_open(bool auto_start)
     } else if (!wifi_manager_scan_is_running()) {
         /* 非自动发起且没有在扫：把上一次缓存的结果直接显示出来（若有） */
         wifi_render_ap_list();
-        if (s_wifi_hint_label != NULL && s_wifi_ap_copy_n > 0) {
-            lv_label_set_text(s_wifi_hint_label, "点选热点后输入密码即可连接。");
-        }
     } else {
         /* 打开时已有扫描在跑：接上轮询（按钮置灰复用 wifi_scan_begin 的视觉） */
         if (s_wifi_scan_btn != NULL) {
             lv_obj_add_state(s_wifi_scan_btn, LV_STATE_DISABLED);
             lv_obj_t *l = lv_obj_get_child(s_wifi_scan_btn, 0);
             if (l != NULL) {
-                lv_label_set_text(l, "扫描中…");
+                lv_label_set_text(l, "扫描中");
             }
         }
         s_wifi_scan_timer = lv_timer_create(wifi_scan_timer_cb, 300, NULL);
@@ -3373,6 +3464,41 @@ void screen_settings_refresh(const data_store_snapshot_t *snap)
     case SUB_DISPLAY:
         /* 自动旋转开启时，实际角度由重力服务改变，这里让按钮高亮跟随 */
         angle_buttons_refresh();
+        /* 【v0.6.3 需求 2】亮度可能被网页控制台远程改过：把 settings 里的当前值
+         * 同步到本页滑条与数值（用户停在本页即可看到变化，无需退出重进）。
+         * 同步助手内部已处理"用户正按住滑条时不回写滑条"与"值未变不重绘"。 */
+        {
+            settings_t cfg;
+            if (settings_get(&cfg) == ESP_OK) {
+                sync_slider_ui(s_bright_slider, s_bright_value_label,
+                               (int32_t)cfg.lcd_brightness, "%u%%");
+                /* 自动降亮档位按钮文案同步（网页也能改 screen_off）：仅文案变化才 set */
+                if (s_scr_off_btn != NULL) {
+                    const uint8_t lvl = (cfg.screen_off_s < 4u) ? cfg.screen_off_s : 0u;
+                    char want[32];
+                    snprintf(want, sizeof(want), "自动降亮：%s", s_scr_off_names[lvl]);
+                    lv_obj_t *lbl = lv_obj_get_child(s_scr_off_btn, 0);
+                    if (lbl != NULL && strcmp(lv_label_get_text(lbl), want) != 0) {
+                        lv_label_set_text(lbl, want);
+                    }
+                }
+            }
+        }
+        break;
+    case SUB_BUZZER:
+        /* 【v0.6.3 需求 2】响度同理：先取驱动当前值（与开页时的取值口径一致），
+         * 驱动不可用再退 settings 缓存值。 */
+        {
+            uint8_t vol = 0;
+            if (buzzer_get_volume(&vol) != ESP_OK) {
+                settings_t cfg;
+                if (settings_get(&cfg) != ESP_OK) {
+                    break;
+                }
+                vol = cfg.buzzer_volume;
+            }
+            sync_slider_ui(s_vol_slider, s_vol_value_label, (int32_t)vol, "%u%%");
+        }
         break;
     case SUB_CALIB_EDIT:
         /* 校准向导：当前读数以 5Hz 刷新，用户对着标准表实时观察偏差 */
