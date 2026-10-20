@@ -677,16 +677,23 @@ static void task_ui(void *arg)
                                  (double)latest.power_w);
                     }
                     if (cur & DATA_ALERT_OTP) {
-                        /* v0.6.4 需求 3：过温恒开告警；soc_temp 为 NaN 时
-                         * （理论上不会——无有效读数不置位）显示"--"兜底 */
-                        char t[16];
+                        /* 【v0.6.5 需求 1】过温恒开告警：判定是"两路温度任一超限"，
+                         * 所以这里把**两个读数都显示出来**，让用户自己看清是哪一路
+                         * 偏高（只显示一路会误导排查方向）。
+                         * 无效读数（NaN）显示 "--" 占位。 */
+                        char ts[16], te[16];
                         if (isfinite(latest.soc_temp_c)) {
-                            snprintf(t, sizeof(t), "%.1f℃", (double)latest.soc_temp_c);
+                            snprintf(ts, sizeof(ts), "%.1f℃", (double)latest.soc_temp_c);
                         } else {
-                            snprintf(t, sizeof(t), "--");
+                            snprintf(ts, sizeof(ts), "--");
+                        }
+                        if (isfinite(latest.temperature_c)) {
+                            snprintf(te, sizeof(te), "%.1f℃", (double)latest.temperature_c);
+                        } else {
+                            snprintf(te, sizeof(te), "--");
                         }
                         snprintf(msg + strlen(msg), sizeof(msg) - strlen(msg),
-                                 "机内温度 %s\n请断开负载降温后再用\n", t);
+                                 "主控 %s / 机内 %s\n请断开负载降温后再用\n", ts, te);
                     }
                     lv_obj_t *box = lv_msgbox_create(NULL);
                     /* v0.6.2 需求 3：全项目移除 U+26A0（⚠），改用全角"！"，

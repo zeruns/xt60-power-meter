@@ -733,6 +733,11 @@ static void save_persist(void)
 #define PM_SAMPLE_PRIO    24    /**< 采样任务优先级：全系统最高（合法上限 24，FreeRTOS
                                  *  configMAX_PRIORITIES=25 即 0~24；M1 基线兜底路线，
                                  *  保证 DRDY→读帧启动延迟 δ 抖动最小、不被 UI 抢占丢帧） */
+/** 过温告警阈值（℃，v0.6.5：60 → 65）。
+ *  判定取 SOC 结温与 AHT20 机内温度两者的最大值（见块边界告警判定处）。
+ *  65℃ 的依据：ESP32-S3 结温上限约 105℃、锂电池长期工作建议不超过 60~65℃，
+ *  取 65 既能在散热异常时提前预警，又不至于满载正常温升就误报。 */
+#define PM_OVER_TEMP_C    65.0f
 #define PM_AUX_STACK      6144  /**< 辅助任务栈（I2C/浮点日志用得多，给大些） */
 #define PM_AUX_PRIO       5     /**< 辅助任务优先级：低，慢 I2C 不该抢测量 */
 #define PM_AUX_PERIOD_MS  2000  /**< 温湿度/电池采集周期（ms） */
@@ -1054,19 +1059,33 @@ static void task_sample(void *arg)
                         new_mask |= DATA_ALERT_OPP;
                     }
                 }
-                /* 【v0.6.4 需求 3】过温告警：机内温度（SOC 结温）> 60℃ 即置位。
+                /* 【v0.6.5 需求 1】过温告警：**双数据源**取最高者判定，任一超过
+                 * PM_OVER_TEMP_C(65℃) 即置位。
                  * 恒定生效（不读使能开关）：前三项是用户可关的"测量告警"，
                  * 过温是硬件保护——关乎主控寿命与电池安全，不允许关闭。
-                 * · 数据源：pm_aux 每 2s 更新的 s_aux_data.soc_temp_c（SOC
-                 *   内部温度传感器）；未读到有效值（soc_temp_valid=false，
-                 *   如温度驱动初始化失败）时不判，避免拿 0/NaN 误报。
-                 * · 阈值 60℃：S3 结温上限约 105℃，60℃ 预警留出处理余量；
-                 *   置位后设备端弹"机内温度"告警框、网页端横幅显示"过温"。
-                 * · 读侧竞态说明：soc_temp_valid 在 soc_temp_c 之后写入
-                 *   （见 task_aux），最坏读到旧一两拍的温度，告警延迟 ≤2s，
-                 *   对 60℃ 级预警完全可接受。 */
-                if (s_aux_data.soc_temp_valid && s_aux_data.soc_temp_c > 60.0f) {
-                    new_mask |= DATA_ALERT_OTP;
+                 * 为什么要两个源（单一数据源都有盲区）：
+                 *   · SOC 结温（s_aux_data.soc_temp_c，ESP32-S3 内部传感器）：
+                 *     反映芯片自身发热，但它测不到外壳/电池区域的升温；
+                 *   · AHT20 机内环境温度（s_aux_data.temp_c，板上温湿度芯片）：
+                 *     反映机内空气/结构温升，但离主控热区较远、响应偏慢。
+                 *   两者任一超限都说明散热异常，因此"取高者"比单选一个更安全。
+                 * · 各自的 *_valid 为 false 时不参与判定（例如温度驱动初始化失败），
+                 *   避免拿 0/NaN 误报；两者都无效则本次不判。
+                 * · 阈值 65℃：S3 结温上限约 105℃、锂电池建议不超 60~65℃，
+                 *   65℃ 是兼顾"提前预警"与"避免正常满载误报"的折中。
+                 * · 读侧竞态：此处**刻意不加 aux mutex** —— 本函数运行在 4kHz
+                 *   采样任务里，等锁会破坏 DRDY 读取窗口；s_aux_data 的 float/bool
+                 *   都是自然对齐的单字访问，最坏读到上一拍的值（延迟 ≤2s）。
+                 *   先用局部变量取快照再判，避免两次读之间被更新导致判断撕裂。 */
+                {
+                    const bool soc_ok = s_aux_data.soc_temp_valid;
+                    const float soc_t = s_aux_data.soc_temp_c;
+                    const bool env_ok = s_aux_data.temp_valid;
+                    const float env_t = s_aux_data.temp_c;
+                    if ((soc_ok && soc_t > PM_OVER_TEMP_C) ||
+                        (env_ok && env_t > PM_OVER_TEMP_C)) {
+                        new_mask |= DATA_ALERT_OTP;
+                    }
                 }
                 if (new_mask != 0 && new_mask != s_alert_mask) {
                     /* 上升沿（含换项）：广播告警事件（不阻塞；丢弃可观测） */
