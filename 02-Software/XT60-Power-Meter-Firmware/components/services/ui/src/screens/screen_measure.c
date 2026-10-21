@@ -40,8 +40,8 @@
  *     低档位时 ui.c 会对采样做滑动平均，读数更稳、更省 CPU/刷屏；
  *   · **纯按键可操作**：触屏只是"加速路径"，所有功能都能用 K1/K2 完成
  *     （长按开/关菜单、单击移焦点、双击执行），适配不带触摸的使用场景；
- *   · **操作完成自动关闭子菜单**：执行"清除电能统计"后菜单自动收起，
- *     减少一次手动退出的操作；
+ *   · **操作先确认再关闭子菜单**：「清除电能统计」先弹确认框（v0.6.8，
+ *     与设置页同一共享弹窗），确定后执行清零并自动收起菜单；
  *   · 字体统一走 lvgl_port_get_font()（本项目按 12~40px 共 7 档预生成
  *     Noto Sans SC tiny_ttf），不用 LVGL 内置字体，保证中英文风格一致。
  *
@@ -59,6 +59,7 @@
 #include "buzzer.h"
 #include "power_measure.h"
 #include "ui.h"
+#include "ui_msgbox.h" /* 【v0.6.8】清零前弹确认框（与设置页同一共享实现） */
 
 /* 四行配色（白字底）：与波形页同数字项的颜色语义保持一致 */
 #define COL_V  lv_color_hex(0x1E9E4F) /* 电压 绿 */
@@ -484,9 +485,10 @@ void screen_measure_refresh(const data_store_snapshot_t *snap)
  * 菜单内：
  *   · K1 单击 = 焦点上移，K2 单击 = 焦点下移（两行循环，带焦点高亮 + 反馈音）；
  *   · K2 双击 = 激活当前焦点行：
- *       -「清除电能统计数据」→ 执行清零，**自动关闭菜单**；
+ *       -「清除电能统计数据」→【v0.6.8】先弹确认框（K1=取消/K2=确定），
+ *         确定后执行清零，**自动关闭菜单**；
  *       -「数据刷新率」→ 在 1/5/10/20/30Hz 间循环切换并立即持久化。
- * 触屏同样可用：点任意档位按钮直接切换，点清除行直接清零并关闭。
+ * 触屏同样可用：点任意档位按钮直接切换，点清除行弹确认框（确认后清零）。
  *
  * 状态机：s_menu（控件）恒存在，s_menu_open（已开）/ s_menu_animating
  * （升降动画中）两个标志组合判断忙闲，动画期间拒绝重复开/关（防重入）。
@@ -659,18 +661,35 @@ static void menu_close(void)
 }
 
 /**
- * @brief 清零动作（触屏/按键共用）：执行清零 + 成功音 + 自动关闭菜单
+ * @brief 确认后的清零动作（触屏/按键共用）：执行清零 + 成功音 + 结果提示
  *
- * "操作完成自动关闭"是刻意设计：清零是一次性动作，做完留着菜单
- * 只会挡住数据，自动收起省一次手动退出。
+ * 由 ui_msgbox_confirm 的"确定"回调调用（确认框已先被关闭）。
+ * 清零由 power_measure_reset_energy 在测量核块边界执行（约 0.2s 后生效）。
+ * 提示框文案与设置页"电能统计 → 清零统计"完全一致（同一共享弹窗模块）。
  */
-static void menu_do_clear(void)
+static void menu_clear_confirmed(void)
 {
     (void)power_measure_reset_energy(); /* 业务：清零电能统计（含运行时间） */
     (void)buzzer_play(BUZZER_TONE_OK);  /* 业务：播成功提示音（非阻塞） */
+    ui_msgbox_notice("已清零", "电能与运行时间已重新开始统计。");
+}
+
+/**
+ * @brief 清零入口（触屏/按键共用）：【v0.6.8】先弹确认框再执行
+ *
+ * 为什么必须二次确认：清零不可撤销，快捷菜单一行按钮 + 一次双击就能触发，
+ * 误触代价太高。弹窗挂在顶层图层（模态），K1=取消 / K2=确定，触屏点按钮，
+ * 与设置页"清零统计"的确认框同一实现、同一文案、同一键位。
+ * 菜单先收起再弹窗：确认框自己就是模态，菜单留在屏上只会挡住视线。
+ */
+static void menu_ask_clear(void)
+{
     if (s_menu_open) {
         menu_close();
     }
+    ui_msgbox_confirm("清除电能统计？",
+                      "将把“累计电能”与“运行时间”归零，\n此操作不可撤销。",
+                      menu_clear_confirmed);
 }
 
 /**
@@ -696,13 +715,13 @@ static void menu_rate_cycle(void)
 }
 
 /**
- * @brief 清除按钮的点击回调（触屏路径）
+ * @brief 清除按钮的点击回调（触屏路径）：弹确认框（v0.6.8 二次确认）
  * @param e LVGL 事件对象（未使用）
  */
 static void menu_clear_clicked_cb(lv_event_t *e)
 {
     (void)e;
-    menu_do_clear();
+    menu_ask_clear();
 }
 
 /**
@@ -908,7 +927,7 @@ bool screen_measure_menu_key(button_id_t id, button_event_t ev)
     if (ev == BUTTON_EVENT_DOUBLE_CLICK) {
         /* K2 双击 = 激活当前焦点行（K1 双击同样有效，减少记忆负担） */
         if (s_focus == 0) {
-            menu_do_clear(); /* 内部会自动关闭菜单 */
+            menu_ask_clear(); /* 【v0.6.8】清零先弹确认框（内部会自动关闭菜单） */
         } else {
             menu_rate_cycle();
         }

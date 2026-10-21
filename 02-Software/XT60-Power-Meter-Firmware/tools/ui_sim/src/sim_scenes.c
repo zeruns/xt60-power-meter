@@ -707,14 +707,23 @@ void sim_run_scenes(void)
                (unsigned)ui_get_display_rate_hz());
     }
 
-    /* K2 单击：焦点回到清除行；K2 双击：执行清零，菜单应自动关闭 */
+    /* K2 单击：焦点回到清除行；K2 双击：【v0.6.8】弹确认框，菜单应自动关闭 */
     ui_nav_handle_key(BUTTON_ID_USER, BUTTON_EVENT_SINGLE_CLICK);
     sim_step(150);
     ui_nav_handle_key(BUTTON_ID_USER, BUTTON_EVENT_DOUBLE_CLICK);
     sim_step(300);
     if (screen_measure_menu_is_open()) {
-        printf("[scene] !! 清除电能后菜单未自动关闭\n");
+        printf("[scene] !! 触发清零后菜单未自动关闭\n");
     }
+    if (find_text("取消") == NULL || find_text("确定") == NULL) {
+        printf("[scene] !! 清零确认框未弹出（v0.6.8 应先二次确认）\n");
+    }
+    ui_nav_refresh(sim_get_measurement());
+    shot("27a_measure_clear_confirm");
+    click_text("确定"); /* 确认清零 */
+    sim_step(350);
+    click_text("确定"); /* 关闭"已清零"提示 */
+    sim_step(300);
     ui_nav_refresh(sim_get_measurement());
     shot("27_measure_after_clear");
 

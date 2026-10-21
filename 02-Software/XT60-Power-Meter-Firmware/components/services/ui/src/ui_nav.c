@@ -46,6 +46,8 @@
 #include "screen_measure.h"
 #include "screen_settings.h"
 #include "screen_wave.h"
+#include "ui_msgbox.h" /* 【v0.6.8】全局模态弹窗：按键最优先路由 + 手势抑制 */
+
 /* ui.h：触摸活动上报（ui_note_user_activity），用于自动降亮计时重置（v0.6.2 需求 11） */
 #include "ui.h"
 /* wifi_manager：状态栏 WiFi 图标要显示真实连接状态与信号强度（v0.6.0 需求 4） */
@@ -500,6 +502,12 @@ static void indev_swipe_event_cb(lv_event_t *e)
          * 菜单开/关走各自的动画，不需要延迟（不涉及 tileview 滚动冲突）。
          * LV_ABS：取绝对值；判定"垂直为主"要求垂直位移既过阈值又大于水平位移。 */
         if (LV_ABS(dy) >= SWIPE_MIN_DIST && LV_ABS(dy) > LV_ABS(dx)) {
+            /* 【v0.6.8】模态弹窗在屏上时忽略滑动手势：否则确认框期间一上滑
+             * 会把快速菜单重新拉出来（菜单压在弹窗下面，两层模态叠罗汉）。
+             * 顶层图层本身已挡住 tileview 翻页，这里补齐"菜单/手势"这条路。 */
+            if (ui_msgbox_is_open()) {
+                return;
+            }
             lv_dir_t dir = (dy < 0) ? LV_DIR_TOP : LV_DIR_BOTTOM; /* 屏幕坐标 y 向下为正 */
             if (s_current == UI_PAGE_MEASURE) {
                 screen_measure_swipe_cb(dir);
@@ -781,10 +789,18 @@ void ui_nav_handle_key(button_id_t id, button_event_t ev)
     bool handled = false;
 
     /* 菜单优先：菜单/子页开着时按键全归它们（返回 true 表示已被消费）。
-     * 顺序：设置页二级页/弹窗 → 测量页菜单 → 波形页菜单 → 三页导航。
+     * 顺序：全局模态弹窗（v0.6.8，任何页面都最优先）→ 设置页二级页/弹窗 →
+     * 测量页菜单 → 波形页菜单 → 三页导航。
      * 【P0-2 修复】设置页二级页与弹窗此前完全没有按键路径（只能触屏），
      * 现在按键优先交给 screen_settings_key() 的焦点体系处理。 */
-    if (screen_settings_subpage_is_open() && screen_settings_key(id, ev)) {
+    if (ui_msgbox_is_open()) {
+        /* 【v0.6.8】模态对话框（确认框/提示框）在屏上：K1=取消、K2=确定，
+         * 与设置页弹窗同键位。必须排在所有页面分支之前——弹窗可能从测量页
+         * 快速菜单弹出，此刻"菜单开着"的分支已因 menu_close 退场，
+         * 若不在此拦截，按键会落到三页导航（弹窗期间还能翻页就乱套了）。 */
+        ui_msgbox_key(id, ev);
+        handled = true;
+    } else if (screen_settings_subpage_is_open() && screen_settings_key(id, ev)) {
         handled = true;
     } else if (screen_measure_menu_is_open() && screen_measure_menu_key(id, ev)) {
         handled = true;
