@@ -27,11 +27,61 @@
  * 模块状态（同一时刻至多一个对话框，单例指针即可）
  * ============================================================ */
 static bool s_layer_hooked = false;     /**< 顶层图层关闭回调是否已安装（只装一次） */
+static bool s_rot_hooked = false;       /**< 屏幕分辨率变化回调是否已安装（只装一次） */
 static lv_obj_t *s_msgbox_scrim = NULL; /**< 当前对话框的压暗遮罩（随框删除） */
 static lv_obj_t *s_active_msgbox = NULL; /**< 当前打开的对话框（NULL=无；按键路由据此判模态） */
 
+/**
+ * @brief 自适应宽度参数（单位 px）
+ *
+ * 屏宽 284（横屏）/ 240（竖屏，逻辑分辨率由 lv_display_set_rotation 更新）：
+ *   横屏 → 284-24 = 260；竖屏 → 240-24 = 216；
+ *   上限 280 只在未来换更大屏时生效（避免弹窗过宽、长句一行过长）。
+ */
+#define UI_MSGBOX_MAX_W 280     /**< 弹窗最大宽度 */
+#define UI_MSGBOX_SIDE_MARGIN 12 /**< 左右各留 12px，弹窗不贴屏边 */
+
 static void close_active_msgbox(void); /* 前向声明：弹新框前关旧框，防叠窗 */
 static void notice_ok_cb(lv_event_t *e); /* 前向声明："确定/取消"共用的关框回调 */
+
+void ui_msgbox_fit_width(lv_obj_t *box)
+{
+    if (box == NULL) {
+        return;
+    }
+    /* lv_obj_get_display：取对象所属显示；lv_display_get_horizontal_resolution：
+     * 取该显示**当前旋转后**的逻辑宽度（竖屏 240 / 横屏 284）。
+     * 注意用逻辑分辨率而不是面板物理宽度——软件旋转后 UI 坐标按逻辑分辨率走。 */
+    lv_display_t *disp = lv_obj_get_display(box);
+    int32_t sw = (disp != NULL) ? lv_display_get_horizontal_resolution(disp) : 240;
+    int32_t w = sw - 2 * UI_MSGBOX_SIDE_MARGIN;
+    if (w > UI_MSGBOX_MAX_W) {
+        w = UI_MSGBOX_MAX_W;
+    }
+    if (w < 120) { /* 兜底：异常小屏也不至于把弹窗压成一条线 */
+        w = 120;
+    }
+    lv_obj_set_width(box, w);
+}
+
+/**
+ * @brief 屏幕分辨率变化（旋转）→ 重新适配当前共享对话框的宽度并居中
+ *
+ * 为什么需要：弹窗可能开着时设备被转动（IMU 自动旋转）。
+ * lv_display_set_rotation 只更新显示逻辑分辨率并广播事件，
+ * 不会自动改已存在对象的像素宽度——不重排的话，横屏建的 260px 弹窗
+ * 转到竖屏（240 宽）仍会左右溢出被裁掉。
+ *
+ * @param e LVGL 事件（目标是 display 对象，本回调不使用）
+ */
+static void on_resolution_changed(lv_event_t *e)
+{
+    (void)e;
+    if (s_active_msgbox != NULL) {
+        ui_msgbox_fit_width(s_active_msgbox);
+        lv_obj_center(s_active_msgbox);
+    }
+}
 
 /* ============================================================
  * 顶层图层生命周期
@@ -169,6 +219,17 @@ static lv_obj_t *msgbox_begin(const char *title, const char *text)
         s_layer_hooked = true;
         lv_obj_add_event_cb(layer, layer_clicked_cb, LV_EVENT_CLICKED, NULL);
     }
+    if (!s_rot_hooked) {
+        /* 【v0.6.8】监听显示旋转：弹窗开着时转屏要重新适配宽度，
+         * 否则横屏建的 260px 弹窗转到 240 宽的竖屏会再次左右被裁。
+         * 事件由 lv_display_set_rotation 广播（见 lvgl_port 软件旋转实现）。 */
+        s_rot_hooked = true;
+        lv_display_t *disp = lv_obj_get_display(layer);
+        if (disp != NULL) {
+            lv_display_add_event_cb(disp, on_resolution_changed, LV_EVENT_RESOLUTION_CHANGED,
+                                    NULL);
+        }
+    }
 
     /* 压暗遮罩：先于对话框创建（渲染在下层），模态感 + 突出对话框。
      * 不可点击 → 命中测试穿透到顶层图层本体，点遮罩空白处仍走
@@ -186,7 +247,10 @@ static lv_obj_t *msgbox_begin(const char *title, const char *text)
 
     /* lv_msgbox_create()：LVGL 9 内置对话框部件，自带标题/正文/按钮区三段结构 */
     lv_obj_t *box = lv_msgbox_create(layer);
-    lv_obj_set_width(box, 250); /* 固定宽度，避免长文本撑到圆角外 */
+    /* 【v0.6.8 竖屏裁切修复】宽度改为按当前（旋转后）屏宽自适应：
+     * 旧版硬编码 250px，在 240 宽的竖屏上左右各溢出 5px 被裁掉。
+     * 正文标签宽度是 content 的 100%，缩窄后长文本自动换行。 */
+    ui_msgbox_fit_width(box);
     lv_msgbox_add_title(box, title); /* 往对话框里追加标题段 */
     lv_msgbox_add_text(box, text);   /* 往对话框里追加正文段 */
     style_msgbox(box);

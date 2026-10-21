@@ -26,6 +26,25 @@
 typedef void (*ui_confirm_cb_t)(void);
 
 /**
+ * @brief 按当前屏幕宽度给对话框设置自适应宽度（v0.6.8 修复竖屏被裁）
+ *
+ * 宽度 = min(屏宽 − 2×12px 安全边距, 280px)，下限 120px：
+ *   · 横屏 284 宽 → 260px；竖屏 240 宽 → 216px，两种方向都完整显示；
+ *   · 280px 上限防止未来换更大屏时对话框被拉得过宽、长句一行太长难读。
+ *
+ * 为什么必须自适应：旧实现硬编码 250px，竖屏（240 宽）时左右各溢出 5px，
+ * 弹窗两端被裁掉。LVGL 9 的 msgbox 正文标签宽度是 content 的 100%，
+ * 因此缩窄对话框后长文本会自动换行，无需逐条改文案。
+ *
+ * 旋转时也需重新调用（lv_display_set_rotation 会广播
+ * LV_EVENT_RESOLUTION_CHANGED，本模块与 ui.c 的告警框各自监听并重新
+ * fit + center），否则弹窗开着转屏会再次裁切。
+ *
+ * @param box lv_msgbox_create 返回的对话框对象（NULL 时安全返回）
+ */
+void ui_msgbox_fit_width(lv_obj_t *box);
+
+/**
  * @brief 弹出单按钮提示框（"确定"，看完点掉）
  * @param title 标题文本
  * @param text  正文文本

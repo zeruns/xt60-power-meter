@@ -727,6 +727,37 @@ void sim_run_scenes(void)
     ui_nav_refresh(sim_get_measurement());
     shot("27_measure_after_clear");
 
+    /* ---- v0.6.8 竖屏弹窗自适应验证：确认框不得左右越界（屏宽 240） ---- */
+    rotate_to_angle(90, 0); /* 竖屏 240×284 */
+    ui_nav_refresh(sim_get_measurement());
+    screen_measure_open_menu();
+    sim_step(200);
+    click_text("清除电能统计数据"); /* 触屏路径 → 弹确认框 */
+    sim_step(250);
+    shot("47_portrait_clear_confirm");
+    {
+        lv_obj_t *box = find_text("确定");
+        /* 从按钮标签沿父链找到 msgbox 本体，检查其屏幕坐标是否越界 */
+        while (box != NULL && !lv_obj_check_type(box, &lv_msgbox_class)) {
+            box = lv_obj_get_parent(box);
+        }
+        if (box == NULL) {
+            printf("[scene] !! 竖屏确认框未找到 msgbox\n");
+        } else {
+            lv_area_t a;
+            lv_obj_get_coords(box, &a);
+            printf("[scene] 竖屏确认框 x1=%d x2=%d（屏宽 240，期望 0<=x1<x2<=240）\n",
+                   (int)a.x1, (int)a.x2);
+            if (a.x1 < 0 || a.x2 > 240) {
+                printf("[scene] !! 竖屏确认框左右被裁\n");
+            }
+        }
+    }
+    click_text("取消"); /* 关闭确认框（不执行清零） */
+    sim_step(250);
+    rotate_to_angle(0, 0); /* 回到横屏，后续触屏回归按横屏坐标 */
+    ui_nav_refresh(sim_get_measurement());
+
     /* 触屏路径回归：再次打开点档位 + K1 长按关闭 */
     screen_measure_open_menu();
     sim_step(150);

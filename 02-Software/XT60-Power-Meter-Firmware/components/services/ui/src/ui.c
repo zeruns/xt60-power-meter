@@ -57,6 +57,7 @@
 #include "screens/screen_wave.h"
 #include "screens/splash.h"
 #include "ui.h"
+#include "ui_msgbox.h" /* 【v0.6.8】共享弹窗的自适应宽度工具（竖屏裁切修复） */
 #include "ui_nav.h"
 
 static const char *TAG = "ui";
@@ -255,6 +256,27 @@ static void alert_box_close(void)
     if (s_alert_box != NULL) {
         lv_msgbox_close(s_alert_box);
         s_alert_box = NULL;
+    }
+}
+
+/** 屏幕分辨率变化回调是否已安装（告警弹窗生命周期内只装一次） */
+static bool s_alert_rot_hooked = false;
+
+/**
+ * @brief 屏幕旋转时重排告警弹窗（v0.6.8 竖屏裁切修复）
+ *
+ * 告警弹窗可能开着时设备被转动：lv_display_set_rotation 只更新逻辑分辨率
+ * 并广播事件，不会改已存在对象的像素宽度——不重排的话，横屏建的 260px
+ * 弹窗转到 240 宽的竖屏会再次左右被裁。这里重新 fit + center。
+ *
+ * @param e LVGL 事件（目标是 display 对象，本回调不使用）
+ */
+static void alert_refit_on_rotation(lv_event_t *e)
+{
+    (void)e;
+    if (s_alert_box != NULL) {
+        ui_msgbox_fit_width(s_alert_box);
+        lv_obj_center(s_alert_box);
     }
 }
 
@@ -510,7 +532,10 @@ static void task_ui(void *arg)
             lv_obj_t *box = lv_msgbox_create(NULL);
             lv_msgbox_add_title(box, "启动提示"); /* 添加标题栏文字 */
             lv_msgbox_add_text(box, msg);         /* 添加正文文字 */
-            lv_obj_set_width(box, 250);           /* 设置弹窗宽度（px） */
+            /* 【v0.6.8 竖屏裁切修复】弹窗宽度按当前（旋转后）屏宽自适应：
+             * 旧版硬编码 250px，在 240 宽的竖屏上左右各溢出 5px 被裁掉。
+             * 共享实现见 ui_msgbox_fit_width（横屏 260 / 竖屏 216）。 */
+            ui_msgbox_fit_width(box);
             /* lv_msgbox_add_footer_button：在弹窗底部加一个按钮（这里"确定"） */
             lv_obj_t *ok = lv_msgbox_add_footer_button(box, "确定");
             /* 中文字体：LVGL 默认字体不含汉字，必须显式换成 lvgl_port 的中文字库
@@ -704,8 +729,21 @@ static void task_ui(void *arg)
                      * 原因见文件头/字体工具的说明（源字体可能无该字形）。 */
                     lv_msgbox_add_title(box, "！测量告警");
                     lv_msgbox_add_text(box, msg);
+                    /* 【v0.6.8 竖屏裁切修复】msgbox 类默认宽度是
+                     * LV_DPI_DEF×2 = 260px，竖屏（240 宽）会左右各溢出 10px；
+                     * 改为按当前屏宽自适应（横屏 260 / 竖屏 216）。 */
+                    ui_msgbox_fit_width(box);
                     lv_obj_t *ok = lv_msgbox_add_footer_button(box, "确认");
                     ui_msgbox_style_cjk(box); /* 显式中文字体：否则中文渲染成方框 */
+                    /* 弹窗开着时转屏：重新适配宽度并居中（与共享弹窗模块同一策略） */
+                    if (!s_alert_rot_hooked) {
+                        s_alert_rot_hooked = true;
+                        lv_display_t *disp = lv_obj_get_display(box);
+                        if (disp != NULL) {
+                            lv_display_add_event_cb(disp, alert_refit_on_rotation,
+                                                    LV_EVENT_RESOLUTION_CHANGED, NULL);
+                        }
+                    }
                     lv_obj_add_event_cb(ok, alert_ok_cb, LV_EVENT_CLICKED, NULL);
                     s_alert_box = box;
                     /* F4：告警是安全信息，降亮中弹出也必须恢复到正常亮度让用户看到；
