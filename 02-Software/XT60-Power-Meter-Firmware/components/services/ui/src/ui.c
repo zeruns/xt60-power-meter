@@ -3,7 +3,7 @@
  * @brief LVGL 界面层实现：启动画面 → 三页主界面（测量/波形/设置）+ UI 任务
  *
  * 界面组成：
- *   ① 启动画面（splash）：白底 + Bold 标题 + 加载条，停留 3 秒；
+ *   ① 启动画面（splash）：白底 + Bold 标题 + 加载条，进度跟随真实初始化步骤；
  *   ② 主界面（ui_nav）：lv_tileview 三页——测量数据 / 波形 / 设置，
  *      底部页面指示点；触摸横滑或 K1/K2 按键翻页；波形页上滑出设置滑板。
  *
@@ -24,7 +24,7 @@
  * 会出现"轻滑跳第三页、甩动跳回第一页"之类的误跳。详见 ui_nav.c 文件头。
  *
  * 本文件的启动流程（task_ui 内顺序执行）：
- *   ① 启动画面 splash（进度条 1800ms）；
+ *   ① 启动画面 splash（进度由 app_init 的真实初始化步骤/自检项驱动）；
  *   ①.5 若有外设初始化故障 → 弹 msgbox，等用户点"确定"才进主界面
  *        （为什么先弹再进：故障信息必须让用户看到并确认，不能一闪而过）；
  *   ② 构建主界面三页（ui_nav_build）；
@@ -76,7 +76,9 @@ static const char *TAG = "ui";
 #define UI_HANDLER_WAIT_MAX_MS 200    /**< 单次等待 LVGL 锁的上限 */
 #define UI_LOOP_PERIOD_MS 5           /**< 主循环节拍（200Hz 检查点；30Hz 刷新档
                                        *   需要 ≤33ms 判定粒度，故收紧到 5ms） */
-#define UI_SPLASH_HOLD_MS 1800        /**< 启动画面停留时长 */
+#define UI_BOOT_POLL_MS 30            /**< 启动页轮询真实进度的周期 */
+#define UI_SPLASH_MIN_MS 600          /**< 启动页最短可见时长（避免初始化很快时一闪而过） */
+#define UI_BOOT_LABEL_LEN 48          /**< 启动页阶段文字缓冲（UTF-8，够放"测量前端 17/23"） */
 #define UI_REFRESH_DEFAULT_HZ 5       /**< 测量页默认刷新率 */
 #define UI_SAMPLE_PERIOD_US 25000     /**< 快照环采样周期（25ms=40Hz，与测量核
                                        *   PM_DISPLAY_SUBWINDOW 的快拍频率一致） */
@@ -88,6 +90,17 @@ static const char *TAG = "ui";
 #define UI_INPUT_QUEUE_LEN 16         /**< 按键消息队列深度（FreeRTOS 队列，满则丢弃新事件） */
 
 static bool s_ui_inited = false; /**< ui_init 防重复初始化标志 */
+
+/** 启动页真实进度快照（v0.6.9）
+ *
+ * 写者：app_init 的初始化循环（app_main 任务）；读者：UI 任务。
+ * 只共享"已完成/总数/阶段文字"三个简单字段，用 portMUX 临界区保护；
+ * 双方都不在临界区里碰 LVGL，避免把渲染锁和进度锁缠在一起。 */
+static portMUX_TYPE s_boot_mux = portMUX_INITIALIZER_UNLOCKED;
+static uint32_t s_boot_done = 0;                     /**< 已完成步数 */
+static uint32_t s_boot_total = 1;                    /**< 总步数（至少 1，防除零） */
+static char s_boot_label[UI_BOOT_LABEL_LEN] = "正在初始化系统"; /**< 当前阶段文字 */
+static volatile bool s_boot_finish_req = false;      /**< app_tasks_start 发出的结束请求 */
 
 /** UI 任务心跳（主循环每轮更新）：供 app_task 判断 UI 任务是否也停摆 */
 static volatile int64_t s_ui_loop_us = 0;     /**< 最近一轮主循环的时间戳（esp_timer 微秒） */
@@ -406,7 +419,7 @@ void ui_note_user_activity(void)
  * 主循环节奏（重要）：
  *   LVGL 的 lv_timer_handler() 与心跳已由 ESP 官方 esp_lvgl_port 的内部任务
  *   驱动（见 middleware/lvgl_port 组件），本任务**不再自行调用** lv_timer_handler()，
- *   只负责：① 启动画面计时与进度更新；② 按页面节奏刷新数据（测量页 1~30Hz
+ *   只负责：① 启动画面期间渲染真实初始化进度；② 按页面节奏刷新数据（测量页 1~30Hz
  *   可设、波形页 25Hz、状态栏/设置页 5Hz）；③ 消费按键队列。
  *   所有 LVGL 访问仍在 lvgl_port_lock() 保护下进行。
  *
@@ -449,45 +462,91 @@ static void task_ui(void *arg)
     }
     ESP_LOGI(TAG, "首页数据刷新率：%u Hz", (unsigned)s_rate_hz);
 
-    /* ---- ① 启动画面：边跑 handler 边计时（停留期间必须持续渲染） ----
+    /* ---- ① 启动画面：显示真实初始化进度（v0.6.9） ----
      *
-     * 进度文字按 4 个阶段切换（总时长 UI_SPLASH_HOLD_MS=1800ms）：
-     *   0~30%   正在初始化系统…
-     *   30~60%  正在加载字库…
-     *   60~90%  正在初始化传感器…
-     *   90~100% 正在准备界面…
-     * 注：真实初始化在 app_init 阶段已完成，此处文字用于向用户传达启动阶段感。
-     */
+     * app_init 在显示链路（LCD/触摸/LVGL/方向）就绪后提前调用 ui_init()，
+     * 因此启动页能覆盖后续电池、温湿度、ADS131M02、测量服务、文件系统
+     * 以及硬件自检的完整过程。进度由 ui_boot_set_progress() 写入共享
+     * 快照，本任务只负责渲染；结束条件为 app_tasks_start() 调用
+     * ui_boot_finish()，且启动页已显示满 UI_SPLASH_MIN_MS（防止一闪而过）。
+     * 启动页文案使用编进固件的极小子集，首帧即为完整中文；
+     * 但退出前仍需等全量字库后台加载完（主界面用全量字体）。 */
     bool backlight_on = false;
     /* lvgl_port_lock/unlock：获取 LVGL 互斥锁。LVGL 不是线程安全的，
      * 多任务访问其对象树前必须先拿锁（esp_lvgl_port 的标准用法）。
      * splash_build 在当前活动屏（lv_screen_active）上创建启动画面对象。 */
     if (lvgl_port_lock(UI_BUILD_LOCK_TIMEOUT_MS)) {
         splash_build(lv_screen_active());
-        splash_set_progress_text("正在初始化系统…");
+        /* 把 app_init 已经写好的进度立即应用，避免启动页从 0 开始 */
+        uint32_t done;
+        uint32_t total;
+        char label[UI_BOOT_LABEL_LEN];
+        portENTER_CRITICAL(&s_boot_mux);
+        done = s_boot_done;
+        total = s_boot_total;
+        snprintf(label, sizeof(label), "%s", s_boot_label);
+        portEXIT_CRITICAL(&s_boot_mux);
+        splash_set_progress(total > 0 ? done * 100u / total : 0u);
+        splash_set_progress_text(label);
         lvgl_port_unlock();
     } else {
         ESP_LOGE(TAG, "构建启动画面时获取 LVGL 锁失败");
     }
 
-    TickType_t last = xTaskGetTickCount(); /* 记录节拍起点，供 vTaskDelayUntil 做固定周期延时 */
-    uint32_t elapsed_ms = 0;
-    while (elapsed_ms < UI_SPLASH_HOLD_MS) {
-        if (lvgl_port_lock(UI_HANDLER_WAIT_MAX_MS)) {
-            uint32_t pct = elapsed_ms * 100u / UI_SPLASH_HOLD_MS;
-            splash_set_progress(pct); /* 更新进度条（0~100） */
-            /* 按进度切换阶段文字（只在跨越阶段边界时更新，避免每帧刷 label） */
-            if (pct < 30) {
-                splash_set_progress_text("正在初始化系统…");
-            } else if (pct < 60) {
-                splash_set_progress_text("正在加载字库…");
-            } else if (pct < 90) {
-                splash_set_progress_text("正在初始化传感器…");
+    const int64_t splash_t0 = esp_timer_get_time();
+    /* 用不可能的值强制首轮刷新一次；shown_cjk 记录启动页当前文案语言。
+     * v0.6.9：启动页字体是编进固件的极小子集，lvgl_port_app_init() 同步创建，
+     * 正常情况下此处已为 true——首帧就是完整中文，不再先显示 ASCII。 */
+    uint32_t shown_done = UINT32_MAX;
+    uint32_t shown_total = UINT32_MAX;
+    bool shown_cjk = lvgl_port_splash_fonts_ready();
+    bool shown_finish = false;
+    while (true) {
+        uint32_t done;
+        uint32_t total;
+        char label[UI_BOOT_LABEL_LEN];
+        bool finish_req;
+
+        portENTER_CRITICAL(&s_boot_mux);
+        done = s_boot_done;
+        total = s_boot_total;
+        snprintf(label, sizeof(label), "%s", s_boot_label);
+        finish_req = s_boot_finish_req;
+        portEXIT_CRITICAL(&s_boot_mux);
+
+        /* cjk：启动页子集是否可用（决定文案/字体语言）；
+         * full_fonts：全量中文字库是否已后台加载完（决定能否进主界面）。 */
+        const bool cjk = lvgl_port_splash_fonts_ready();
+        const bool full_fonts = lvgl_port_fonts_ready();
+        const uint32_t pct = total > 0 ? done * 100u / total : 0u;
+
+        if (done != shown_done || total != shown_total || cjk != shown_cjk ||
+            finish_req != shown_finish) {
+            /* 子集不可用（极少数：PSRAM/字库创建失败）时只显示 ASCII，
+             * 避免中文渲染成方框；子集可用则直接显示真实中文阶段文字。 */
+            char stage[UI_BOOT_LABEL_LEN + 8];
+            if (cjk) {
+                snprintf(stage, sizeof(stage), "%s", label);
+            } else if (finish_req) {
+                snprintf(stage, sizeof(stage), "LOADING FONTS...");
             } else {
-                splash_set_progress_text("正在准备界面…");
+                snprintf(stage, sizeof(stage), "BOOTING %u%%", (unsigned)pct);
             }
-            lvgl_port_unlock();
+
+            if (lvgl_port_lock(UI_HANDLER_WAIT_MAX_MS)) {
+                if (cjk != shown_cjk) {
+                    splash_set_cjk(cjk);
+                }
+                splash_set_progress(pct);
+                splash_set_progress_text(stage);
+                lvgl_port_unlock();
+            }
+            shown_done = done;
+            shown_total = total;
+            shown_cjk = cjk;
+            shown_finish = finish_req;
         }
+
         /* 首帧真正上屏后才打开背光：避免开机先看到黑屏/局部条带（见 lcd 驱动注释）。
          * lvgl_port_flush_count：LVGL 每次向屏幕刷完一帧（flush）计数 +1，
          * 大于 0 表示显示内容真的已经输出到 LCD 了。 */
@@ -495,10 +554,36 @@ static void task_ui(void *arg)
             apply_backlight();
             backlight_on = true;
         }
-        /* vTaskDelayUntil：固定周期延时（相对"上一次唤醒时刻"），比 vTaskDelay
-         * 更不容易累积漂移；pdMS_TO_TICKS 把毫秒换算成 FreeRTOS 节拍数。 */
-        vTaskDelayUntil(&last, pdMS_TO_TICKS(UI_LOOP_PERIOD_MS));
-        elapsed_ms += UI_LOOP_PERIOD_MS;
+
+        /* 启动阶段也更新心跳，避免 5s 巡检把"正在等初始化"误判为 UI 冻结 */
+        s_ui_loop_us = esp_timer_get_time();
+
+        const int64_t splash_elapsed_ms = (esp_timer_get_time() - splash_t0) / 1000;
+        const bool min_elapsed = splash_elapsed_ms >= UI_SPLASH_MIN_MS;
+
+        /* 结束条件：初始化完成 + 最短显示时间 + **全量字库**已就绪。
+         * 启动页本身用嵌入子集，早就不依赖全量字库；但主界面三页用的是
+         * 全量 Noto，必须等后台任务加载完再进入，否则整页中文会变方框。
+         * 全量字库正常约 3s 完成；若异常迟迟不完成，15s 后降级进入主界面。 */
+        if (finish_req && min_elapsed && full_fonts) {
+            break;
+        }
+        if (finish_req && min_elapsed && !full_fonts && splash_elapsed_ms > 15000) {
+            ESP_LOGW(TAG, "全量中文字体加载超时（>15s），降级使用内置 ASCII 字体进入主界面");
+            break;
+        }
+        vTaskDelay(pdMS_TO_TICKS(UI_BOOT_POLL_MS));
+    }
+
+    /* 收尾：补一帧 100% + 结束文字，避免进度停在最后一个步骤的百分比 */
+    if (lvgl_port_lock(UI_HANDLER_WAIT_MAX_MS)) {
+        splash_set_progress(100);
+        splash_set_progress_text(lvgl_port_splash_fonts_ready() ? "正在准备界面…" : "STARTING...");
+        lvgl_port_unlock();
+    }
+    vTaskDelay(pdMS_TO_TICKS(50));
+    if (!lvgl_port_fonts_ready()) {
+        ESP_LOGW(TAG, "主界面将使用内置 ASCII 字体（中文可能显示为方块）");
     }
     /* 兜底：若因异常一直没有 flush 完成，启动画面结束后也点亮背光，避免全黑 */
     if (!backlight_on) {
@@ -607,7 +692,7 @@ static void task_ui(void *arg)
      *   · 波形页：固定 25Hz（图面流畅，不受测量页刷新率影响）；
      *   · 设置页：5Hz（校准向导读数/电能统计等少量实时值）。
      * 数据源恒定 40Hz 快拍 + 200ms 权威块（电能/真 RMS 不受显示设置影响）。 */
-    last = xTaskGetTickCount();
+    TickType_t last = xTaskGetTickCount();
     s_last_input_us = esp_timer_get_time(); /* 输入计时起点＝进主循环时刻（防开机即降亮） */
 
     /* 【v0.6.0 卡死取证】把 UI 任务订阅到任务看门狗（TWDT）。
@@ -825,10 +910,54 @@ static void task_ui(void *arg)
 }
 
 /**
- * @brief 启动 UI 任务（界面在其内部构建），重复调用返回错误
+ * @brief 更新启动页真实进度（线程安全，app_init 初始化循环调用）
  *
- * 只创建任务、不直接建界面：建界面需要 12KB 栈，必须在任务自己的栈里做
+ * 只写共享快照；UI 任务在每个轮询周期读取并渲染，双方不直接跨任务操作
+ * LVGL 对象。done/total 会做边界收敛，避免除零或进度超过 100%。
+ */
+void ui_boot_set_progress(uint32_t done, uint32_t total, const char *label)
+{
+    if (total == 0) {
+        total = 1;
+    }
+    if (done > total) {
+        done = total;
+    }
+
+    portENTER_CRITICAL(&s_boot_mux);
+    s_boot_done = done;
+    s_boot_total = total;
+    if (label != NULL) {
+        snprintf(s_boot_label, sizeof(s_boot_label), "%s", label);
+    }
+    portEXIT_CRITICAL(&s_boot_mux);
+}
+
+/**
+ * @brief 通知启动页初始化结束（app_tasks_start 在测量任务启动后调用）
+ *
+ * UI 任务未创建（显示链路故障/任务创建失败）时为空操作；置位后 UI 任务
+ * 仍需满足最短显示时间才退出启动页，随后构建主界面。
+ */
+void ui_boot_finish(void)
+{
+    if (!s_ui_inited) {
+        return;
+    }
+
+    portENTER_CRITICAL(&s_boot_mux);
+    s_boot_done = s_boot_total; /* 结束时强制 100% */
+    s_boot_finish_req = true;
+    portEXIT_CRITICAL(&s_boot_mux);
+}
+
+/**
+ * @brief 启动 UI 任务：先显示启动页，收到 ui_boot_finish() 后再构建主界面
+ *
+ * 只创建任务、不直接建界面：建界面需要 16KB 栈，必须在任务自己的栈里做
  * （app_main 的栈只有约 3.5KB，放不下 LVGL 的递归建树）。
+ * v0.6.9 起由 app_init 在显示链路（lcd/touch/lvgl_port/orientation）
+ * 就绪后提前调用，以便启动页覆盖后续文件系统、传感器与测量服务的初始化过程。
  *
  * @return ESP_OK 成功；ESP_ERR_INVALID_STATE 已初始化过；ESP_ERR_NO_MEM 任务创建失败
  */

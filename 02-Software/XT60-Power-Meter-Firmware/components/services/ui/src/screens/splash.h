@@ -13,12 +13,22 @@
 void splash_build(lv_obj_t *scr);
 
 /**
- * @brief 按启动停留进度（0~100）更新底部加载条
+ * @brief 切换启动页文案/字体（v0.6.9 字体异步加载）
+ *
+ * 字体未就绪时启动页显示内置 ASCII 文案；中文字库加载完成后由 ui.c
+ * 调用本函数切换为中文文案与 Noto 字体。必须在 LVGL 锁内调用。
+ *
+ * @param cjk true=中文；false=ASCII
+ */
+void splash_set_cjk(bool cjk);
+
+/**
+ * @brief 按真实初始化进度（0~100）更新底部加载条
  */
 void splash_set_progress(uint32_t pct);
 
 /**
- * @brief 更新进度条下方的进度项目文字（如"正在初始化传感器…"）
+ * @brief 更新进度条下方的进度项目文字（如"测量前端 17/23"）
  *
  * 用于向用户传达当前启动阶段。传 NULL 或空串清空文字。
  */

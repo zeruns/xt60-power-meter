@@ -2655,15 +2655,21 @@ static void numkey_open(const char *title, const char *unit, float init, float m
 #define ALARM_ROW_P 2 /**< 过功率（W） */
 #define ALARM_ROW_CNT 3
 
-/** 阈值范围与步进（settings_set_alarm 要求阈值 >0，故下限取最小步进而非 0） */
+/** 阈值范围与步进（settings_set_alarm 要求阈值 >0，故下限取最小步进而非 0）
+ *  上限按整机设计量程取值（v0.6.9）：
+ *   · 电压 90V：分压链路理论满量程 ±121V，但辅助电源最高输入 100V，
+ *     设计测量范围取 0~90V，告警上限随之定为 90V；
+ *   · 电流 70A：1mΩ/5W 分流器的额定功率上限（70A 时约 4.9W），
+ *     XT60 接口额定 30A；复刻者换 XT90 底板可用到更高电流；
+ *   · 功率 6300W：90V × 70A（电压与电流上限的乘积）。 */
 #define ALARM_V_MIN 0.1f
-#define ALARM_V_MAX 30.0f
+#define ALARM_V_MAX 90.0f
 #define ALARM_V_STEP 0.1f
 #define ALARM_I_MIN 0.1f
-#define ALARM_I_MAX 20.0f
+#define ALARM_I_MAX 70.0f
 #define ALARM_I_STEP 0.1f
 #define ALARM_P_MIN 1.0f
-#define ALARM_P_MAX 200.0f
+#define ALARM_P_MAX 6300.0f
 #define ALARM_P_STEP 1.0f
 
 /**
@@ -2710,7 +2716,11 @@ static float *alarm_row_value(int row)
 }
 
 /**
- * @brief 刷新某行阈值数值标签（"14.10 V" / "2.05 A" / "28.9 W"）
+ * @brief 刷新某行阈值数值标签（"14.10 V" / "2.05 A" / "6300 W"）
+ *
+ * 功率阈值步进是 1W，且上限到 6300W，用 "%.0f" 既符合精度也避免
+ * "6300.00 W" 超出 72px 的数值标签宽度被裁。
+ *
  * @param row 行下标（ALARM_ROW_*）
  */
 static void alarm_update_label(int row)
@@ -2720,8 +2730,12 @@ static void alarm_update_label(int row)
         return;
     }
     char buf[24];
-    snprintf(buf, sizeof(buf), "%.2f %s", (double)(*alarm_row_value(row)),
-             row == ALARM_ROW_V ? "V" : (row == ALARM_ROW_I ? "A" : "W"));
+    if (row == ALARM_ROW_P) {
+        snprintf(buf, sizeof(buf), "%.0f W", (double)(*alarm_row_value(row)));
+    } else {
+        snprintf(buf, sizeof(buf), "%.2f %s", (double)(*alarm_row_value(row)),
+                 row == ALARM_ROW_V ? "V" : "A");
+    }
     lv_label_set_text(lbl, buf);
 }
 

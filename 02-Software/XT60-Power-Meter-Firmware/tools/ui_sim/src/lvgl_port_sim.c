@@ -161,6 +161,28 @@ const lv_font_t *lvgl_port_get_font_bold(lvgl_port_font_size_t size)
     return get_font(FONT_BOLD, size);
 }
 
+/* 模拟器没有"嵌入子集/全量字库"之分：两者映射到同一套已加载的全量字体，
+ * 启动页与真机一样直接走中文分支（用于验证中文文案与版式）。 */
+const lv_font_t *lvgl_port_get_splash_font(lvgl_port_font_size_t size)
+{
+    return get_font(FONT_REG, size);
+}
+
+const lv_font_t *lvgl_port_get_splash_font_bold(lvgl_port_font_size_t size)
+{
+    return get_font(FONT_BOLD, size);
+}
+
+bool lvgl_port_splash_fonts_ready(void)
+{
+    return true;
+}
+
+bool lvgl_port_fonts_ready(void)
+{
+    return true; /* 模拟器同步加载，启动页直接走中文分支 */
+}
+
 uint32_t lvgl_port_flush_count(void)
 {
     return s_flush_count;

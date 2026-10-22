@@ -169,6 +169,9 @@ CONFIG_LV_COLOR_FORMAT_RGB565_SWAPPED=y
 #   PSRAM（约 2.2MB），之后渲染走内存，运行期对 flash 零访问（避免渲染中
 #   读 SPIFFS 与 flash 擦除/LCD DMA 交错引发的 cache 故障）。
 #   文件缺失时 lvgl_port 回退内置 montserrat14（仅 ASCII）。
+#   v0.6.9 起改为**后台任务异步加载**：启动页先以 ASCII 显示，字体就绪后切中文。
+#   启动页 ASCII 大标题使用内置 Montserrat 32px（14px 已默认开启，兼作图标回退）。
+CONFIG_LV_FONT_MONTSERRAT_32=y
 #   tiny_ttf 运行时只使用内存接口 lv_tiny_ttf_create_data，不需要文件支持。
 CONFIG_LV_USE_TINY_TTF=y
 # CONFIG_LV_TINY_TTF_FILE_SUPPORT is not set

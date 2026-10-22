@@ -455,20 +455,23 @@ esp_err_t app_tasks_start(void)
     }
 
     /* ---- UI 任务 ----
-     * 门控条件：显示链路（lcd_nv3030b + lvgl_port）必须初始化成功。
-     * 走到这里说明启动表与硬件自检都已完成（见 app_init.c），
-     * 但 UI 只依赖显示链路，故仍单独检查 SYSTEM_FAULT_LCD：
-     *   · lvgl_port 未初始化时调用任何 LVGL API 都是未定义行为，必须先查故障位；
-     *   · 触摸故障（SYSTEM_FAULT_TOUCH）不阻止 UI 启动——界面仍可显示，只是不能触控。
-     * 注意：界面本身是在 ui 任务内部构建的（不在 app_main 的栈上），原因见 ui.c。 */
+     * v0.6.9：UI 任务已在 app_init 的显示链路就绪时（orientation 之后）提前创建，
+     * 此刻只需通知启动页"初始化结束"，UI 任务便退出启动页并构建主界面。
+     * 门控条件仍是显示链路（lcd_nv3030b + lvgl_port）无故障：
+     *   · lvgl_port 未初始化时不能调用任何 LVGL API；
+     *   · 触摸故障（SYSTEM_FAULT_TOUCH）不阻止界面显示，只是不能触控；
+     *   · ui_init 若曾因任务创建失败而未运行，ui_boot_finish() 为空操作。 */
     if ((system_state_get_fault_mask() & SYSTEM_FAULT_LCD) == 0) {
-        esp_err_t err = ui_init();
-        if (err != ESP_OK) {
-            /* UI 启动失败不阻断测量等业务任务，降级继续（无界面运行） */
-            ESP_LOGE(TAG, "UI 启动失败: %s -> 无界面运行", esp_err_to_name(err));
+        /* v0.6.9：先拉起中文字体后台加载，再通知启动页结束。
+         * 字体加载与"启动页等待"并行，主界面在字体就绪后构建；若任务
+         * 创建失败，驱动内部会置 ready=true 并降级为内置 ASCII 字体。 */
+        esp_err_t ferr = lvgl_port_start_font_load();
+        if (ferr != ESP_OK) {
+            ESP_LOGW(TAG, "中文字体后台任务启动失败: %s（降级 ASCII）", esp_err_to_name(ferr));
         }
+        ui_boot_finish();
     } else {
-        ESP_LOGW(TAG, "显示链路故障，跳过 UI 启动");
+        ESP_LOGW(TAG, "显示链路故障，跳过主界面构建");
     }
 
     /* xTaskCreatePinnedToCore 的最后一个参数就是绑定的核编号。

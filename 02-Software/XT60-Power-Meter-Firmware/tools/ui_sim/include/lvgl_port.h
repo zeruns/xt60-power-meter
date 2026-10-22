@@ -36,6 +36,14 @@ esp_err_t lvgl_port_app_init(void);
 
 const lv_font_t *lvgl_port_get_font(lvgl_port_font_size_t size);
 const lv_font_t *lvgl_port_get_font_bold(lvgl_port_font_size_t size);
+
+/** 启动页嵌入子集（模拟器与全量字库同源，便于验证中文文案/版式） */
+const lv_font_t *lvgl_port_get_splash_font(lvgl_port_font_size_t size);
+const lv_font_t *lvgl_port_get_splash_font_bold(lvgl_port_font_size_t size);
+bool lvgl_port_splash_fonts_ready(void);
+
+/** 模拟器字体在初始化时同步加载完成，恒为 true（真机为后台异步加载） */
+bool lvgl_port_fonts_ready(void);
 uint32_t lvgl_port_flush_count(void);
 
 esp_err_t lvgl_port_set_rotation(lcd_nv3030b_rotation_t rot);

@@ -128,7 +128,7 @@ SYSTEM_FAULT_CRITICAL_MASK = SYSTEM_FAULT_ADC | SYSTEM_FAULT_INFRA
 
 ### 初始化表
 
-`main/app_init.c` 用一张表描述启动步骤，每项登记自己的故障位（下表为真实内容，共 17 项）：
+`main/app_init.c` 用一张表描述启动步骤，每项登记自己的故障位（下表为真实内容，共 18 项）：
 
 ```c
 static const init_step_t s_boot_steps[] = {
@@ -141,18 +141,19 @@ static const init_step_t s_boot_steps[] = {
     { "device_ctrl",   device_ctrl_init,   SYSTEM_FAULT_LED     },
     /* 数据通道 */
     { "data_store",    data_store_init,    SYSTEM_FAULT_INFRA   },  /* 关键 */
-    /* 传感器与测量前端 */
     { "button",        button_init,        SYSTEM_FAULT_BUTTON  },
-    { "battery_adc",   battery_adc_init,   SYSTEM_FAULT_BATTERY },
-    { "aht20",         aht20_init,         SYSTEM_FAULT_ENV     },
-    { "imu_sc7a20h",   imu_sc7a20h_init,   SYSTEM_FAULT_IMU     },
-    { "ads131m02",     ads131m02_init,     SYSTEM_FAULT_ADC     },  /* 关键，4kSPS */
-    { "power_measure", power_measure_init, SYSTEM_FAULT_ADC     },  /* 测量服务：NVS/波形缓冲 */
-    /* 显示与交互 */
-    { "fs_storage",    fs_storage_init,    SYSTEM_FAULT_STORAGE },  /* /spiffs 挂载，字体在此 */
+    /* 显示链路（v0.6.9 前移：尽早点亮屏幕；使用固件内嵌启动页子库） */
     { "lcd_nv3030b",   lcd_nv3030b_init,   SYSTEM_FAULT_LCD     },
     { "touch_cst816d", touch_cst816d_init, SYSTEM_FAULT_TOUCH   },
-    { "lvgl_port",     lvgl_port_init,     SYSTEM_FAULT_LCD     },
+    { "lvgl_port",     lvgl_port_app_init, SYSTEM_FAULT_LCD     },
+    { "imu_sc7a20h",   imu_sc7a20h_init,   SYSTEM_FAULT_IMU     },
+    { "orientation",   orientation_boot_restore, 0             },  /* 此后创建 UI 任务 */
+    /* 资源与测量链路（启动页可见后再初始化） */
+    { "fs_storage",    fs_storage_init,    SYSTEM_FAULT_STORAGE },  /* /spiffs：仅全量字体需要 */
+    { "battery_adc",   battery_adc_init,   SYSTEM_FAULT_BATTERY },
+    { "aht20",         aht20_init,         SYSTEM_FAULT_ENV     },
+    { "ads131m02",     ads131m02_init,     SYSTEM_FAULT_ADC     },  /* 关键，4kSPS */
+    { "power_measure", power_measure_init, SYSTEM_FAULT_ADC     },  /* 测量服务：NVS/波形缓冲 */
 };
 ```
 
@@ -161,12 +162,42 @@ static const init_step_t s_boot_steps[] = {
 - **关键步骤失败**（故障位命中 `CRITICAL_MASK`，即 `SYSTEM_FAULT_ADC` 与 `SYSTEM_FAULT_INFRA`）→ 跳过后续关键步骤，但**继续执行非关键步骤**（尽量保住屏幕 / WiFi 这些"救回通道"），最终进入 `FAULT` 状态且**不复位**；
 - **非关键步骤失败** → 只登记故障位，系统降级继续运行。
 
-顺序约束（四条，改表时必须保持）：
+顺序约束（改表时必须保持）：
 
 1. `event_bus` 最先（其他模块靠它通信）；
-2. `status_led` 早于 `system_state` / `device_ctrl`（状态机初始化会广播状态，`device_ctrl` 收到后要立刻设置指示灯）；
-3. `buzzer` / `settings` 早于 `device_ctrl`（它初始化时会按当前状态同步输出并读取已保存的用户偏好）；
-4. 传感器与测量前端早于显示与交互（先把"数据怎么来"准备好，再启动"数据怎么显示"）。
+2. `status_led` / `buzzer` / `settings` 早于 `device_ctrl`（状态机初始化会广播状态，`device_ctrl` 会同步输出并读取用户偏好）；
+3. `button` 早于 UI 任务（`task_ui` 启动时注册按键回调）；
+4. `lcd_nv3030b` / `touch_cst816d` 早于 `lvgl_port`（显示与输入设备）；
+5. `imu_sc7a20h` 与 `lvgl_port` 早于 `orientation_boot_restore`（方向判断与软件旋转）；
+6. `fs_storage` 早于 `app_tasks_start()` 里的 `lvgl_port_start_font_load()`（全量字体在 `/spiffs`）；启动页字体已内嵌，故本步可后移到 orientation 之后；
+7. `ads131m02` 早于 `power_measure`；
+8. `power_measure` 早于 `app_tasks_start()` 中的测量任务启动。
+
+### 启动页与真实进度
+
+`orientation` 步骤带 `start_ui_after=true`：该步结束后 `app_init` 立即调用
+`ui_init()` 创建 UI 任务，启动页先点亮；文件系统、电池、温湿度、ADS131M02、
+测量服务随后初始化。每执行一步/一个自检项，`app_init` 调用
+`ui_boot_set_progress(已完成, 总步数, 中文短名)` 写入共享快照（总步数 =
+18 个初始化步骤 + 5 个自检项），UI 任务在 LVGL 锁内渲染进度条与文字。
+
+**启动页字体（v0.6.9）**：启动页文案只需要约 200 个字（品牌、版本、
+18 个初始化短名、5 个自检项），`tools/fonts/make_splash_font.py` 把
+`app_init.c` 的 label 与 `splash.c` 的字符串自动收集成**极小子集**
+（约 34KB/字重），生成 `components/middleware/lvgl_port/src/splash_font_data.c`
+直接编进 app 分区。`lvgl_port_app_init()` 内同步复制到 PSRAM 并创建
+12/14/16px 常规 + 40px 粗体四个实例（实测仅 4ms），**不依赖 SPIFFS**，
+因此启动页第一帧就是完整中文。子集创建失败时才回退 ASCII 文案。
+
+主界面用的全量字库（4MB TTF + 16 个字号实例）加载约 3.3s，仍为**后台异步**：
+`app_tasks_start()` 在测量任务启动后调用 `lvgl_port_start_font_load()`
+拉起字库任务（内部 RAM 栈，SPIFFS 读取会短暂关闭 cache）。启动页自身
+不等它；但 UI 任务必须等到 `ui_boot_finish()` 且 `lvgl_port_fonts_ready()`
+都为真才构建主界面，避免整页中文变方框。启动页最少显示 600ms，
+全量字体异常时 15s 后降级为 ASCII 进入主界面。
+
+实测启动时间线（v0.6.9，横屏）：启动页子库 4ms 创建完成、屏幕约 **1.06~1.09s**
+点亮（较调整前 1.42s 提前）；全量字库 3.3s，主界面约 **5.3s** 构建完成。
 
 ### 启动自检（阶段二）
 
@@ -446,16 +477,21 @@ opcode 封装与约 200 条分页式初始化序列都由组件负责，**驱动
 | `lvgl/lvgl`（组件管理器托管） | LVGL 9.6 源码本体 |
 | `components/drivers/lcd_nv3030b/` | QSPI 总线 + 面板（官方 `esp_lcd_spd2010`）+ 背光 + 导出 panel/io 句柄 |
 | `components/drivers/touch_cst816d/` | 触摸读点（解析与厂商 STM32 参考例程一致） |
-| `components/middleware/lvgl_port/` | 应用侧适配：字体（SPIFFS→PSRAM）、触摸 indev、首帧计数、旋转；LVGL 内核/任务/心跳/锁/显示由官方 `espressif/esp_lvgl_port` 提供 |
+| `components/middleware/lvgl_port/` | 应用侧适配：启动页内嵌子库 + 全量字体（SPIFFS→PSRAM）、触摸 indev、首帧计数、旋转；LVGL 内核/任务/心跳/锁/显示由官方 `espressif/esp_lvgl_port` 提供 |
 | `components/middleware/fs_storage/` | storage 分区挂为 `/spiffs`，字体镜像（`spiffs_create_partition_image`） |
 | `components/services/ui/` | 启动页 + 测量/波形/设置三页（tileview/chart/roller 官方组件） |
 | `components/services/power_measure/` | 4kHz 采样、块均值/功率/电能/容量（直流口径非 RMS）、三级波形缓冲、NVS 掉电保存 |
 
-### 字体方案（OFL Noto Sans SC，文件系统存放）
+### 字体方案（启动页内嵌子集 + 主界面文件字体）
 
-- 字体**不嵌入 app**：`tools/fonts/make_fonts.py` 从 google/fonts 下载 Noto Sans SC
-  可变 TTF，实例化 Regular(400)/Bold(700) 两个字重，按 **ASCII + GB2312 一级+二级
-  6763 字 + 全角标点/单位符号** 子集化，输出到
+- **启动页子集**：`tools/fonts/make_splash_font.py` 自动收集 `app_init.c` 的
+  初始化/自检 label 与 `splash.c` 的文案，生成约 200 字、34KB/字重的
+  `components/middleware/lvgl_port/src/splash_font_data.c/.h`，**编进 app 分区**。
+  `lvgl_port_app_init()` 同步建 4 个字体实例（实测 4ms），首帧即完整中文，
+  不再等待 SPIFFS/全量字库；改启动页文案后重新运行脚本即可。
+- **主界面字体不嵌入 app**：`tools/fonts/make_fonts.py` 从 google/fonts 下载
+  Noto Sans SC 可变 TTF，实例化 Regular(400)/Bold(700) 两个字重，按
+  **ASCII + GB2312 一级+二级 6763 字 + 全角标点/单位符号** 子集化，输出到
   `components/middleware/fs_storage/spiffs_image/fonts/`（**约 2.09MB/个**），构建时
   打入 SPIFFS 镜像随 `idf.py flash` 烧入 `storage` 分区（partitions.csv，8MB → 挂载后可用 7346KB）。
 
@@ -467,9 +503,10 @@ opcode 封装与约 200 条分页式初始化序列都由组件负责，**驱动
   两字重约 12MB，**装不进 8MB 分区**；且 PSRAM 也放不下两套。因此 GB2312 之外的
   GBK 生僻字（人名用字如「喆」「堃」）与 emoji 仍会缺字——这是已知取舍。
   扩大字库后必须**全量 `idf.py flash`**（OTA 只更新 app 分区，不含 storage/字体）。
-- `lvgl_port_init`（启动表中位于 fs_storage 之后、测量任务启动之前）用标准
-  `fopen` 把两个 TTF **整读入 PSRAM**，再用 `lv_tiny_ttf_create_data()` 建
-  7 档字号 ×2 字重；之后渲染只走内存，**运行期对 flash 零访问**。
+- `lvgl_port_start_font_load()`（`app_tasks_start()` 中调用，晚于 `fs_storage`、
+  早于主界面构建）用标准 `fopen` 把两个 TTF **整读入 PSRAM**，再用
+  `lv_tiny_ttf_create_data()` 建 7 档字号 ×2 字重；之后渲染只走内存，
+  **运行期对 flash 零访问**。
   这样避免了渲染中 SPIFFS 读（spi_flash 读会挂起 MSPI cache）与 NVS 擦除/
   LCD DMA 交错的 cache 故障窗口。文件缺失时回退内置 montserrat14（仅 ASCII）。
 - **不要改回 `lv_tiny_ttf_create_file()` 边渲染边读**，除非重新评估 cache 安全。
@@ -494,6 +531,10 @@ opcode 封装与约 200 条分页式初始化序列都由组件负责，**驱动
   每 200ms（墙钟，约 800 样本）输出一帧 V/I 块均值（直流口径）、平均功率与积分电能到 data_store。
 - 温湿度/电池由 Core0 辅助任务 2s 采集一次，在块边界由采样任务合并进快照
   （维持 data_store 单写者）；电能/运行时间每 30s 落 NVS，启动恢复。
+- **量程（v0.6.9 校正）**：电压设计测量 **0~90V**——101:1 分压链路理论满量程 ±121V，
+  但辅助电源（XT60 输入）最高输入 100V，故限制到 90V；电流 ADC 满量程 **±75A**
+  （1mΩ + PGA 16x），5W 分流器功率限制额定最大 70A，XT60 接口再限制到额定 **±30A**；
+  复刻者更换 XT90 底板可发挥到 70A。告警阈值上限与量程对齐：**90V / 70A / 6300W**。
 - **空载小信号死区（v0.6.7）**：|I| < `PM_CURRENT_DEADBAND_A`（2 mA）时，25ms 显示子窗与
   200ms 块均值都按 0 处理。1 mΩ 分流器 + PGA 16x 下 1 LSB = 8.94 µA，单帧噪声 σ≈2 mA
   （5s 原始码峰峰约 17 mA），25ms 子窗残余 σ≈0.2 mA，再叠加数百 µA 的零点温漂，
@@ -594,6 +635,20 @@ v0.6.8 起：波形页**纵轴刻度去尾零**（3.00V→3V、0.200A→0.2A，�
 min(屏宽−24, 280)，横屏 260 / 竖屏 216），修复竖屏（240 宽）左右被裁；
 共享弹窗与 ui.c 的启动/告警弹窗统一走该函数，并监听
 `LV_EVENT_RESOLUTION_CHANGED` 在弹窗开着转屏时重新适配 + 居中。
+v0.6.9 起：**量程文档校正**——电压设计测量 0~90V（分压链路理论 ±121V，
+受辅助电源 100V 输入上限限制）；电流峰值 ±75A（ADC 满量程）、额定 ±30A
+（5W 分流器可到 70A，XT60 接口 30A，复刻可换 XT90 底板）。
+告警阈值上限与量程对齐：**90V / 70A / 6300W**，设备端 UI 步进/数字键盘、
+网页滑条/输入框与 `settings_set_alarm()` 校验使用同一组上限。
+波形页纵轴刻度标签宽度由固定 62px 改为 `LV_SIZE_CONTENT`（左右列分别
+`LV_ALIGN_TOP_LEFT/RIGHT` 对齐），半透明底色只覆盖数字本身，短刻度不再
+占用左右波形显示空间。
+启动流程重排：显示链路（LCD/触摸/LVGL/IMU/方向）前移到第 9~13 步，
+`fs_storage` 后移到 orientation 之后（仅全量字库后台任务需要），
+启动页改为显示 **18 步初始化 + 5 项自检的真实进度**；
+启动页文案改用 `tools/fonts/make_splash_font.py` 生成的**内嵌极小子集**
+（约 200 字、34KB/字重，编入 app 分区，同步创建 4ms），首帧即完整中文，
+屏幕点亮由 1.42s 提前到约 1.09s；主界面仍在全量字库加载完成后构建。
 以下为**尚未实现**的缺口：
 
 | 缺口 | 现状 | 影响 |

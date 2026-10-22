@@ -51,6 +51,7 @@
 
 /* ---- 字体 ---- */
 #define LV_FONT_MONTSERRAT_14 1
+#define LV_FONT_MONTSERRAT_32 1 /* 启动页 ASCII 模式大标题（与固件 sdkconfig 同步） */
 #define LV_USE_TINY_TTF 1
 #define LV_TINY_TTF_CACHE_GLYPH_CNT 64
 #define LV_TINY_TTF_CACHE_KERNING_CNT 16

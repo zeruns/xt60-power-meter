@@ -462,6 +462,12 @@ void sim_run_scenes(void)
     splash_set_progress_text("正在初始化传感器…");
     shot("01_splash");
 
+    /* ---- 01c 启动页 ASCII 阶段（中文字库加载完成前）---- */
+    splash_set_cjk(false);
+    splash_set_progress_text("BOOTING 45%");
+    shot("01c_splash_ascii");
+    splash_set_cjk(true);
+
     /* ---- 01b 启动页（竖屏）：验证进度条居中、不与版本行冲突 ---- */
     lv_obj_clean(lv_screen_active());
     lvgl_port_set_rotation_angle(90);
@@ -470,6 +476,10 @@ void sim_run_scenes(void)
     splash_set_progress(45);
     splash_set_progress_text("正在初始化传感器…");
     shot("01b_splash_90");
+    splash_set_cjk(false);
+    splash_set_progress_text("BOOTING 45%");
+    shot("01d_splash_ascii_90");
+    splash_set_cjk(true);
     lv_obj_clean(lv_screen_active());
     lvgl_port_set_rotation_angle(0);
     sim_step(100);
@@ -860,6 +870,36 @@ void sim_run_scenes(void)
     shot("42_alarm_after_input");
     close_subpage_if_open();
     sim_step(150);
+
+    /* ---- v0.6.9 告警上限（90V / 70A / 6300W）显示不溢出 ---- */
+    {
+        settings_alarm_t max_alm = {
+            .v_en = 1,
+            .i_en = 1,
+            .p_en = 1,
+            .v_limit = 90.0f,
+            .i_limit = 70.0f,
+            .p_limit = 6300.0f,
+        };
+        (void)settings_set_alarm(&max_alm);
+        open_sub_page("告警设置");
+        shot("40b_alarm_max"); /* 检查 "90.00 V" / "70.00 A" 显示 */
+        scroll_all_to_bottom(lv_screen_active());
+        sim_step(200);
+        shot("40c_alarm_max_bottom"); /* 检查 "6300 W" 在 72px 数值标签内不被裁 */
+        close_subpage_if_open();
+        /* 还原默认值，避免影响后续场景 */
+        settings_alarm_t def_alm = {
+            .v_en = 0,
+            .i_en = 0,
+            .p_en = 0,
+            .v_limit = 15.0f,
+            .i_limit = 5.0f,
+            .p_limit = 50.0f,
+        };
+        (void)settings_set_alarm(&def_alm);
+        sim_step(150);
+    }
 
     /* 收尾回到设置首页（与旧场景一致，便于人工对照 23_settings_final） */
     ensure_page(2);

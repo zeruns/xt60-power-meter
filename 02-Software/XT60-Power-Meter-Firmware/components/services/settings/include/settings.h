@@ -83,9 +83,9 @@ typedef struct {
     uint8_t v_en;   /**< 过压告警使能（1=开启） */
     uint8_t i_en;   /**< 过流告警使能 */
     uint8_t p_en;   /**< 过功率告警使能 */
-    float v_limit;  /**< 过压阈值（V） */
-    float i_limit;  /**< 过流阈值（A） */
-    float p_limit;  /**< 过功率阈值（W） */
+    float v_limit;  /**< 过压阈值（V），范围 (0, 90] */
+    float i_limit;  /**< 过流阈值（A），范围 (0, 70] */
+    float p_limit;  /**< 过功率阈值（W），范围 (0, 6300] */
 } settings_alarm_t;
 
 /**
@@ -198,7 +198,8 @@ esp_err_t settings_get_alarm(settings_alarm_t *out);
 /**
  * @brief 更新告警阈值配置：写入内存缓存并安排延迟落盘（防抖）
  *
- * 非法输入（阈值 ≤0、NaN/inf）拒绝并保持原值不变。
+ * 非法输入（阈值 ≤0、NaN/inf，或超过整机量程上限 90V / 70A / 6300W）
+ * 拒绝并保持原值不变。上限与设备端 UI、网页滑条/输入框使用同一组数值。
  *
  * @param in 新配置，不可为 NULL
  * @return ESP_OK 成功；ESP_ERR_INVALID_ARG 参数非法；ESP_ERR_INVALID_STATE 尚未初始化

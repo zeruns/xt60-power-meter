@@ -15,6 +15,7 @@
 #include "app_init.h"
 
 #include <stdbool.h>
+#include <stdio.h>
 
 #include "ads131m02.h"
 #include "aht20.h"
@@ -34,9 +35,11 @@
 #include "status_led.h"
 #include "system_state.h"
 #include "touch_cst816d.h"
+#include "ui.h"
 
 #include "esp_core_dump.h"
 #include "esp_log.h"
+#include "esp_timer.h"
 
 /** 日志标签 */
 static const char *TAG = "app_init";
@@ -47,93 +50,111 @@ static const char *TAG = "app_init";
  * 用结构体描述而不是把顺序写死在代码里，好处是：
  *   · 新增模块只加一行表项，不用改流程控制代码；
  *   · 每个模块的"重要程度"由它的 fault_bit 唯一决定
- *     （与 SYSTEM_FAULT_CRITICAL_MASK 比对），信息只存在一处。
+ *     （与 SYSTEM_FAULT_CRITICAL_MASK 比对），信息只存在一处；
+ *   · label 是启动页显示的中文短名，start_ui_after 标记"此步完成后
+ *     立即创建 UI 任务"，避免在流程代码里写死模块名判断。
  */
 typedef struct {
-    const char *name;        /**< 模块名，仅用于日志 */
+    const char *name;        /**< 模块名，用于串口日志 */
+    const char *label;       /**< 启动页中文短名（如"测量前端"） */
     esp_err_t (*init)(void); /**< 初始化函数 */
     uint32_t fault_bit;      /**< 失败时记入的故障位 */
+    bool start_ui_after;     /**< true=本步结束后创建 UI 任务（显示启动页） */
 } init_step_t;
 
 /**
- * 初始化表（按依赖顺序排列：先基础设施，再外设）
+ * 初始化表（按依赖顺序排列：基础设施 → 显示链路 → 测量链路）
  *
- * 顺序上有两条硬约束：
+ * v0.6.9 顺序调整：把显示链路（lcd/touch/lvgl_port/imu/orientation）
+ * 提前到第 9~13 步，屏幕点亮后立即显示启动页；文件系统、电池、温湿度、
+ * ADS131M02、测量服务（14~18 步）在启动页可见后再初始化，进度条能反映
+ * 真实过程。启动页中文字体已改为编进固件的极小子集（不依赖 SPIFFS），
+ * 因此 fs_storage 可以后移——它只服务全量字库的后台加载任务。
+ *
+ * 顺序上的硬约束：
  *   1. event_bus 必须最先——其他模块要靠它通信；
- *   2. status_led 必须早于 system_state / device_ctrl——
- *      状态机初始化时会广播状态，device_ctrl 收到后要立刻设置指示灯，
- *      所以指示灯驱动必须已经就绪。
+ *   2. status_led / buzzer / settings 必须早于 device_ctrl——
+ *      device_ctrl 初始化时会广播状态并读取用户配置；
+ *   3. button 必须早于 UI 任务——task_ui 启动时立即注册按键回调；
+ *   4. lcd / touch 必须早于 lvgl_port（显示、输入设备）；
+ *   5. imu 与 lvgl_port 必须早于 orientation（方向判断与软件旋转）；
+ *   6. fs_storage 必须早于 lvgl_port_start_font_load()（全量字库在 SPIFFS），
+ *      该调用发生在 app_tasks_start()，晚于本表全部步骤；
+ *   7. ads131m02 必须早于 power_measure；
+ *   8. power_measure 必须早于 app_tasks_start 中的测量任务启动。
  *
- * 另外两条来自"先有数据、再有展示"的自然依赖：
- *   3. 传感器 / 测量前端的初始化要早于显示与交互（界面只是把 data_store
- *      的数据显示出来，先把数据链路准备好）；
- *   4. ads131m02 是本设备的核心测量前端，用 SYSTEM_FAULT_ADC（关键位），
- *      其余外设（按键 / 电池 / 温湿度 / 加速度计）失败只降级，不进 FAULT。
+ * 故障分级保持不变：ads131m02/power_measure 用 SYSTEM_FAULT_ADC（关键位），
+ * 其余外设失败只降级，不进 FAULT。
  */
 static const init_step_t s_boot_steps[] = {
     /* ---- 软件基础设施 ---- */
     /* 事件总线：整个框架的通信基础，坏了系统就没法工作 → 关键 */
-    { "event_bus", event_bus_init, SYSTEM_FAULT_INFRA },
+    { "event_bus", "系统总线", event_bus_init, SYSTEM_FAULT_INFRA, false },
     /* 指示灯：坏了只是看不到指示，测量功能不受影响 → 非关键 */
-    { "status_led", status_led_init, SYSTEM_FAULT_LED },
+    { "status_led", "状态指示", status_led_init, SYSTEM_FAULT_LED, false },
     /* 蜂鸣器：同上，属于可选的提示外设 → 非关键。
      * 注意位置：必须排在 device_ctrl 之前，因为 device_ctrl 初始化时
      * 会立即按当前状态同步一次输出（包含设置蜂鸣器报警），
      * 那时蜂鸣器必须已经就绪。 */
-    { "buzzer", buzzer_init, SYSTEM_FAULT_BUZZER },
-    { "system_state", system_state_init, SYSTEM_FAULT_INFRA },
+    { "buzzer", "蜂鸣器", buzzer_init, SYSTEM_FAULT_BUZZER, false },
+    { "system_state", "系统状态", system_state_init, SYSTEM_FAULT_INFRA, false },
 
     /* 配置持久化（NVS）：失败只是"记不住用户设置"，设备仍可正常测量，
      * 因此归为非关键。必须排在 device_ctrl 之前——device_ctrl 初始化时
      * 会读取已保存的配置来恢复蜂鸣器响度等用户偏好。 */
-    { "settings", settings_init, SYSTEM_FAULT_STORAGE },
+    { "settings", "配置存储", settings_init, SYSTEM_FAULT_STORAGE, false },
 
     /* 设备控制：负责把状态映射成指示灯与蜂鸣器动作 → 非关键 */
-    { "device_ctrl", device_ctrl_init, SYSTEM_FAULT_LED },
+    { "device_ctrl", "设备控制", device_ctrl_init, SYSTEM_FAULT_LED, false },
 
     /* ---- 数据通道 ---- */
     /* data_store 是测量结果通往 UI / 网页的必经通道，出问题等于没有数据可看，
      * 故用 INFRA（关键）而不是 STORAGE —— STORAGE 已归属真正的存储模块
      * settings，两者语义不同，不应混用同一个故障位。 */
-    { "data_store", data_store_init, SYSTEM_FAULT_INFRA },
+    { "data_store", "数据通道", data_store_init, SYSTEM_FAULT_INFRA, false },
 
-    /* ---- 传感器与测量前端 ----
-     * 这一组彼此之间没有依赖，排在数据通道之后、显示之前：
-     * 先把"数据怎么来"准备好，再启动"数据怎么显示"。 */
-    /* 按键（BOOT/USER）：坏了只是不能操作，测量不受影响 → 非关键 */
-    { "button", button_init, SYSTEM_FAULT_BUTTON },
+    /* 按键（BOOT/USER）：坏了只是不能操作，测量不受影响 → 非关键。
+     * 必须早于 UI 任务：task_ui 启动时会注册按键回调，也保证启动故障
+     * 弹窗期间按键能作为"确定"的备用通道。 */
+    { "button", "按键", button_init, SYSTEM_FAULT_BUTTON, false },
+
+    /* ---- 显示链路（v0.6.9：整体前移，尽早点亮屏幕） ---- */
+    /* LCD 面板（NV3030B，QSPI）：坏了只是"没有显示"，测量不受影响 → 非关键。
+     * 须先于 lvgl_port——LVGL 适配层要注册显示设备。 */
+    { "lcd_nv3030b", "显示屏", lcd_nv3030b_init, SYSTEM_FAULT_LCD, false },
+    /* 电容触摸（CST816D）：坏了只是"不能触控"，界面仍可显示 → 非关键。
+     * 触摸故障不阻止 UI 启动（见 app_tasks_start 的门控）。 */
+    { "touch_cst816d", "触摸屏", touch_cst816d_init, SYSTEM_FAULT_TOUCH, false },
+    /* LVGL 适配层：注册显示/输入设备并启动心跳，同时同步创建启动页嵌入
+     * 子库（不读 SPIFFS，几十毫秒）。失败则 UI 无法工作，故与 LCD 共用
+     * SYSTEM_FAULT_LCD 故障位，UI 启动门控据此判断。 */
+    { "lvgl_port", "图形界面", lvgl_port_app_init, SYSTEM_FAULT_LCD, false },
+    /* 加速度计 SC7A20H（I2C1）：坏了只是失去姿态判断 → 非关键。
+     * 必须早于 orientation，让启动页第一次上屏就是恢复后的方向。 */
+    { "imu_sc7a20h", "姿态传感器", imu_sc7a20h_init, SYSTEM_FAULT_IMU, false },
+    /* 重力自动旋转：IMU/LVGL 就绪后启动方向监测，并按 NVS 恢复方向模式。
+     * 非关键——失败只影响自动转屏，手动角度仍可用。
+     * start_ui_after=true：此步结束后 UI 任务立即创建并显示启动页，
+     * 让后面的文件系统/测量链路初始化过程对用户可见。 */
+    { "orientation", "屏幕方向", orientation_boot_restore, 0, true },
+
+    /* ---- 资源与测量链路（启动页可见后再初始化） ---- */
+    /* 资源文件系统：storage 分区挂为 /spiffs（全量中文字库在上面）。
+     * v0.6.9 后移到显示链路之后：启动页已用固件内嵌子集，不再依赖本步；
+     * 挂载失败只影响主界面字体（后台任务回退内置 ASCII），非关键。
+     * 必须早于 app_tasks_start() 里的 lvgl_port_start_font_load()。 */
+    { "fs_storage", "字库文件", fs_storage_init, SYSTEM_FAULT_STORAGE, false },
     /* 电池电压采样（ADC1 + 校准）：坏了只是看不到电量 → 非关键 */
-    { "battery_adc", battery_adc_init, SYSTEM_FAULT_BATTERY },
+    { "battery_adc", "电池检测", battery_adc_init, SYSTEM_FAULT_BATTERY, false },
     /* 温湿度 AHT20（I2C1，与 IMU 共享总线）：坏了只是少一项环境读数 → 非关键 */
-    { "aht20", aht20_init, SYSTEM_FAULT_ENV },
-    /* 加速度计 SC7A20H（I2C1，与 AHT20 共享总线）：坏了只是失去姿态判断 → 非关键 */
-    { "imu_sc7a20h", imu_sc7a20h_init, SYSTEM_FAULT_IMU },
+    { "aht20", "温湿度传感器", aht20_init, SYSTEM_FAULT_ENV, false },
     /* 测量前端 ADC（SPI3 独占）：整个设备的核心，坏了就没有测量数据，
      * 因此用 SYSTEM_FAULT_ADC —— 该位在 SYSTEM_FAULT_CRITICAL_MASK 中 → 关键 */
-    { "ads131m02", ads131m02_init, SYSTEM_FAULT_ADC },
+    { "ads131m02", "测量前端", ads131m02_init, SYSTEM_FAULT_ADC, false },
     /* 测量服务：载入 NVS 电能/标定、分配 PSRAM 波形缓冲（不启动任务，
      * 任务在 app_tasks_start 中于 Core1 启动）。它不可用 = 无法测量，
      * 与 ADC 同属关键位。 */
-    { "power_measure", power_measure_init, SYSTEM_FAULT_ADC },
-
-    /* ---- 显示与交互 ---- */
-    /* 资源文件系统：storage 分区挂为 /spiffs（UI 字体在上面）。
-     * 挂载失败不阻止显示（lvgl_port 会回退内置 ASCII 字体），非关键。
-     * 必须早于 lvgl_port——字体在 lvgl_port_init() 中从文件加载。 */
-    { "fs_storage", fs_storage_init, SYSTEM_FAULT_STORAGE },
-    /* LCD 面板（NV3030B，QSPI）：坏了只是"没有显示"，测量不受影响 → 非关键。
-     * 须先于 lvgl_port——LVGL 适配层要注册显示设备。 */
-    { "lcd_nv3030b", lcd_nv3030b_init, SYSTEM_FAULT_LCD },
-    /* 电容触摸（CST816D）：坏了只是"不能触控"，界面仍可显示 → 非关键。
-     * 触摸故障不阻止 UI 启动（见 app_tasks_start 的门控）。 */
-    { "touch_cst816d", touch_cst816d_init, SYSTEM_FAULT_TOUCH },
-    /* LVGL 适配层：注册显示/输入设备并启动心跳。失败则 UI 无法工作，
-     * 故与 LCD 共用 SYSTEM_FAULT_LCD 故障位，UI 启动门控据此判断。 */
-    { "lvgl_port", lvgl_port_app_init, SYSTEM_FAULT_LCD },
-
-    /* 重力自动旋转：IMU/LVGL 就绪后启动方向监测，并按 NVS 恢复方向模式。
-     * 非关键——失败只影响自动转屏，手动角度仍可用。 */
-    { "orientation", orientation_boot_restore, 0 },
+    { "power_measure", "测量服务", power_measure_init, SYSTEM_FAULT_ADC, false },
 };
 
 /** 初始化步骤个数 */
@@ -172,7 +193,8 @@ static inline bool is_critical_step(const init_step_t *step)
  *   巡检日志与用户实际操作体现。
  * ============================================================ */
 typedef struct {
-    const char *name;         /**< 自检项名，仅用于日志 */
+    const char *name;         /**< 自检项名，用于串口日志 */
+    const char *label;        /**< 启动页中文短名 */
     esp_err_t (*probe)(void); /**< 探测函数：真读到数据才算通过 */
     uint32_t fault_bit;       /**< 失败时记入的故障位 */
 } selftest_item_t;
@@ -243,11 +265,11 @@ static esp_err_t selftest_touch_cst816d(void)
 
 /** 自检表（顺序 = 报告顺序，关键项排在首位便于优先看到） */
 static const selftest_item_t s_selftest_items[] = {
-    { "ads131m02", selftest_ads131m02, SYSTEM_FAULT_ADC }, /* 关键：测量前端 */
-    { "aht20", selftest_aht20, SYSTEM_FAULT_ENV },
-    { "imu_sc7a20h", selftest_imu_sc7a20h, SYSTEM_FAULT_IMU },
-    { "battery_adc", selftest_battery_adc, SYSTEM_FAULT_BATTERY },
-    { "touch_cst816d", selftest_touch_cst816d, SYSTEM_FAULT_TOUCH },
+    { "ads131m02", "测量前端", selftest_ads131m02, SYSTEM_FAULT_ADC }, /* 关键：测量前端 */
+    { "aht20", "温湿度", selftest_aht20, SYSTEM_FAULT_ENV },
+    { "imu_sc7a20h", "姿态", selftest_imu_sc7a20h, SYSTEM_FAULT_IMU },
+    { "battery_adc", "电池", selftest_battery_adc, SYSTEM_FAULT_BATTERY },
+    { "touch_cst816d", "触摸", selftest_touch_cst816d, SYSTEM_FAULT_TOUCH },
 };
 
 /** 自检项个数 */
@@ -269,6 +291,13 @@ static bool run_selftest(bool *critical_failed)
     for (size_t i = 0; i < SELFTEST_COUNT; i++) {
         const selftest_item_t *item = &s_selftest_items[i];
         const bool critical = (item->fault_bit & SYSTEM_FAULT_CRITICAL_MASK) != 0;
+
+        /* 自检也计入启动进度：总步数 = 初始化步骤 + 自检项数。
+         * 即使当前项因初始化失败被跳过，也先把进度推进到该项。 */
+        char prog[48];
+        snprintf(prog, sizeof(prog), "自检 %s %u/%u", item->label, (unsigned)(i + 1),
+                 (unsigned)SELFTEST_COUNT);
+        ui_boot_set_progress(BOOT_STEP_COUNT + i, BOOT_STEP_COUNT + SELFTEST_COUNT, prog);
 
         /* 初始化阶段已登记过该模块故障 → 驱动未就绪，再探测只会重复报同一个错，
          * 徒增干扰，故跳过并把该项计为失败。 */
@@ -299,6 +328,11 @@ static bool run_selftest(bool *critical_failed)
         }
     }
 
+    /* 自检全部结束：进度到 100%，文字提示即将进入主界面。
+     * 真正的启动页收尾由 app_tasks_start() 的 ui_boot_finish() 触发。 */
+    ui_boot_set_progress(BOOT_STEP_COUNT + SELFTEST_COUNT,
+                         BOOT_STEP_COUNT + SELFTEST_COUNT, "正在启动应用…");
+
     *critical_failed = any_critical_failed;
 
     if (failed == 0) {
@@ -325,10 +359,21 @@ esp_err_t app_init_startup(void)
     }
     bool critical_failed = false;
 
+    /* 启动页进度总步数：初始化步骤 + 硬件自检项（自检阶段进度条也能继续走） */
+    const uint32_t progress_total = BOOT_STEP_COUNT + SELFTEST_COUNT;
+    const int64_t boot_t0 = esp_timer_get_time();
+
     ESP_LOGI(TAG, "开始系统初始化（共 %u 个步骤）", (unsigned)BOOT_STEP_COUNT);
 
     for (size_t i = 0; i < BOOT_STEP_COUNT; i++) {
         const init_step_t *step = &s_boot_steps[i];
+        char prog[48];
+
+        /* 启动页只显示共享快照，不直接碰 LVGL：执行前先告诉用户当前在初始化什么。
+         * 分母用 progress_total（含自检项），保证整段启动的文字计数一致。 */
+        snprintf(prog, sizeof(prog), "%s %u/%u", step->label, (unsigned)(i + 1),
+                 (unsigned)progress_total);
+        ui_boot_set_progress(i, progress_total, prog);
 
         /* 已经出现过致命故障时，跳过后续"关键"步骤：
          * 它们都依赖基础设施，继续尝试没有意义，还可能产生二次错误
@@ -336,33 +381,52 @@ esp_err_t app_init_startup(void)
          * 与潜在的救回通道（后续的 WiFi / 屏幕）。 */
         if (critical_failed && is_critical_step(step)) {
             ESP_LOGW(TAG, "跳过关键模块 %s（此前已发生致命故障）", step->name);
+            ui_boot_set_progress(i + 1, progress_total, prog); /* 跳过也要推进进度 */
             continue;
         }
 
+        const int64_t step_t0 = esp_timer_get_time();
         esp_err_t err = step->init();
+        const long long step_ms = (long long)((esp_timer_get_time() - step_t0) / 1000);
+        const long long total_ms = (long long)((esp_timer_get_time() - boot_t0) / 1000);
 
         if (err == ESP_OK) {
-            ESP_LOGI(TAG, "[%u/%u] %s 初始化成功", (unsigned)(i + 1), (unsigned)BOOT_STEP_COUNT,
-                     step->name);
-            continue;
-        }
-
-        if (is_critical_step(step)) {
+            ESP_LOGI(TAG, "[%u/%u] %s 初始化成功（+%lld ms，累计 %lld ms）",
+                     (unsigned)(i + 1), (unsigned)BOOT_STEP_COUNT, step->name, step_ms, total_ms);
+        } else if (is_critical_step(step)) {
             /* ---- 关键模块失败 ----
              * 尝试登记故障位。若失败发生在 system_state 之前，这一步会返回
              * ESP_ERR_INVALID_STATE，属预期内情况，故忽略其返回值——
              * 真正的原因由下面的错误日志与 main.c 的汇总日志体现。 */
-            ESP_LOGE(TAG, "[%u/%u] 关键模块 %s 初始化失败: %s", (unsigned)(i + 1),
-                     (unsigned)BOOT_STEP_COUNT, step->name, esp_err_to_name(err));
+            ESP_LOGE(TAG, "[%u/%u] 关键模块 %s 初始化失败: %s（+%lld ms，累计 %lld ms）",
+                     (unsigned)(i + 1), (unsigned)BOOT_STEP_COUNT, step->name,
+                     esp_err_to_name(err), step_ms, total_ms);
             critical_failed = true;
             (void)system_state_report_fault(step->fault_bit);
         } else {
             /* ---- 非关键模块失败：登记故障位，降级继续 ---- */
-            ESP_LOGW(TAG, "[%u/%u] 模块 %s 初始化失败: %s -> 系统降级运行", (unsigned)(i + 1),
-                     (unsigned)BOOT_STEP_COUNT, step->name, esp_err_to_name(err));
+            ESP_LOGW(TAG, "[%u/%u] 模块 %s 初始化失败: %s -> 系统降级运行"
+                          "（+%lld ms，累计 %lld ms）",
+                     (unsigned)(i + 1), (unsigned)BOOT_STEP_COUNT, step->name,
+                     esp_err_to_name(err), step_ms, total_ms);
             (void)system_state_report_fault(step->fault_bit);
         }
+
+        ui_boot_set_progress(i + 1, progress_total, prog);
+
+        /* ---- 显示链路已就绪：立即创建 UI 任务并显示启动页 ----
+         * 即使 orientation 失败（只影响自动转屏）也要启动 UI；
+         * 只有 LCD/LVGL 链路故障（SYSTEM_FAULT_LCD）时才跳过。 */
+        if (step->start_ui_after && (system_state_get_fault_mask() & SYSTEM_FAULT_LCD) == 0) {
+            esp_err_t uerr = ui_init();
+            if (uerr != ESP_OK) {
+                ESP_LOGE(TAG, "UI 任务创建失败: %s -> 无界面运行", esp_err_to_name(uerr));
+            }
+        }
     }
+
+    /* 初始化表结束，进入硬件自检；进度条继续按自检项前进 */
+    ui_boot_set_progress(BOOT_STEP_COUNT, progress_total, "硬件自检…");
 
     /* ---------- 阶段二：硬件自检 ----------
      * 初始化表跑完只说明"配置写下去了"，这里再"真读一次数据"确认器件可用。

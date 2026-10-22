@@ -69,6 +69,15 @@ static const char *TAG = "settings";
 #define SETTINGS_ALARM_I_LIMIT_DEF 5.0f
 #define SETTINGS_ALARM_P_LIMIT_DEF 50.0f
 
+/** 告警阈值上限（v0.6.9，与整机设计量程一致）
+ *   · 电压 90V：分压链路理论 ±121V，受辅助电源最高输入 100V 限制取 90V；
+ *   · 电流 70A：1mΩ/5W 分流器功率上限（XT60 额定 30A，换 XT90 底板可更高）；
+ *   · 功率 6300W：90V × 70A。
+ *  网页/API 与设备端 UI 都按同一组上限校验，越界整体拒绝。 */
+#define SETTINGS_ALARM_V_MAX 90.0f
+#define SETTINGS_ALARM_I_MAX 70.0f
+#define SETTINGS_ALARM_P_MAX 6300.0f
+
 /** 防抖时长（毫秒）：最后一次修改后静默这么久才真正写 Flash */
 #define SETTINGS_SAVE_DELAY_MS     1500
 
@@ -804,8 +813,13 @@ esp_err_t settings_set_alarm(const settings_alarm_t *in)
     if (!s_ready) {
         return ESP_ERR_INVALID_STATE;
     }
-    /* 校验：阈值必须是有限正数（拒绝 NaN/inf/≤0），非法输入整体拒绝保持原值 */
-    if (!(in->v_limit > 0.0f) || !(in->i_limit > 0.0f) || !(in->p_limit > 0.0f)) {
+    /* 校验：阈值必须是正数且不超过整机量程上限（拒绝 NaN/inf/≤0/越界），
+     * 非法输入整体拒绝保持原值。
+     * NaN 与 +inf 的判据：NaN 的任何比较均为 false，`!(x > 0)` 会命中；
+     * +inf 虽 >0，但 `x > MAX` 会命中——两条合起来即可过滤非有限值。 */
+    if (!(in->v_limit > 0.0f) || (in->v_limit > SETTINGS_ALARM_V_MAX) ||
+        !(in->i_limit > 0.0f) || (in->i_limit > SETTINGS_ALARM_I_MAX) ||
+        !(in->p_limit > 0.0f) || (in->p_limit > SETTINGS_ALARM_P_MAX)) {
         return ESP_ERR_INVALID_ARG;
     }
     settings_alarm_t norm = *in;

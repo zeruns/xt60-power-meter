@@ -115,7 +115,10 @@ static float wave_nice_div(float min_div, bool is_volt)
  * 内边距 20 ≈ 224。旧值 188 是加"曲线平滑"开关行之前的布局。 */
 #define PANEL_H 224
 #define SAFE_X 12          /**< 内容区左右安全边距（避屏幕圆角） */
-#define AXIS_LABEL_W 62    /**< 纵轴刻度标签宽（容得下 "19.98 V" 之类） */
+/** 纵轴刻度标签高度；宽度不再固定，改为 LV_SIZE_CONTENT 随文本自适应
+ *  （v0.6.9 需求：半透明底色只覆盖数字本身，避免固定 62px 遮罩长期占用
+ *   左右两侧的波形显示空间）。 */
+#define AXIS_LABEL_H 14
 
 /**
  * @brief 波形页布局几何（横/竖屏各一套；旋转重建时重新取值）
@@ -323,7 +326,8 @@ static void trim_num_tail(char *s)
  * 小数位按通道固定（V 2 位 / A 3 位 / W 1 位 / Wh 3 位）后再**去尾零**
  * （v0.6.8 需求 1）：3.00V→3V、0.200A→0.2A。刻度值锚定 1-2-5 标准格值，
  * 末位本来就是 0 才会多出来，去掉后读数更干净、不损失任何信息。
- * 刻度标签空间充足（AXIS_LABEL_W），宽度随内容收缩无溢出风险。
+ * 刻度标签宽度随文本自适应（LV_SIZE_CONTENT），底色只包住数字本身；
+ * 短刻度（如 "3 V"）不会留下大块半透明遮罩挡住波形。
  *
  * @param dst  输出缓冲
  * @param n    缓冲大小
@@ -1320,12 +1324,14 @@ static void chart_size_event_cb(lv_event_t *e)
     lv_obj_t *chart = lv_event_get_current_target(e);
     /* lv_obj_get_content_width/height：取对象内容区尺寸（不含 border/padding），
      * 刻度定位基于曲线实际绘制区域，故用 content 尺寸而非对象总宽高。 */
-    lv_coord_t w = lv_obj_get_content_width(chart);
     lv_coord_t h = lv_obj_get_content_height(chart);
     for (int k = 0; k < 3; k++) {
-        lv_coord_t y = (k == 0) ? -3 : (k == 1) ? (h - 14) / 2 : (h - 11);
-        lv_obj_set_pos(s_axis_a[k], 0, y);            /* 左刻度贴左缘 */
-        lv_obj_set_pos(s_axis_b[k], w - AXIS_LABEL_W, y); /* 右刻度贴右缘 */
+        lv_coord_t y = (k == 0) ? -3 : (k == 1) ? (h - AXIS_LABEL_H) / 2 : (h - 11);
+        /* 标签宽度是 LV_SIZE_CONTENT（随文本变化），不能再按固定宽度算右缘。
+         * 改用对齐：左列贴内容区左缘、右列贴右缘，LVGL 会在标签宽度变化后
+         * 自动重新对齐，半透明底色始终只包住数字本身。 */
+        lv_obj_align(s_axis_a[k], LV_ALIGN_TOP_LEFT, 0, y);
+        lv_obj_align(s_axis_b[k], LV_ALIGN_TOP_RIGHT, 0, y);
     }
 }
 
@@ -1573,7 +1579,7 @@ void screen_wave_create(lv_obj_t *tile)
      * 暗灰 1px，降低视觉密度——DSO Nano 等小屏示波器的通用密度。 */
     lv_chart_set_div_line_count(s_chart, 5, 9);
     lv_obj_set_style_pad_left(s_chart, 4, 0);  /* 曲线铺满宽度，Y 轴刻度浮于其上 */
-    lv_obj_set_style_pad_right(s_chart, 4, 0); /* （原 AXIS_LABEL_W+4 让出两侧，波形被挤压） */
+    lv_obj_set_style_pad_right(s_chart, 4, 0); /* 刻度改为自适应宽度后仍贴边浮于曲线上 */
     lv_obj_set_style_pad_top(s_chart, 5, 0);
     lv_obj_set_style_pad_bottom(s_chart, 5, 0);
     /* 黑底 + 暗灰格线（示波器风格，见 COL_WAVE_BG 注释） */
@@ -1603,11 +1609,13 @@ void screen_wave_create(lv_obj_t *tile)
     lv_chart_set_all_values(s_chart, s_ser_a, LV_CHART_POINT_NONE);
     lv_chart_set_all_values(s_chart, s_ser_b, LV_CHART_POINT_NONE);
 
-    /* 轴刻度（上/中/下 × 左/右），浮于曲线之上：深色半透底保证黑底上可读 */
+    /* 轴刻度（上/中/下 × 左/右），浮于曲线之上：深色半透底保证黑底上可读。
+     * 宽度用 LV_SIZE_CONTENT：底色随刻度文本（"3 V" / "19.98 V"）自适应，
+     * 不再固定 62px 占用左右波形区；右列由 chart_size_event_cb 右对齐。 */
     const lv_font_t *f12 = lvgl_port_get_font(LVGL_PORT_FONT_12);
     for (int k = 0; k < 3; k++) {
         s_axis_a[k] = lv_label_create(s_chart);
-        lv_obj_set_size(s_axis_a[k], AXIS_LABEL_W, 14);
+        lv_obj_set_size(s_axis_a[k], LV_SIZE_CONTENT, AXIS_LABEL_H);
         lv_obj_set_style_text_font(s_axis_a[k], f12, 0);
         lv_obj_set_style_pad_hor(s_axis_a[k], 2, 0);
         lv_label_set_text(s_axis_a[k], "--");
@@ -1617,7 +1625,7 @@ void screen_wave_create(lv_obj_t *tile)
         lv_obj_set_scrollable(s_axis_a[k], false);
 
         s_axis_b[k] = lv_label_create(s_chart);
-        lv_obj_set_size(s_axis_b[k], AXIS_LABEL_W, 14);
+        lv_obj_set_size(s_axis_b[k], LV_SIZE_CONTENT, AXIS_LABEL_H);
         lv_obj_set_style_text_font(s_axis_b[k], f12, 0);
         lv_obj_set_style_pad_hor(s_axis_b[k], 2, 0);
         lv_obj_set_style_text_align(s_axis_b[k], LV_TEXT_ALIGN_RIGHT, 0);
