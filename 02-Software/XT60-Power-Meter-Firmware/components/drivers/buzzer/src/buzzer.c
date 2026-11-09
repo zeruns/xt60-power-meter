@@ -188,6 +188,9 @@ static uint32_t s_tone_gen_expected = 0;
  */
 static uint32_t current_duty(void)
 {
+    /* portENTER_CRITICAL / portEXIT_CRITICAL：临界区，进入后中断与任务切换被
+     * 暂时屏蔽，保证这几行共享变量的读写不会被打断。临界区必须极短，
+     * 且不能调用任何可能阻塞的 API（如延时、信号量、日志）。 */
     portENTER_CRITICAL(&s_lock);
     uint8_t volume = s_volume_percent;
     portEXIT_CRITICAL(&s_lock);
@@ -235,6 +238,7 @@ static void sound_off(void)
  */
 static void sound_for(uint32_t on_ms)
 {
+    /* portMAX_DELAY = 无限等待，直到拿到互斥锁为止（这里不能放弃发声） */
     xSemaphoreTake(s_sound_mutex, portMAX_DELAY);
 
     /* 推进代际：本轮发声从现在开始算新一代，此前任何迟到回调都失效 */
@@ -340,7 +344,10 @@ esp_err_t buzzer_init(void)
         return ESP_ERR_NO_MEM;
     }
 
-    /* ---- 创建两个定时器 ---- */
+    /* ---- 创建两个定时器 ----
+     * esp_timer_create：创建软件定时器，callback 默认由 esp_timer 任务调用
+     * （不是中断上下文），因此回调里可以打日志、取信号量。
+     * 定时精度与时间参数单位都是「微秒」，故启动时 ms × 1000。 */
     const esp_timer_create_args_t tone_timer_cfg = {
         .callback = s_tone_timer_callback,
         .arg = NULL,

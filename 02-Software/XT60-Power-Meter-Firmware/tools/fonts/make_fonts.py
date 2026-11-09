@@ -4,8 +4,8 @@ make_fonts.py — 生成 SPIFFS 用中文字体子集（Regular + Bold）
 
 数据源：Noto Sans SC（SIL OFL 1.1 开源授权）可变 TTF（google/fonts 仓库）。
 流程：下载 VF → 按字重实例化（500/700，见 WEIGHTS 注释）→ 子集化
-（ASCII + CJK 标点 + 全角符号 + **GB2312 一级+二级 6763 汉字** + components/
-源码里出现的所有字符）→ 输出到 fs_storage/spiffs_image/fonts/。
+（ASCII + CJK 标点 + 全角符号 + **GB2312 一级+二级 6763 汉字** + 常用符号/单位
++ components/ 源码里出现的所有字符）→ 输出到 fs_storage/spiffs_image/fonts/。
 
 产出体积（v0.6.5 实测）：约 7078 码点 / 7075 字形，单字重约 2.09MB、两字重约 4.18MB；
 storage 分区可用 7346KB，烧录后已用约 4208KB（剩余约 3.1MB）。
@@ -39,7 +39,7 @@ VF_URLS = [
 VF_CACHE = os.path.join(CACHE_DIR, "NotoSansSC-VF.ttf")
 
 # (输出文件名, 字重)
-# ⚠ "reg" 实际取 500（Medium）而不是 400（Regular）：本机是 2.4 寸高亮 IPS，
+# ⚠ "reg" 实际取 500（Medium）而不是 400（Regular）：本机是 240×284 高亮 IPS 屏，
 #   12~16px 的 Regular 笔画偏细，在强背光下看起来发虚；Medium 笔画略粗，
 #   同样的 AA 渲染下观感明显更清晰（见 tools/ui_preview 的对比图）。
 WEIGHTS = [("notosc_reg.ttf", 500), ("notosc_bold.ttf", 700)]

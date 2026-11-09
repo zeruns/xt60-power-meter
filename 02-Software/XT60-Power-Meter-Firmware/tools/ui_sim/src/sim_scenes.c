@@ -9,6 +9,9 @@
  * 点击目标用**文本语义查找**（find_text），避免硬编码坐标：
  * 先在屏幕与顶层图层里按文本找 label，再向上找可点击祖先、
  * 滚动到可见后取中心点点击 —— 与真人手指操作等价且更稳。
+ *
+ * 回归判定：控制台不得出现 `[scene] !!` 告警（tools/ci/run_ci.ps1 会检查），
+ * 出现即说明某个按钮/文本在当前布局下点不到或未按预期响应。
  */
 #include "sim.h"
 
@@ -686,7 +689,7 @@ void sim_run_scenes(void)
     ui_nav_refresh(sim_get_measurement());
     shot("29_measure_270");
 
-    rotate_to_angle(90, 1); /* 竖屏波形页：图表加高到 170 */
+    rotate_to_angle(90, 1); /* 竖屏波形页：图表加高到 166（见 screen_wave 的竖屏几何） */
     ui_nav_refresh(sim_get_measurement());
     shot("30_wave_90");
 
@@ -701,14 +704,14 @@ void sim_run_scenes(void)
     /* K2 长按打开（真机由 ui_nav 路由；场景直接投递等价事件） */
     ui_nav_handle_key(BUTTON_ID_USER, BUTTON_EVENT_LONG_PRESS_START);
     sim_step(200);
-    shot("24_measure_menu"); /* 初始焦点在「清除电能统计数据」行（橙边） */
+    shot("24_measure_menu"); /* 初始焦点在「清除电能统计数据」行（焦点框为品牌蓝，首次按键后才显示） */
 
     /* K2 单击：焦点下移到「数据刷新率」行 */
     ui_nav_handle_key(BUTTON_ID_USER, BUTTON_EVENT_SINGLE_CLICK);
     sim_step(150);
     shot("25_measure_menu_focus_rate");
 
-    /* K2 双击：激活焦点行 → 刷新率 5Hz → 10Hz（循环） */
+    /* K2 双击：激活焦点行 → 刷新率在 1/5/10/20/30Hz 间循环（当前 5Hz → 10Hz） */
     ui_nav_handle_key(BUTTON_ID_USER, BUTTON_EVENT_DOUBLE_CLICK);
     sim_step(200);
     shot("26_measure_menu_10hz");
@@ -786,7 +789,7 @@ void sim_run_scenes(void)
     shot("23_settings_final");
 
     /* ============================================================
-     * v0.6.0 新增场景：WiFi 页改版 + 状态栏信号条 + 数字键盘
+     * v0.6.0 新增场景：WiFi 页改版 + 状态栏 WiFi 图标 + 数字键盘
      * ============================================================ */
 
     /* ---- WiFi 页：模式三档 + 扫描列表 + 密码键盘 ---- */
@@ -833,25 +836,25 @@ void sim_run_scenes(void)
     ensure_page(2);
     close_subpage_if_open();
 
-    /* ---- 状态栏 WiFi 信号条四态（测量页截图即可看到状态栏） ---- */
+    /* ---- 状态栏 WiFi 图标四态（测量页截图即可看到状态栏） ---- */
     ensure_page(0);
     mock_wifi_set_state(WIFI_MANAGER_STATE_CONNECTED);
-    mock_wifi_set_rssi(-52); /* 强信号 → 4 格绿 */
+    mock_wifi_set_rssi(-52); /* 强信号（≥-60dBm）→ 绿色图标 */
     ui_nav_refresh(sim_get_measurement());
     sim_step(250);
     shot("36_wifi_bar_connected");
-    mock_wifi_set_rssi(-85); /* 弱信号 → 1 格黄 */
+    mock_wifi_set_rssi(-85); /* 很差信号（<-80dBm）→ 红色图标 */
     ui_nav_refresh(sim_get_measurement());
     sim_step(250);
     shot("37_wifi_bar_weak");
     mock_wifi_set_state(WIFI_MANAGER_STATE_AP_MODE);
     ui_nav_refresh(sim_get_measurement());
     sim_step(250);
-    shot("38_wifi_bar_ap"); /* 配网热点 → 4 格蓝 */
+    shot("38_wifi_bar_ap"); /* 配网热点 → 蓝色图标 + "AP" 徽标 */
     mock_wifi_set_state(WIFI_MANAGER_STATE_FAILED);
     ui_nav_refresh(sim_get_measurement());
     sim_step(250);
-    shot("39_wifi_bar_off"); /* 未连接 → 全灰 */
+    shot("39_wifi_bar_off"); /* 未连接/失败 → 灰色图标 + 斜杠 */
     /* 还原成"已连接"给后续场景 */
     mock_wifi_set_state(WIFI_MANAGER_STATE_CONNECTED);
     mock_wifi_set_rssi(-52);

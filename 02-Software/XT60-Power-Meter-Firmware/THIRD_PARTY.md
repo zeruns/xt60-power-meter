@@ -1,7 +1,7 @@
 # 第三方组件许可清单
 
 本固件（MIT，见 [LICENSE](LICENSE)）在构建时会引入以下第三方组件。
-版本号以仓库根目录 `dependencies.lock` 为准（ESP 组件管理器锁定），
+版本号以本固件工程根目录的 `dependencies.lock` 为准（ESP 组件管理器锁定），
 字体版本以 `tools/fonts/make_fonts.py` 所用字体文件为准。
 
 | 组件 | 版本 | 许可证 | 来源 |
@@ -19,8 +19,9 @@
   Apache-2.0 许可，源码经 ESP 组件管理器下载到 `managed_components/`（不入库）。
   Apache-2.0 与本项目 MIT 兼容，再分发时需保留其 LICENSE 与 NOTICE 声明。
 - **Noto Sans SC**：Google Fonts 提供的开源中文字体，SIL OFL 1.1。
-  本项目用 `tools/fonts/make_fonts.py` 子集化后存入 storage 分区；启动页另有
-  `tools/fonts/make_splash_font.py` 生成的极小子集 C 数组（`lvgl_port/src/splash_font_data.c`）。
+  本项目用 `tools/fonts/make_fonts.py` 子集化后存入 storage 分区（主界面全量字库）；
+  启动页另有 `tools/fonts/make_splash_font.py` 生成的极小子集（约 197 字、34KB/字重）
+  C 数组（`components/middleware/lvgl_port/src/splash_font_data.c`），编入 app 分区。
   OFL 允许自由使用与再分发，但**不得单独出售字体**；修改/衍生字体亦须以 OFL 发布。
   许可全文：https://openfontlicense.org/
 - **ESP-IDF 及其内含组件**（FreeRTOS、esp-idf 各 driver 等）由乐鑫以 Apache-2.0 等许可提供，

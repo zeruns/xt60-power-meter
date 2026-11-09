@@ -2,8 +2,10 @@
  * @file mock_settings.c
  * @brief 配置服务 mock：内存缓存（模拟"防抖落盘"的最终效果）
  *
- * 与真机 settings 的行为差异：不做防抖定时器与 NVS，set 直接改内存并打日志；
- * UI 层的调用方式（set_xxx + save_now）与真机完全一致。
+ * 与真机 settings 的行为差异：不做防抖定时器与 NVS，set 直接改内存
+ * （部分接口只打日志、不校验就绪状态），落盘类接口仅返回成功；
+ * UI 层的调用方式（set_xxx + settings_request_save）与真机完全一致；
+ * settings_save_now（同步落盘）仍保留，供需要立即写盘的调用方使用。
  */
 #include "settings.h"
 
@@ -103,7 +105,7 @@ esp_err_t settings_set_wave_smooth(uint8_t on)
  *  这里一次性补齐，恢复"模拟 = 真机"的回归闭环）
  * ============================================================ */
 
-/** 告警阈值的模拟缓存（与真机一样是"内存 + 防抖落盘"） */
+/** 告警阈值的模拟缓存（真机为“内存 + 防抖落盘”，模拟器只保留内存语义） */
 static settings_alarm_t s_alarm = {
     .v_en = 1u,
     .i_en = 0u,

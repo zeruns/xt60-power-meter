@@ -9,7 +9,8 @@
  *   ① QSPI 总线 + panel IO + 背光；
  *   ② 通过官方组件 espressif/esp_lcd_spd2010 创建面板；
  *   ③ 注入厂商在本模组上验证过的初始化序列 s_lcd_init_cmds；
- *   ④ 刷确定底色、开背光；LVGL 刷屏走 lcd_nv3030b_draw_bitmap()。
+ *   ④ 刷确定底色（**不点背光**，留给上层在第一帧上屏后打开）；
+ *      LVGL 刷屏走 lcd_nv3030b_draw_bitmap()。
  *
  * ============================================================
  * 为什么用官方组件而不是自写命令序列
@@ -308,6 +309,10 @@ esp_err_t lcd_nv3030b_register_flush_done_cb(lcd_nv3030b_flush_done_cb_t cb, voi
  */
 static esp_err_t backlight_pwm_init(void)
 {
+    /* LEDC 分「定时器」和「通道」两层：
+     *   timer   决定 PWM 频率（freq_hz=5kHz）与占空比分辨率（10bit → 0~1023）；
+     *   channel 决定用哪个定时器、输出到哪个 GPIO、初始占空比。
+     * 4 个通道可共用同一 timer，本工程背光独用 timer1 / channel1。 */
     const ledc_timer_config_t timer_cfg = {
         .speed_mode = BL_LEDC_MODE,
         .duty_resolution = BL_LEDC_RES,
@@ -460,13 +465,25 @@ esp_err_t lcd_nv3030b_init(void)
         .data3_io_num = BOARD_PIN_LCD_SDIO3,
         .max_transfer_sz = LCD_MAX_TRANSFER_SZ,
     };
+    /* spi_bus_initialize：初始化一条 SPI 主机总线；第三个参数 SPI_DMA_CH_AUTO
+     * 表示让驱动自动挑一个空闲 DMA 通道（显存数据走 DMA 才不会占用 CPU）。 */
     err = spi_bus_initialize(LCD_QSPI_HOST, &bus_cfg, SPI_DMA_CH_AUTO);
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "QSPI 总线初始化失败: %s", esp_err_to_name(err));
         return err;
     }
 
-    /* ---- ③ 建 panel IO（QSPI） ---- */
+    /* ---- ③ 建 panel IO（QSPI） ----
+     * 关键字段含义（初学者容易混淆）：
+     *   cs_gpio_num        ：片选脚，esp_lcd 每次事务自动拉低/拉高；
+     *   dc_gpio_num = -1   ：QSPI 没有独立的「命令/数据」选择脚，
+     *                        命令与参数靠 32bit 命令字里的 opcode 区分；
+     *   spi_mode = 3       ：SCLK 空闲高电平，第二个边沿采样（本面板要求）；
+     *   pclk_hz            ：写显存时钟（见 LCD_QSPI_PCLK_HZ 的实测说明）；
+     *   trans_queue_depth  ：异步事务队列深度，决定最多可排队几个刷屏请求；
+     *   on_color_trans_done：颜色 DMA 真正结束时在 SPI 中断里回调（见其实现）；
+     *   lcd_cmd_bits/param_bits：命令字 32bit、参数 8bit 的线上宽度；
+     *   quad_mode          ：4 根数据线并行收发（QSPI）。 */
     const esp_lcd_panel_io_spi_config_t io_cfg = {
         .cs_gpio_num = BOARD_PIN_LCD_CS,
         .dc_gpio_num = -1,
@@ -607,6 +624,8 @@ esp_err_t lcd_nv3030b_set_backlight(uint8_t percent)
     }
 
     uint32_t duty = (uint32_t)percent * BL_DUTY_MAX / 100U;
+    /* ledc_set_duty 只把占空比写进影子寄存器，ledc_update_duty 才让它生效，
+     * 两步必须成对调用（否则亮度不会变化）。 */
     esp_err_t err = ledc_set_duty(BL_LEDC_MODE, BL_LEDC_CHANNEL, duty);
     if (err != ESP_OK) {
         return err;

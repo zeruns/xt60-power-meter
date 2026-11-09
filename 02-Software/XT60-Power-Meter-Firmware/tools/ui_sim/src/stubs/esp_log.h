@@ -1,6 +1,9 @@
 /**
  * @file esp_log.h
- * @brief 模拟器桩：ESP-IDF 日志宏 → 标准输出（保持与真机相同的格式便于对照）
+ * @brief 模拟器桩：ESP-IDF 日志宏 → 标准输出（保留级别前缀与 tag 便于对照）
+ *
+ * 简化点：没有时间戳与颜色；ERROR 走 stderr，其余级别走 stdout，
+ * DEBUG/VERBOSE 直接编译为空语句。
  */
 #pragma once
 

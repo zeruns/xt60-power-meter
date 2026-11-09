@@ -4,10 +4,11 @@
  *
  * 与真机（components/middleware/lvgl_port/src/lvgl_port.c）保持一致的地方：
  *   · 同一份 Noto Sans SC TTF（notosc_reg / notosc_bold）用 lv_tiny_ttf 建
- *     7 档字号 × 2 字重 —— 字形光栅化结果与真机相同；
+ *     8 档字号 × 2 字重 —— 字形光栅化结果与真机相同；
  *   · fallback 挂 montserrat_14（图标符号走回退链，与真机一致）；
  *   · 用 16px Noto 重建默认主题（msgbox/roller 等控件默认字体一致）；
- *   · 旋转切换同步 LVGL 分辨率（真机另写面板 MADCTL，模拟器无需）。
+ *   · 旋转切换同步 LVGL 逻辑分辨率（真机面板方向固定，同样靠 LVGL 软件旋转，
+ *     运行期不写 MADCTL）。
  */
 #include "lvgl_port.h"
 
@@ -77,7 +78,12 @@ static uint8_t *read_file(const char *path, size_t *out_len)
     return buf;
 }
 
-/** @brief 加载中文字体（与真机 load_fonts 相同的构建方式） */
+/**
+ * @brief 加载中文字体（与真机 load_fonts 相同的构建方式）
+ *
+ * 真机在后台任务里加载并逐字号取 LVGL 锁；模拟器是单线程，直接同步加载。
+ * 两条路径用同一份 TTF 与同一组像素高度，所以字形位图一致。
+ */
 static void load_fonts(void)
 {
     const struct {

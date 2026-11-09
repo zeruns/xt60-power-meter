@@ -587,7 +587,7 @@ esp_err_t settings_get(settings_t *out)
         return ESP_ERR_INVALID_STATE;
     }
 
-    /* 结构体很小（目前 1 字节），用临界区拷贝即可保证一致性，
+    /* 结构体很小（目前约 10 字节），用临界区拷贝即可保证一致性，
      * 不必引入互斥锁 */
     portENTER_CRITICAL(&s_lock);
     *out = s_cache;
@@ -798,7 +798,7 @@ esp_err_t settings_get_alarm(settings_alarm_t *out)
     if (!s_ready) {
         return ESP_ERR_INVALID_STATE;
     }
-    /* 缓存读取与 set 竞争，短临界区拷一份（24 字节，几条指令） */
+    /* 缓存读取与 set 竞争，短临界区拷一份（约 16 字节，几条指令） */
     portENTER_CRITICAL(&s_lock);
     *out = s_alarm_cache;
     portEXIT_CRITICAL(&s_lock);

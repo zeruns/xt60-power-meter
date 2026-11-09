@@ -31,7 +31,7 @@
 │   lvgl/lvgl · espressif/esp_lvgl_port                │
 │   espressif/esp_lcd_spd2010                          │
 ├─────────────────────────────────────────────────────┤
-│ ESP-IDF v5.5+（开发基线 v6.1）· FreeRTOS · ESP32-S3   │
+│ ESP-IDF v6.1（开发基线）· FreeRTOS · ESP32-S3         │
 └─────────────────────────────────────────────────────┘
 ```
 
@@ -128,7 +128,8 @@ SYSTEM_FAULT_CRITICAL_MASK = SYSTEM_FAULT_ADC | SYSTEM_FAULT_INFRA
 
 ### 初始化表
 
-`main/app_init.c` 用一张表描述启动步骤，每项登记自己的故障位（下表为真实内容，共 18 项）：
+`main/app_init.c` 用一张表描述启动步骤，每项登记自己的故障位（下表为真实内容，共 18 项；
+为便于阅读省略了 `label`（启动页中文短名）与 `start_ui_after` 两个字段）：
 
 ```c
 static const init_step_t s_boot_steps[] = {
@@ -142,7 +143,7 @@ static const init_step_t s_boot_steps[] = {
     /* 数据通道 */
     { "data_store",    data_store_init,    SYSTEM_FAULT_INFRA   },  /* 关键 */
     { "button",        button_init,        SYSTEM_FAULT_BUTTON  },
-    /* 显示链路（v0.6.9 前移：尽早点亮屏幕；使用固件内嵌启动页子库） */
+    /* 显示链路（v0.6.9 前移：尽早点亮屏幕；使用固件内嵌启动页子集） */
     { "lcd_nv3030b",   lcd_nv3030b_init,   SYSTEM_FAULT_LCD     },
     { "touch_cst816d", touch_cst816d_init, SYSTEM_FAULT_TOUCH   },
     { "lvgl_port",     lvgl_port_app_init, SYSTEM_FAULT_LCD     },
@@ -159,7 +160,7 @@ static const init_step_t s_boot_steps[] = {
 
 容错规则：
 
-- **关键步骤失败**（故障位命中 `CRITICAL_MASK`，即 `SYSTEM_FAULT_ADC` 与 `SYSTEM_FAULT_INFRA`）→ 跳过后续关键步骤，但**继续执行非关键步骤**（尽量保住屏幕 / WiFi 这些"救回通道"），最终进入 `FAULT` 状态且**不复位**；
+- **关键步骤失败**（故障位命中 `CRITICAL_MASK`，即 `SYSTEM_FAULT_ADC` 与 `SYSTEM_FAULT_INFRA`）→ 跳过后续关键步骤，但**继续执行非关键步骤**（尽量保住屏幕 / WiFi 这些"救回通道"），最终**停在 `INIT` 状态**（未调用 `system_state_start_running()`，不推导为 `FAULT`）且**不复位**；
 - **非关键步骤失败** → 只登记故障位，系统降级继续运行。
 
 顺序约束（改表时必须保持）：
@@ -181,7 +182,7 @@ static const init_step_t s_boot_steps[] = {
 `ui_boot_set_progress(已完成, 总步数, 中文短名)` 写入共享快照（总步数 =
 18 个初始化步骤 + 5 个自检项），UI 任务在 LVGL 锁内渲染进度条与文字。
 
-**启动页字体（v0.6.9）**：启动页文案只需要约 200 个字（品牌、版本、
+**启动页字体（v0.6.9）**：启动页文案只需要约 197 个字（品牌、版本、
 18 个初始化短名、5 个自检项），`tools/fonts/make_splash_font.py` 把
 `app_init.c` 的 label 与 `splash.c` 的字符串自动收集成**极小子集**
 （约 34KB/字重），生成 `components/middleware/lvgl_port/src/splash_font_data.c`
@@ -189,14 +190,14 @@ static const init_step_t s_boot_steps[] = {
 12/14/16px 常规 + 40px 粗体四个实例（实测仅 4ms），**不依赖 SPIFFS**，
 因此启动页第一帧就是完整中文。子集创建失败时才回退 ASCII 文案。
 
-主界面用的全量字库（4MB TTF + 16 个字号实例）加载约 3.3s，仍为**后台异步**：
+主界面用的全量字库（两套 TTF 共约 4.2MB + 16 个字号实例）加载约 3.3s，仍为**后台异步**：
 `app_tasks_start()` 在测量任务启动后调用 `lvgl_port_start_font_load()`
 拉起字库任务（内部 RAM 栈，SPIFFS 读取会短暂关闭 cache）。启动页自身
 不等它；但 UI 任务必须等到 `ui_boot_finish()` 且 `lvgl_port_fonts_ready()`
 都为真才构建主界面，避免整页中文变方框。启动页最少显示 600ms，
 全量字体异常时 15s 后降级为 ASCII 进入主界面。
 
-实测启动时间线（v0.6.9，横屏）：启动页子库 4ms 创建完成、屏幕约 **1.06~1.09s**
+实测启动时间线（v0.6.9，横屏）：启动页子集 4ms 创建完成、屏幕约 **1.06~1.09s**
 点亮（较调整前 1.42s 提前）；全量字库 3.3s，主界面约 **5.3s** 构建完成。
 
 ### 启动自检（阶段二）
@@ -210,7 +211,7 @@ I2C 器件地址对但时序不对（能应答、读不出有效数据）；SPI 
 
 | 自检项 | 探测方式 | 故障位 | 关键 |
 |---|---|---|---|
-| `ads131m02` | `ads131m02_read()` 能读到一帧 | `SYSTEM_FAULT_ADC` | **是** |
+| `ads131m02` | `ads131m02_selftest()`（器件 ID + GAIN1 回读 + 连续帧非全 0） | `SYSTEM_FAULT_ADC` | **是** |
 | `aht20` | `aht20_read()` 且读数落在合理量程内 | `SYSTEM_FAULT_ENV` | 否 |
 | `imu_sc7a20h` | `imu_sc7a20h_get_orientation()` | `SYSTEM_FAULT_IMU` | 否 |
 | `battery_adc` | `battery_adc_read()` | `SYSTEM_FAULT_BATTERY` | 否 |
@@ -221,7 +222,7 @@ I2C 器件地址对但时序不对（能应答、读不出有效数据）；SPI 
 
 判定与听觉反馈：
 
-- **关键项失败** → 登记故障位、**不进入运行态**（状态保持 `FAULT`）、**不短鸣**；
+- **关键项失败** → 登记故障位、**不进入运行态**（状态停在 `INIT`）、**不短鸣**；
 - **非关键项失败** → 登记故障位、以 `DEGRADED` 进入运行态、**不短鸣**；
 - **全部通过** → 进入运行态并**短鸣一声**。
 
@@ -264,8 +265,8 @@ ESP32-S3 双核。ESP-IDF 默认把 WiFi 任务钉在 Core 0，因此按"通信�
 
 测量核以 40 Hz 写入（每 25ms 显示子窗写一次快照）、交互核约 30 Hz 读取。直觉做法是加锁，但有两个问题：
 
-- 测量核不能被阻塞（2 ms 样本周期很紧，等锁会破坏采样时序）；
-- 快照是 24 字节的结构体，**多字节读写没有原子性**。
+- 测量核不能被阻塞（250 µs 样本周期很紧，等锁会破坏采样时序）；
+- 快照是 68 字节（17 个字段）的结构体，**多字节读写没有原子性**。
 
 第二点的危害很隐蔽：读者可能在写者刚写完电压、还没写电流时读走整份数据，得到"新电压配旧电流"的错乱组合，算出的功率瞬间跳变 —— UI 上表现为曲线毛刺，且极难复现。这称为**数据撕裂（data tearing）**。
 
@@ -346,8 +347,8 @@ Kconfig  ← 出厂默认值（首次上电 / NVS 损坏时使用）
 
 | 层 | 内容 | 位置 |
 |---|---|---|
-| 底层（已完成） | 纯算法：24 位补码符号扩展、标定换算、功率、电能积分 | `components/services/power_measure/src/power_calc.c`，测试在 `test/host/` |
-| 中层（待补） | 驱动寄存器解析逻辑，用桩件模拟总线 | `test/target/` |
+| 底层（已完成） | 纯算法：24 位补码符号扩展、标定换算、功率、电能积分；按键状态机；AHT20 CRC8 与量程钳制 | `components/services/power_measure/src/power_calc.c`、`components/drivers/key_button/src/button_fsm.c`、`components/drivers/aht20/src/aht20_calc.c`，测试在 `test/host/` |
+| 中层（待补） | 驱动寄存器解析逻辑，用桩件模拟总线 | `test/target/`（规划中，尚未创建） |
 | 顶层 | 整机联调 | 上板 |
 
 `power_calc.c` **不包含任何 ESP-IDF 头文件**，因此可在 PC 上直接编译测试：
@@ -360,8 +361,8 @@ gcc -std=c11 -Wall -Wextra -I components/services/power_measure/include \
 
 或使用 `test/host/run_host_tests.ps1`（自动寻找编译器；无编译器时提示并跳过）。
 
-> 注意：本机未安装主机端编译器（只有 ESP-IDF 的 xtensa 交叉工具链），
-> 因此该测试目前只做过语法校验，尚未实际运行。装上 gcc / clang 后即可执行。
+> 注意：脚本按 `gcc` → `clang` → `tcc` 顺序查找主机端编译器，找不到时提示并跳过（退出码 0）。
+> 建议开发机上装一个（如 MSYS2 / MinGW-w64）以便提交前实际跑一遍。
 
 ---
 
@@ -380,10 +381,11 @@ gcc -std=c11 -Wall -Wextra -I components/services/power_measure/include \
 | 崩溃取证 | coredump 写 Flash，panic 后延时 3 秒复位 | 野外设备唯一的崩溃定位手段 |
 | 控制台 | USB-Serial/JTAG | 烧录与日志共用一根 USB 线 |
 
-**不要开启 `CONFIG_NEWLIB_NANO_FORMAT`** —— 精简版格式化不支持 `%f`，
+**不要开启 `CONFIG_LIBC_NEWLIB_NANO_FORMAT`** —— 精简版格式化不支持 `%f`，
 会导致日志里的浮点测量值打印为空或乱码（当前配置已确认关闭）。
 
-**关于任务栈与 PSRAM**：`CONFIG_SPIRAM_ALLOW_STACK_EXTERNAL_MEMORY` 保持开启（IDF 默认），
+**关于任务栈与 PSRAM**：`CONFIG_FREERTOS_TASK_CREATE_ALLOW_EXT_MEM` 保持开启（IDF 默认，
+旧名 `CONFIG_SPIRAM_ALLOW_STACK_EXTERNAL_MEMORY`），
 它允许把任务栈放进 PSRAM 以节省内部 RAM。但**中断服务程序运行在当前任务栈上，
 且中断期间不能访问 PSRAM**，因此凡可能被中断打断时正在使用的任务
 （尤其测量采样任务），其栈必须在内部 RAM —— 创建时不要传 `MALLOC_CAP_SPIRAM`。
@@ -430,7 +432,7 @@ WS 10Hz 推送缓冲压进仅剩 ~19KB 的内部 RAM，碎片化耗尽后 `lv_ma
 | 外设 | 建议 | 原因 |
 |---|---|---|
 | LCD（NV3030B，QSPI） | 用 ESP32-S3 的 LCD 外设 + `esp_lcd`（占用 **SPI2**），**不要用 GPIO 模拟** | 硬件加速，省 CPU；LVGL 官方有现成后端 |
-| ADS131M02（SPI） | 独占 **SPI3** | 测量链路不能被其他设备插入事务打断。**为什么不是 SPI2**：SPI2 已被 LCD QSPI 占用，而 ESP32-S3 的一个 SPI 外设同一时刻只能映射一组引脚（LCD 在 IO15~18、ADC 在 IO9~12，无法共存）；「独占」的本意是"不被打断"，不是字面上的外设编号 |
+| ADS131M02（SPI） | 独占 **SPI3** | 测量链路不能被其他设备插入事务打断。**为什么不是 SPI2**：SPI2 已被 LCD QSPI 占用（CS15 / SCK18 / D0-16 / D1-17，D2/D3 为 IO3/IO8），ADC 在 IO9~12，同一 SPI 外设无法同时映射两组引脚；「独占」的本意是"不被打断"，不是字面上的外设编号 |
 | 触摸 CST816D | I2C（IO5/IO6） | 独立总线，避免与传感器互相阻塞 |
 | AHT20 / SC7A20HTR | I2C（IO21/IO47） | 同一条总线，注意地址不冲突（0x38 / 0x19） |
 
@@ -454,7 +456,10 @@ IO19/IO20 是原生 USB-Serial/JTAG 的数据线。**调试期间这两个脚不
 都不生效，表现为**整屏黑**（背光正常但没有任何内容）。
 
 本工程曾因此长期黑屏。现在该屏统一走官方组件 `espressif/esp_lcd_spd2010`，
-opcode 封装与约 200 条分页式初始化序列都由组件负责，**驱动里不要再手写命令表**。
+opcode 封装由组件负责；但**组件 1.0.2 自带的默认初始化表不适用于本模组**
+（约 200 条分页式序列，直接用会满屏花屏），必须通过 `spd2010_vendor_config_t.init_cmds`
+注入厂商验证过的短序列（`lcd_nv3030b.c` 的 `s_lcd_init_cmds`，以 `{0xFF,0x20,0x10,0x10}`
+开头）。**不要删这段注入，也不要让组件用回默认表。**
 
 另有两条相关约束：
 
@@ -464,9 +469,11 @@ opcode 封装与约 200 条分页式初始化序列都由组件负责，**驱动
   若同时写了 `quadwp/quadhd = -1`，后写的会覆盖 `data2/data3`，
   等于只配了 2 根数据线（同样出不了图）。
 - `esp_lcd` 的颜色数据传输是**异步**的（内部 `spi_device_queue_trans`，
-  `spi_device_release_bus()` 不等 DMA 结束）。LVGL 适配层必须在
-  `lcd_nv3030b_register_flush_done_cb()` 的回调里才调 `lv_display_flush_ready()`，
-  否则 LVGL 会与 DMA 抢同一块绘图缓冲，表现为撕裂 / 花屏 / 整屏黑。
+  `spi_device_release_bus()` 不等 DMA 结束）。DMA 完成前 LVGL 不得复用绘图缓冲，
+  因此必须保留「panel IO color-done 回调 → flush_ready」这条链：驱动内部注册
+  color-done 回调并导出 `lcd_nv3030b_register_flush_done_cb()`，官方
+  `espressif/esp_lvgl_port` 在传输完成事件里再调 `lv_display_flush_ready()`。
+  改显示驱动时若漏掉这条链，表现为撕裂 / 花屏 / 整屏黑。
 
 ### LVGL 与显示子系统的引入方式
 
@@ -477,7 +484,7 @@ opcode 封装与约 200 条分页式初始化序列都由组件负责，**驱动
 | `lvgl/lvgl`（组件管理器托管） | LVGL 9.6 源码本体 |
 | `components/drivers/lcd_nv3030b/` | QSPI 总线 + 面板（官方 `esp_lcd_spd2010`）+ 背光 + 导出 panel/io 句柄 |
 | `components/drivers/touch_cst816d/` | 触摸读点（解析与厂商 STM32 参考例程一致） |
-| `components/middleware/lvgl_port/` | 应用侧适配：启动页内嵌子库 + 全量字体（SPIFFS→PSRAM）、触摸 indev、首帧计数、旋转；LVGL 内核/任务/心跳/锁/显示由官方 `espressif/esp_lvgl_port` 提供 |
+| `components/middleware/lvgl_port/` | 应用侧适配：启动页内嵌子集 + 全量字体（SPIFFS→PSRAM）、触摸 indev、首帧计数、软件旋转；LVGL 内核/任务/心跳/锁/显示由官方 `espressif/esp_lvgl_port` 提供 |
 | `components/middleware/fs_storage/` | storage 分区挂为 `/spiffs`，字体镜像（`spiffs_create_partition_image`） |
 | `components/services/ui/` | 启动页 + 测量/波形/设置三页（tileview/chart/roller 官方组件） |
 | `components/services/power_measure/` | 4kHz 采样、块均值/功率/电能/容量（直流口径非 RMS）、三级波形缓冲、NVS 掉电保存 |
@@ -485,14 +492,14 @@ opcode 封装与约 200 条分页式初始化序列都由组件负责，**驱动
 ### 字体方案（启动页内嵌子集 + 主界面文件字体）
 
 - **启动页子集**：`tools/fonts/make_splash_font.py` 自动收集 `app_init.c` 的
-  初始化/自检 label 与 `splash.c` 的文案，生成约 200 字、34KB/字重的
+  初始化/自检 label 与 `splash.c` 的文案，生成约 197 字、34KB/字重的
   `components/middleware/lvgl_port/src/splash_font_data.c/.h`，**编进 app 分区**。
   `lvgl_port_app_init()` 同步建 4 个字体实例（实测 4ms），首帧即完整中文，
-  不再等待 SPIFFS/全量字库；改启动页文案后重新运行脚本即可。
+  不再等待 SPIFFS/全量字库；改启动页文案后重新运行脚本即可（只重编 app，不必全量烧录）。
 - **主界面字体不嵌入 app**：`tools/fonts/make_fonts.py` 从 google/fonts 下载
   Noto Sans SC 可变 TTF，实例化 Regular(400)/Bold(700) 两个字重，按
   **ASCII + GB2312 一级+二级 6763 字 + 全角标点/单位符号** 子集化，输出到
-  `components/middleware/fs_storage/spiffs_image/fonts/`（**约 2.09MB/个**），构建时
+  `components/middleware/fs_storage/spiffs_image/fonts/`（**约 2.1MB/个**），构建时
   打入 SPIFFS 镜像随 `idf.py flash` 烧入 `storage` 分区（partitions.csv，8MB → 挂载后可用 7346KB）。
 
   **容量账（v0.6.5 需求 2 实测）**：全量子集共 7078 码点 / 7075 字形，两字重合计约
@@ -505,7 +512,7 @@ opcode 封装与约 200 条分页式初始化序列都由组件负责，**驱动
   扩大字库后必须**全量 `idf.py flash`**（OTA 只更新 app 分区，不含 storage/字体）。
 - `lvgl_port_start_font_load()`（`app_tasks_start()` 中调用，晚于 `fs_storage`、
   早于主界面构建）用标准 `fopen` 把两个 TTF **整读入 PSRAM**，再用
-  `lv_tiny_ttf_create_data()` 建 7 档字号 ×2 字重；之后渲染只走内存，
+  `lv_tiny_ttf_create_data()` 建 8 档字号（12/14/16/20/24/32/36/40px）×2 字重；之后渲染只走内存，
   **运行期对 flash 零访问**。
   这样避免了渲染中 SPIFFS 读（spi_flash 读会挂起 MSPI cache）与 NVS 擦除/
   LCD DMA 交错的 cache 故障窗口。文件缺失时回退内置 montserrat14（仅 ASCII）。
@@ -514,13 +521,17 @@ opcode 封装与约 200 条分页式初始化序列都由组件负责，**驱动
   均扫描**整个 `components/`** 的字符串字面量（此前只扫 `services/ui/src`），避免
   "上游组件里定义、最终却显示到屏幕上"的文案漏字；内嵌网页 `web_console_page.c`
   例外——它的字符串由浏览器字体渲染，不经过设备字库（emoji/✔✘ 之类也进不了 CJK TTF）。
-- NVS 定时擦除期间 4kHz DRDY 中断仍持续，故必须开 `CONFIG_GPIO_ISR_IRAM_SAFE`。
+- NVS 定时擦除期间 4kHz DRDY 中断仍持续，故必须开 `CONFIG_GPIO_CTRL_FUNC_IN_IRAM`
+  （v6.1 新名，旧名 `CONFIG_GPIO_ISR_IRAM_SAFE`）与 `CONFIG_ESP_TIMER_IN_IRAM`
+  （DRDY ISR 内调用 `esp_timer_get_time()` 做 δ 统计）。
 
 ### 测量链路（4kSPS）
 
 - ADS131M02 CLOCK 寄存器在 init 中显式写 **0x030E**（两通道使能 / HR / OSR=1024，
   恰为芯片复位值）并回读校验：f_MOD=4.096MHz，
   ODR=4.096MHz/1024=4000 SPS（寄存器位定义见 ads131m02.c 注释，出自手册 §8.6.4）。
+  每帧为 `[STATUS][CH0][CH1][CRC]` 四个 24bit 字（12 字节），帧尾 CRC-16/CCITT
+  不可关闭，必须整帧读满并校验。
   4kHz 稳定的前提是**读窗不跨越转换完成时刻**（手册 §8.5.1.5 的 DRDY 抑制机制，
   旧版 4MHz SPI + 任务调度路径下实测塌到 ~310Hz）：现以 20MHz SPI + DMA 把读窗
   压到 µs 级、固定在 DRDY 之后启动，DRDY→SPI 启动延迟 δ 由 ads131m02_get_stats()
@@ -606,7 +617,8 @@ version.txt               固件版本号
 
 测量链路、三页正式 UI、自动转屏均已实现；`wifi_manager`（STA / AP 配网 + 模式三档 +
 扫描 + RSSI，v0.6.0/0.6.1）与 `web_console`（内嵌网页控制台，v0.6.0 起为
-实时数据 / 波形图 / 设置 / API / 日志五页签，10Hz 推送 + WiFi 扫描配网）已落地。
+实时数据 / 波形图 / 设置 / API / 日志五页签，10Hz 推送（v0.6.4 起提高到 15Hz）+
+WiFi 扫描配网）已落地。
 v0.6.2 起 web_console 增加 `GET /api/config`（回读配置）与 `GET /api/info`
 （版本 / IP / MAC / 运行时间 / 内存水位）；设备端新增"无操作 15/30/60s 背光降到 10%"
 的自动降亮（触摸与按键均重置计时并恢复亮度）。
@@ -647,7 +659,7 @@ v0.6.9 起：**量程文档校正**——电压设计测量 0~90V（分压链路
 `fs_storage` 后移到 orientation 之后（仅全量字库后台任务需要），
 启动页改为显示 **18 步初始化 + 5 项自检的真实进度**；
 启动页文案改用 `tools/fonts/make_splash_font.py` 生成的**内嵌极小子集**
-（约 200 字、34KB/字重，编入 app 分区，同步创建 4ms），首帧即完整中文，
+（约 197 字、34KB/字重，编入 app 分区，同步创建 4ms），首帧即完整中文，
 屏幕点亮由 1.42s 提前到约 1.09s；主界面仍在全量字库加载完成后构建。
 以下为**尚未实现**的缺口：
 

@@ -85,7 +85,7 @@ static const char *TAG = "wifi_manager";
 /** 连接失败后的最大重试次数（不含首次尝试）；耗尽即进入 FAILED */
 #define WIFI_MANAGER_RETRY_MAX 5
 
-/** 重试退避：首两次间隔 1s，逐次翻倍，封顶 8s */
+/** 重试退避：首次间隔 1s，之后逐次翻倍，封顶 8s（1/2/4/8/8s） */
 #define WIFI_MANAGER_RETRY_BASE_MS 1000
 #define WIFI_MANAGER_RETRY_MAX_MS  8000
 
@@ -251,6 +251,10 @@ static volatile uint8_t s_last_disconnect_reason = 0;
  */
 static esp_err_t nvs_ensure_ready(void)
 {
+    /* NVS（Non-Volatile Storage）是 ESP-IDF 的键值存储：数据写在 Flash 的
+     * nvs 分区，掉电不丢。它按"命名空间（namespace）"分租户，命名空间内是
+     * "键 → 值"；本项目 WiFi 用自己的 "wifi" 命名空间（ssid/pass/mode）。
+     * nvs_open(命名空间, 读写模式, &句柄)：打开命名空间，用完必须 nvs_close。 */
     nvs_handle_t handle;
     esp_err_t err = nvs_open(WIFI_MANAGER_NVS_NAMESPACE, NVS_READONLY, &handle);
 
@@ -1007,6 +1011,9 @@ static void wifi_manager_task(void *arg)
     ESP_LOGI(TAG, "内部任务已启动");
 
     for (;;) {
+        /* xEventGroupWaitBits(事件组, 关心哪些位, 取走后是否清零, 是否要求全部置位, 最长等待)：
+         * 内部任务在这里睡眠，直到事件回调置位或退避重试到点（超时）。
+         * pdTRUE=取到后自动清零；pdFALSE=任一位满足即可返回。 */
         EventBits_t bits = xEventGroupWaitBits(s_evt, WM_EVT_ALL, pdTRUE, pdFALSE,
                                                compute_wait_ticks());
 
@@ -1078,6 +1085,12 @@ static void wifi_manager_task(void *arg)
  */
 static esp_err_t create_sync_objects(void)
 {
+    /* 事件组（EventGroup）：一组二进制标志位，用来把"发生了哪些事件"从
+     * esp_event 回调传给内部任务；xEventGroupSetBits 置位、WaitBits 等待+取位，
+     * 比多个信号量更省对象，也天然支持"多事件同时到达"。
+     * 命令队列：公开 API → 内部任务的单向通道，元素按值拷贝。
+     * 互斥锁（Mutex）：保证 connect/forget 两条命令通道串行执行，
+     * 避免两个调用方同时等同一个"命令完成"事件位。 */
     s_evt = xEventGroupCreate();
     s_cmd_queue = xQueueCreate(WIFI_MANAGER_CMD_QUEUE_LEN, sizeof(wifi_manager_cmd_t));
     s_cmd_mutex = xSemaphoreCreateMutex();
@@ -1236,7 +1249,10 @@ esp_err_t wifi_manager_start(void)
         }
     }
 
-    /* ---- 4. WiFi 驱动 ---- */
+    /* ---- 4. WiFi 驱动 ----
+     * WIFI_INIT_CONFIG_DEFAULT()：IDF 提供的默认初始化参数（缓冲区数量、任务
+     * 优先级等），一般无需手改；esp_wifi_init() 完成驱动内部资源与 WiFi 任务的创建。
+     * WiFi 驱动任务默认固定在 Core 0，与"Core 0 交互/通信、Core 1 采样"的分工一致。 */
     wifi_init_config_t init_cfg = WIFI_INIT_CONFIG_DEFAULT();
     err = esp_wifi_init(&init_cfg);
     if (err != ESP_OK) {
@@ -1246,7 +1262,11 @@ esp_err_t wifi_manager_start(void)
     /* 凭据由本组件自管到 NVS "wifi"，禁止 esp_wifi 再落一份 */
     (void)esp_wifi_set_storage(WIFI_STORAGE_RAM);
 
-    /* ---- 5. 注册事件处理器 ---- */
+    /* ---- 5. 注册事件处理器 ----
+     * esp_event_handler_instance_register(事件基, 事件 ID, 回调, 回调参数, 实例句柄)：
+     * 把回调注册到默认事件循环。WIFI_EVENT/ESP_EVENT_ANY_ID 表示关心 WiFi 的全部事件，
+     * 具体是哪个事件由回调的 id 参数区分（STA_START / DISCONNECTED / SCAN_DONE…）。
+     * 句柄用于 stop() 时精确注销，避免误删其它组件注册的处理器。 */
     err = esp_event_handler_instance_register(WIFI_EVENT, ESP_EVENT_ANY_ID,
                                               &wifi_event_handler, NULL, &s_wifi_event_inst);
     if (err != ESP_OK) {
@@ -1273,6 +1293,9 @@ esp_err_t wifi_manager_start(void)
         return err;
     }
 
+    /* xTaskCreate（不带 Pin）：创建内部任务，栈 4KB、优先级 4、任务名 "wifi_mgr"。
+     * 不绑核：由 FreeRTOS 调度器在两个核间迁移，网络事件处理对时延不敏感。
+     * 句柄写入 s_worker，stop() 靠它等待任务退出。 */
     if (xTaskCreate(wifi_manager_task, "wifi_mgr", WIFI_MANAGER_TASK_STACK, NULL,
                     WIFI_MANAGER_TASK_PRIO, &s_worker) != pdPASS) {
         ESP_LOGE(TAG, "创建内部任务失败");

@@ -65,7 +65,8 @@ esp_err_t ads_engine_init(int mosi, int miso, int sclk, int clk_hz, int input_de
 esp_err_t ads_engine_attach_drdy(int drdy_gpio);
 
 /**
- * @brief 开/关流式 kick（维护模式前关、后开；关闭时 DRDY ISR 只打时间戳）
+ * @brief 开/关流式 kick（维护模式前关、后开；关闭时不启动流式帧，
+ *        DRDY ISR 仍会计数并给同步信号量）
  * @param on true=开流式
  * @return 之前的开关状态（便于"临时暂停-恢复"：保存旧值，用后恢复）
  */
@@ -87,12 +88,14 @@ esp_err_t ads_engine_xfer_frame(const uint32_t *tx, uint32_t *rx, uint32_t timeo
 /**
  * @brief 流式读一帧（消费 DRDY ISR kick 的帧）
  *
- * 等待「帧已 kick」信号 → 等 DMA 完成 → 从槽环取帧。丢帧时序不齐会返回
- * ESP_ERR_TIMEOUT（调用方按丢帧处理）。
+ * 等待「帧已 kick」信号 → 等 DMA 完成 → 从槽环取帧。
+ * 若该次 DRDY 因槽满没 kick（丢帧），返回 ESP_ERR_INVALID_STATE 而不是超时，
+ * 以便上层把「丢了一帧」与「ADC 真死」分开计数。
  *
  * @param rx 输出 4 个 24bit 字
  * @param timeout_ms 超时（ms）
- * @return ESP_OK / ESP_ERR_TIMEOUT
+ * @return ESP_OK / ESP_ERR_TIMEOUT（等信号或等 DMA 完成超时）
+ *         / ESP_ERR_INVALID_STATE（槽满丢帧，无数据可返回）
  */
 esp_err_t ads_engine_read_frame(uint32_t *rx, uint32_t timeout_ms);
 

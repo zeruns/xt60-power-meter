@@ -44,7 +44,8 @@
  * 没有 CS —— 即片选在硬件上常接地、器件永远处于选中状态。因此：
  *   · spi_device 配置 spics_io_num = -1（不让 SPI 主机去驱动不存在的片选）；
  *   · 帧边界只能靠「24bit 字的整数倍」保证，故一次采样必须放在同一个 SPI 事务里
- *     连续交换 3 个字（ads_xfer_raw 就是这么做的），绝不可拆成多次事务，否则帧错位。
+ *     连续交换 4 个字 = 一整帧（STATUS+CH0+CH1+CRC，ads_xfer_raw 就是这么做的），
+ *     绝不可拆成多次事务，否则帧错位。
  *   · 若上板后读数恒为乱码或固定值，先确认硬件 CS 是否真的接地。
  *
  * ============================================================
@@ -65,8 +66,10 @@
  *     需要看原始字时把本文件日志级别开到 DEBUG，ads_read_reg() 会打印帧内原始字。
  *   · 【帧错位】没有 CS 时若帧错位，读出的电压/电流会呈现规律的错位关系。
  *     排查点：MODE 寄存器里的字长设置、是否启用了 CRC。
- *   · 【中断与内存】DRDY ISR 只做 xSemaphoreGiveFromISR，且 ISR 与
- *     ads131m02_read() 均不访问 PSRAM（见 hardware_pinout.md §6 的硬约束）。
+ *   · 【中断与内存】DRDY ISR 内只做三件事：计数、唤醒消费者（xSemaphoreGiveFromISR）、
+ *     重臂 DMA 描述符并启动一帧（内存写 + inline LL，全是 IRAM 安全操作），
+ *     不做阻塞调用、不读 flash；且 ISR 与 ads131m02_read() 均不访问 PSRAM
+ *     （见 hardware_pinout.md §6 的硬约束）。
  * ============================================================
  */
 #include "ads131m02.h"
@@ -153,7 +156,8 @@ static const char *TAG = "ads131m02";
 
 /**
  * RREG：格式 101a aaaa annn nnnn
- *   7bit 寄存器地址在 [12:6]，7bit 字数（寄存器个数 - 1）在 [5:0]。
+ *   6bit 寄存器地址在 [12:7]，7bit 字数（寄存器个数 - 1）在 [6:0]
+ *   （对应本文件宏实现里的 addr << 7 与 n 掩码 0x7F）。
  * @param addr 起始寄存器地址
  * @param n 连续读取的寄存器个数（1 ~ 128）
  */
@@ -231,7 +235,8 @@ static const char *TAG = "ads131m02";
 /* ============================================================
  * 时序参数
  * ============================================================ */
-#define ADS_RESET_LOW_MS    2   /**< RESET# 低电平保持（手册要求 ≥ 1ms） */
+#define ADS_RESET_LOW_MS    2   /**< RESET# 低电平保持（手册要求 ≥ 2048·t_CLKIN，
+                                 *   8.192MHz 下约 250µs；取 2ms 留裕量） */
 #define ADS_POWERUP_MS      50  /**< 复位释放后等待（上电 + 时钟起振） */
 #define ADS_CMD_GAP_MS      2   /**< 命令之间留出的间隔 */
 #define ADS_DRDY_TIMEOUT_MS 100 /**< 等 DRDY# 超时（一帧 250µs，100ms 为数百倍余量） */
@@ -250,7 +255,7 @@ static SemaphoreHandle_t s_bus_mutex = NULL;
 /** 采样侧统计（单写者：采样任务；诊断/验收用，δ 统计在引擎侧） */
 static uint32_t s_read_ok = 0;      /**< 成功读取帧数 */
 static uint32_t s_crc_fail = 0;     /**< CRC 校验失败帧数 */
-static uint32_t s_read_timeout = 0; /**< 等帧超时/丢帧次数 */
+static uint32_t s_read_timeout = 0; /**< 等帧超时次数（槽满丢帧是瞬态，不计入） */
 static uint32_t s_crc_fail_streak = 0; /**< 连续 CRC 失败计数（M3 重同步触发用） */
 
 /** 连续 CRC 失败多少帧判定帧错位并请求重同步（无 CS 下 4 连败即不自愈） */
@@ -322,6 +327,9 @@ static esp_err_t ads_xfer_raw(const uint32_t *tx, uint32_t *rx, size_t word_coun
  */
 static bool ads_bus_lock(void)
 {
+    /* xSemaphoreTake：申请互斥锁，最多等待 ADS_MUTEX_TIMEOUT_MS 毫秒。
+     * pdMS_TO_TICKS 把毫秒换算成 FreeRTOS 的 tick（系统节拍），直接把毫秒数
+     * 传进去会算错等待时长。返回 pdTRUE = 拿到锁，pdFALSE = 等待超时。 */
     return xSemaphoreTake(s_bus_mutex, pdMS_TO_TICKS(ADS_MUTEX_TIMEOUT_MS)) == pdTRUE;
 }
 
@@ -505,6 +513,8 @@ static esp_err_t ads_apply_config(void)
     if (err != ESP_OK) {
         return err;
     }
+    /* vTaskDelay：让当前任务休眠指定 tick 数，休眠期间 CPU 让给其他任务运行；
+     * 这里留出芯片处理命令的间隔（ADS_CMD_GAP_MS = 2ms）。 */
     vTaskDelay(pdMS_TO_TICKS(ADS_CMD_GAP_MS));
 
     /* GAIN1：CH0=16x（电流）/ CH1=1x（电压） */
@@ -584,6 +594,9 @@ esp_err_t ads131m02_init(void)
     esp_err_t err = ESP_OK;
 
     /* ---- ① 同步对象：SPI 事务互斥锁（DRDY 同步由引擎内部处理） ---- */
+    /* xSemaphoreCreateMutex：创建一个 FreeRTOS 互斥量，保证同一时刻只有一个任务
+     * 能进入「SPI 访问」临界区；同任务重复取锁会死锁（故 read() 内不调 ads_resync）。
+     * 返回 NULL 表示堆内存不足。 */
     s_bus_mutex = xSemaphoreCreateMutex();
     if (s_bus_mutex == NULL) {
         ESP_LOGE(TAG, "创建互斥锁失败（内存不足）");
@@ -592,6 +605,11 @@ esp_err_t ads131m02_init(void)
     }
 
     /* ---- ② RESET#(SYNC#) 脚：输出，先保持高（不复位） ---- */
+    /* gpio_config 一次性配置一个引脚的默认电平/方向/上下拉/中断：
+     *   pin_bit_mask ：位掩码，bit n 对应 GPIO n（1ULL << 引脚号）；
+     *   mode         ：GPIO_MODE_OUTPUT = 推挽输出；
+     *   pull_up/down ：本脚由驱动外部拉高，不需要内部上下拉；
+     *   intr_type    ：主机不用该脚中断，禁用（DRDY 中断在引擎里单独装）。 */
     const gpio_config_t rst_cfg = {
         .pin_bit_mask = 1ULL << BOARD_PIN_ADC_RST,
         .mode = GPIO_MODE_OUTPUT,
@@ -853,7 +871,8 @@ esp_err_t ads131m02_read(ads131m02_sample_t *out)
 
 esp_err_t ads131m02_resync_if_needed(void)
 {
-    /* atomic_exchange：一次性消费请求标志（多核/多上下文安全） */
+    /* atomic_exchange：原子地「读出旧值 + 写入 false」，即一次性取走请求标志；
+     * 采样任务与读帧上下文可能并发，用原子操作可避免重复消费或丢标志。 */
     if (!atomic_exchange(&s_resync_req, false)) {
         return ESP_OK; /* 无请求：常态快速返回 */
     }

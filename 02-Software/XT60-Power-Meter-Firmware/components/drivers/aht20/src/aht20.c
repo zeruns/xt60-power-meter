@@ -87,6 +87,8 @@ static i2c_master_dev_handle_t s_dev = NULL;
  */
 static esp_err_t aht20_read_status(uint8_t *status)
 {
+    /* i2c_master_receive：纯读事务。AHT20 的状态字节不需要先写寄存器地址，
+     * 直接按器件地址读 1 字节即可。 */
     return i2c_master_receive(s_dev, status, 1, AHT20_I2C_TIMEOUT_MS);
 }
 
@@ -158,7 +160,9 @@ esp_err_t aht20_init(void)
         return err;
     }
 
-    /* ---- ③ 上电稳定 ---- */
+    /* ---- ③ 上电稳定 ----
+     * vTaskDelay：当前任务休眠指定 tick 数（期间 CPU 可跑其他任务），
+     * 手册要求上电后至少等 40ms 再访问器件。 */
     vTaskDelay(pdMS_TO_TICKS(AHT20_POWERON_WAIT_MS));
 
     /* ---- ④ 校准使能（若未校准则发初始化命令） ---- */
@@ -169,6 +173,7 @@ esp_err_t aht20_init(void)
         goto fail_dev;
     }
     if ((status & AHT20_STATUS_CALIBRATED) == 0) {
+        /* i2c_master_transmit：纯写事务，把 3 字节命令一次性发给器件 */
         err = i2c_master_transmit(s_dev, AHT20_CMD_INIT, sizeof(AHT20_CMD_INIT),
                                   AHT20_I2C_TIMEOUT_MS);
         if (err != ESP_OK) {

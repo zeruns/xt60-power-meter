@@ -42,7 +42,8 @@ bool screen_measure_menu_is_open(void);
 /**
  * @brief 快速菜单按键处理
  *
- * 打开期间：长按（K1/K2）关闭菜单；单击/双击被吞掉（防止误翻页）。
+ * 打开期间：长按（K1/K2）关闭菜单；单击 K1/K2 = 焦点上/下移，
+ * 双击 = 激活当前焦点行（其余事件不消费，交回 ui_nav）。
  * @return true 表示事件已被菜单消费
  */
 bool screen_measure_menu_key(button_id_t id, button_event_t ev);

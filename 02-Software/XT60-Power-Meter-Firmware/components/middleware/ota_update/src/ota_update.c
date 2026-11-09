@@ -49,8 +49,10 @@ static const char *TAG = "ota_update";
  * OTA 任务栈大小（字节）
  *
  * TLS 握手 + HTTP 收发都在本任务栈上完成，IDF 官方 OTA 示例同为 8192。
- * 小于 CONFIG_SPIRAM_MALLOC_ALWAYSINTERNAL(16KB) 的分配优先落在内部 RAM，
- * 栈不会挂到 PSRAM，避开 cache 关闭窗口的访问风险。
+ * 注意：本工程 CONFIG_SPIRAM_MALLOC_ALWAYSINTERNAL=0，且
+ * CONFIG_SPIRAM_ALLOW_STACK_EXTERNAL_MEMORY=y，xTaskCreatePinnedToCore()
+ * 的默认分配**不保证**把 8KB 栈放进内部 RAM（与显式 MALLOC_CAP_INTERNAL
+ * 的 font_load 任务不同）；本任务只做网络 I/O，不主动读 SPIFFS。
  */
 #define OTA_UPDATE_TASK_STACK   8192
 
@@ -326,6 +328,9 @@ esp_err_t ota_update_rollback_if_pending(void)
     }
 
     esp_ota_img_states_t ota_state = ESP_OTA_IMG_UNDEFINED;
+    /* esp_ota_get_state_partition：从 otadata 分区读取指定应用分区的状态。
+     * 常见值：NEW（刚烧录）/ PENDING_VERIFY（升级后首启，等待确认）/
+     * VALID（已确认）/ INVALID（已标记坏）。ESP_ERR_NOT_FOUND 表示没有记录。 */
     esp_err_t err = esp_ota_get_state_partition(running, &ota_state);
     if (err == ESP_ERR_NOT_FOUND) {
         /* otadata 中没有当前分区的记录（如整机首次烧录）：无待验证升级，正常启动 */

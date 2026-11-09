@@ -128,7 +128,7 @@ static bool s_font_load_started = false;
 
 /* ---- 启动页专用小子库（v0.6.9） ----
  * 由 tools/fonts/make_splash_font.py 生成、随固件编进 app 分区；
- * 只覆盖启动页文案，创建耗时几十毫秒，首帧即可显示完整中文。 */
+ * 只覆盖启动页文案，创建耗时约 4ms，首帧即可显示完整中文。 */
 static lv_font_t *s_splash_font[LVGL_PORT_FONT_MAX] = { 0 }; /**< 常规：12/14/16 */
 static lv_font_t *s_splash_font_bold[LVGL_PORT_FONT_MAX] = { 0 }; /**< 粗体：40 */
 static uint8_t *s_splash_data_reg = NULL;  /**< 子集 TTF 的 PSRAM 常驻副本 */
@@ -202,6 +202,8 @@ static void font_load_task(void *arg)
         [FONT_WEIGHT_BOLD] = { FONT_WEIGHT_BOLD, LVGL_PORT_FONT_BOLD_PATH },
     };
 
+    /* esp_timer_get_time()：返回系统启动至今的微秒数（int64_t）。
+     * 用它掐表比 tick 更细，且不受 FreeRTOS 节拍精度影响。 */
     const int64_t t0 = esp_timer_get_time();
     int ok_count = 0;
 
@@ -210,7 +212,14 @@ static void font_load_task(void *arg)
             continue;
         }
         for (int i = 0; i < LVGL_PORT_FONT_MAX; i++) {
+            /* lvgl_port_lock(超时毫秒)：官方移植层提供的 LVGL 互斥锁。
+             * LVGL 不是线程安全的：任何任务想创建/修改 LVGL 对象（这里创建字体）
+             * 都必须先拿锁，做完再 lvgl_port_unlock()，否则会与 LVGL 任务打架。
+             * 这里取 2s 超时——真拿不到说明系统异常，跳过该字号而不是死等。 */
             if (lvgl_port_lock(2000)) {
+                /* lv_tiny_ttf_create_data()：用内存里的 TTF 数据直接创建
+                 * 指定像素高度的 LVGL 字体对象；不读文件，运行期渲染全在内存完成。
+                 * 传入的数据缓冲必须在该字体生命周期内一直有效（这里是 s_font_data）。 */
                 s_fonts[w][i] =
                     lv_tiny_ttf_create_data(s_font_data[w], s_font_data_len[w], s_font_px[i]);
                 if (s_fonts[w][i] != NULL) {
@@ -252,14 +261,17 @@ static void font_load_task(void *arg)
 /**
  * @brief 创建启动页专用字体（嵌入子集 TTF → 12/14/16 常规 + 40 粗体）
  *
- * 子集只有约 190 个字形（32KB/字重），创建 4 个实例约几十毫秒；
+ * 子集只有约 197 个字形（约 34KB/字重），创建 4 个实例约 4ms；
  * 在显示链路初始化阶段同步完成，保证启动页第一帧就是完整中文。
  * 数据复制到 PSRAM 常驻（tiny_ttf 生命周期内需保持有效）。
  */
 static void create_splash_fonts(void)
 {
-    const int64_t t0 = esp_timer_get_time();
+    const int64_t t0 = esp_timer_get_time(); /* 计时起点（微秒），仅用于日志 */
 
+    /* heap_caps_malloc(大小, 能力位)：按内存类型分配。
+     * MALLOC_CAP_SPIRAM = 只从 PSRAM 分配（大块数据放这里，省内部 RAM）；
+     * 返回 NULL 表示 PSRAM 不足，走 fail 分支回退 ASCII 文案。 */
     s_splash_data_reg = heap_caps_malloc(splash_font_reg_ttf_len, MALLOC_CAP_SPIRAM);
     s_splash_data_bold = heap_caps_malloc(splash_font_bold_ttf_len, MALLOC_CAP_SPIRAM);
     if (s_splash_data_reg == NULL || s_splash_data_bold == NULL) {
@@ -378,6 +390,8 @@ esp_err_t lvgl_port_app_init(void)
     cfg.task_priority = LVGL_PORT_TASK_PRIO;
     cfg.task_stack = LVGL_PORT_TASK_STACK;
     cfg.task_affinity = LVGL_PORT_TASK_CORE;
+    /* 没有新定时器时，LVGL 任务最多睡多久再醒来检查一次（毫秒）。
+     * 500ms 是上限；有新绘制请求时 lv_timer_handler 会被提前唤醒。 */
     cfg.task_max_sleep_ms = 500;
     cfg.timer_period_ms = LVGL_PORT_TICK_MS;
     /* 【v0.6.3 性能】LVGL 任务栈改回**内部 RAM**。
@@ -397,7 +411,7 @@ esp_err_t lvgl_port_app_init(void)
         return err;
     }
 
-    /* ---- ② 启动页嵌入子库（同步，几十毫秒；不依赖 SPIFFS） ---- */
+    /* ---- ② 启动页嵌入子库（同步，约 4ms；不依赖 SPIFFS） ---- */
     create_splash_fonts();
 
     /* ---- ③ 注册显示（软件旋转架构）----
@@ -443,12 +457,19 @@ esp_err_t lvgl_port_app_init(void)
         return ESP_FAIL;
     }
 
-    /* 渲染完成计数：官方在刷屏回调返回后触发 FLUSH_FINISH 事件 */
+    /* 渲染完成计数：官方在刷屏回调返回后触发 FLUSH_FINISH 事件。
+     * lv_display_add_event_cb(显示设备, 回调, 事件码, 用户数据)：把回调挂到
+     * LVGL 显示对象上；事件由 LVGL 任务在对应时机调用，回调里不要做耗时操作。 */
     lv_display_add_event_cb(s_display, disp_flush_finish_cb, LV_EVENT_FLUSH_FINISH, NULL);
 
     /* ---- ④ 触摸输入设备（自研驱动 + 旋转映射） ----
      * 官方 lvgl_port_add_touch() 需要 esp_lcd_touch 句柄；本工程用自研
      * CST816D 驱动，故自行创建 indev（理由见 lvgl_port.h 文件头）。 */
+    /* lv_indev_create()：创建一个 LVGL 输入设备对象；
+     * lv_indev_set_type(对象, LV_INDEV_TYPE_POINTER)：声明它是"指针类"输入
+     * （触摸/鼠标），LVGL 会按坐标做控件命中和点击判定；
+     * lv_indev_set_read_cb(对象, 回调)：LVGL 每次处理输入时调用该回调取当前
+     * 触摸状态与坐标（见 indev_read_cb）。 */
     s_indev = lv_indev_create();
     if (s_indev == NULL) {
         ESP_LOGE(TAG, "创建触摸输入设备失败");
@@ -482,6 +503,11 @@ esp_err_t lvgl_port_start_font_load(void)
         return ESP_ERR_INVALID_STATE;
     }
 
+    /* xTaskCreatePinnedToCoreWithCaps：创建任务并指定栈所在内存类型。
+     * 参数依次为（函数, 任务名, 栈字节数, 参数, 优先级, 句柄, 核心号, 栈能力位）。
+     * 这里强制 MALLOC_CAP_INTERNAL：本任务要读 SPIFFS，而 SPIFFS 读写期间
+     * 会临时关闭 flash cache，此时 CPU 访问不了 PSRAM；若栈在 PSRAM 会立刻
+     * 触发 cache 错误并复位（踩过的坑）。优先级 2 让字库加载不抢 UI/测量。 */
     BaseType_t tok = xTaskCreatePinnedToCoreWithCaps(font_load_task, "font_load", 8192, NULL, 2,
                                                     NULL, 0, MALLOC_CAP_INTERNAL);
     if (tok != pdPASS) {

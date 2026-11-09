@@ -1,7 +1,7 @@
 # 引脚分配表（XT60 功率计）
 
 - 依据：`01-Hardware/02-上板原理图_V2.pdf`（更新 2026-09-22）、`01-Hardware/02-下板原理图.pdf`
-- 代码唯一真相源：[board_pins.h](file:///e:/Electronic/80.Project/XT60-Power-Meter/02-Software/XT60-Power-Meter-Firmware/components/bsp/include/board_pins.h)
+- 代码唯一真相源：[board_pins.h](../components/bsp/include/board_pins.h)
 - 主控：ESP32-S3-WROOM-1-N16R8（16MB Flash + 8MB 八线 PSRAM）
 
 ## 1. 按功能分类的引脚分配
@@ -34,7 +34,7 @@
 | 数据 2 | IO3 | LCD_D2 | QSPI SDIO2，**strapping 脚** |
 | 数据 3 | IO8 | LCD_D3 | QSPI SDIO3 |
 | 复位 | IO7 | LCD_RST | |
-| 撕裂同步 | IO48 | LCD_TE | 与 LVGL 刷新同步 |
+| 撕裂同步 | IO48 | LCD_TE | 预留，当前驱动未使用（LVGL 走异步传输完成回调） |
 
 ### 电容触摸（CST816D，I2C 从地址 0x15）
 
@@ -106,7 +106,7 @@
 | GPIO | 说明 |
 |---|---|
 | IO33 ~ IO37 | 被模组内部八线 PSRAM 占用（SPIIO4~7 / SPIDQS），**不可作普通 IO** |
-| IO35 ~ IO38、IO40 ~ IO42 | 悬空 |
+| IO38、IO40 ~ IO42 | 悬空 |
 | IO43 (TXD0)、IO44 (RXD0) | 悬空；控制台已配置为 USB-Serial/JTAG，UART0 未使用 |
 
 ## 4. 已用引脚汇总
@@ -121,7 +121,7 @@ IO20 USB D+         IO21 I2C SCL       IO39 SYS_LED      IO45 LCD 背光
 IO46 触摸 INT       IO47 I2C SDA       IO48 LCD_TE       EN   CHIP_PU
 ```
 
-共占用 26 个 GPIO，另加 EN、GND、3V3。
+共占用 27 个 GPIO，另加 EN、GND、3V3。
 
 注意 IO19/IO20 是 ESP32-S3 的原生 USB-Serial/JTAG 数据线，
 既是烧录口也是日志口；**调试期间不可挪作他用**。
@@ -131,7 +131,7 @@ IO46 触摸 INT       IO47 I2C SDA       IO48 LCD_TE       EN   CHIP_PU
 | 外设 | 建议使用的总线 / 外设 | 原因 |
 |---|---|---|
 | LCD（NV3030B，QSPI 4bit） | ESP32-S3 的 **LCD 外设 + `esp_lcd`（占用 SPI2）**，不要用 GPIO 模拟 | 硬件加速，CPU 开销低；LVGL 有官方后端 |
-| ADS131M02（SPI） | **独占 SPI3** | 测量链路不能被其他设备的事务插入打断。**不是 SPI2**：SPI2 已被 LCD QSPI 占用，而 ESP32-S3 的一个 SPI 外设同一时刻只能映射一组引脚（LCD 在 IO15~18、ADC 在 IO9~12，无法共存）；「独占」的本意是"不被打断"，不是字面上的外设编号 |
+| ADS131M02（SPI） | **独占 SPI3** | 测量链路不能被其他设备的事务插入打断。**不是 SPI2**：SPI2 已被 LCD QSPI 占用（CS15 / SCK18 / D0-16 / D1-17，D2/D3 为 IO3/IO8），ADC 在 IO9~12，同一 SPI 外设无法同时映射两组引脚；「独占」的本意是"不被打断"，不是字面上的外设编号 |
 | CST816D（触摸） | I2C0（IO5/IO6） | 单独一条总线，与传感器互不阻塞 |
 | AHT20 / SC7A20HTR | I2C1（IO21/IO47） | 共享总线，地址不冲突（0x38 / 0x19） |
 | 蜂鸣器 / LCD 背光 | LEDC（两路通道） | 需要方波与 PWM 调光 |
@@ -145,16 +145,16 @@ IO46 触摸 INT       IO47 I2C SDA       IO48 LCD_TE       EN   CHIP_PU
 | **初始化序列必须用厂商验证版** | ⚠ 注册表 `espressif/esp_lcd_spd2010` **1.0.2 自带的默认初始化表对本模组不适用**（约 200 条分页式序列），直接用会**满屏花屏**。厂商随模组资料提供的同组件版本已把该默认表整段注释，替换为一套更短的序列（以 `{0xFF,0x20,0x10,0x10}` 开头，与 STM32 例程 `Lcd_Initialize()` 一致）。本工程通过 `spd2010_vendor_config_t.init_cmds` 注入该序列（见 `lcd_nv3030b.c` 的 `s_lcd_init_cmds`），**不要删、不要让组件用回默认表** |
 | QSPI 命令封装 | 线上 32bit 命令字必须是 `(opcode << 24) \| (cmd << 8)`：写命令 `0x02`、写显存 `0x32`。**`esp_lcd` 不会替你补 opcode**，直接发 8bit 命令面板会全部忽略（现象：背光正常但整屏黑）。opcode 封装由 spd2010 组件完成 |
 | QSPI 数据线 | `spi_bus_config_t` 里 `quadwp/quadhd` 与 `data2/data3` 共用匿名联合，只能写一组，否则后写的会把前面的覆盖成 -1（等于只配 2 根数据线） |
-| 方向（MADCTL 0x36） | NV3030B 手册 7.1.25 为**标准 MIPI 位**：MY=0x80 / MX=0x40 / MV=0x20 / BGR=0x08（TFT_eSPI 官方 NV3030B 驱动同此）。竖屏 0x08；**横屏(rotation 1)=MX\|MV\|BGR=0x68**，本工程在厂商序列末尾直写 0x36=0x68。⚠ 只写 0x28(无 MX) 会镜像错位、横条变竖条。不要用组件 swap_xy()（硬编码不支持）。240×284 玻璃在 240×320 RAM 内 gap=0 |
+| 方向（MADCTL 0x36） | NV3030B 手册 7.1.25 为**标准 MIPI 位**：MY=0x80 / MX=0x40 / MV=0x20 / BGR=0x08（TFT_eSPI 官方 NV3030B 驱动同此）。竖屏 0x08；**横屏(rotation 1)=MX\|MV\|BGR=0x68**，本工程在厂商序列末尾直写 0x36=0x68。⚠ 只写 0x28(无 MX) 会镜像错位、横条变竖条。不要用组件 swap_xy()（硬编码不支持）。240×284 玻璃在 240×320 RAM 内 gap=0。**以上仅用于 init 序列，运行期不再写 MADCTL**（方向由 LVGL 软件旋转） |
 | 控制器 vs 玻璃 | NV3030B 控制器 240RGB×320，本模组玻璃 240×284（用其中 284 行）；240×284 无需 CGRAM 偏移（TFT_eSPI 仅在 240×280 时加 20 偏移） |
-| 色彩 / 像素字节序 | 面板线上要求每像素**高字节在前（big-endian）**（厂商 STM32 例程先发 `Color>>8`）。LVGL 显示格式须配 **`LV_COLOR_FORMAT_RGB565_SWAPPED`**（`CONFIG_LV_COLOR_FORMAT_RGB565_SWAPPED=y`），让 LVGL 直接渲染成 big-endian；**不要再做软件字节交换**（否则交换两次反而错色）。用小端 RGB565 会整体偏色、列错位 |
-| 背光极性 | IO45 经 Q3 低边驱动，**高电平点亮**（占空比越大越亮）；IO45 是 strapping 脚，复位期间须为低（板上有 R10 10kΩ 下拉），故驱动初始化全程保持背光灭，等面板初始化并刷过清屏色后再点亮，避免"上电先白屏" |
+| 色彩 / 像素字节序 | 面板线上要求每像素**高字节在前（big-endian）**（厂商 STM32 例程先发 `Color>>8`）。本工程启用了 LVGL **软件旋转**（`sw_rotate=1`），而 `lv_draw_sw_rotate()` 只支持普通 RGB565、不支持 RGB565_SWAPPED，因此渲染格式用 **`LV_COLOR_FORMAT_RGB565`**，再由 `flags.swap_bytes=1` 在旋转完成后统一交换字节序给面板（见 `lvgl_port.c`）。⚠ 不要改成 RGB565_SWAPPED（90/180/270° 会花屏），也不要在业务层再做一次软件交换 |
+| 背光极性 | IO45 经 Q3 低边驱动，**高电平点亮**（占空比越大越亮）；IO45 是 strapping 脚，复位期间须为低（板上有 R10 10kΩ 下拉），故驱动初始化全程保持背光灭，等首帧真正 flush 完成后由 UI 层点亮（`lvgl_port_flush_count() > 0`），避免"上电先白屏" |
 | 反显 | 初始化序列已含 `0x21(INVON)`，代码里**不要再**调 `esp_lcd_panel_invert_color()` |
-| 触摸坐标映射 | 触摸 IC 输出**物理玻璃坐标**（px∈0..239, py∈0..283），不随显示方向变化。每个旋转档位配一组「交换/翻转」参数（`lvgl_port.c` 的 `s_touch_map[]`）：`x0=swap?py:px`、`y0=swap?px:py`、`lx=flip_x?(宽-1-x0):x0`、`ly=flip_y?(高-1-y0):y0`。**ROT_90 三项为 `T/T/T`，是上板实测校正值**（曾因未翻 X 导致左右镜像）。换档位方向不对时只改这张表，不要动 MADCTL |
-| 旋转切换 | 统一入口 `lvgl_port_set_rotation(rot)`：内部依次 ① 写 MADCTL（`lcd_nv3030b_set_rotation`）② 更新触摸映射档位 ③ 更新 LVGL 显示分辨率。档位与 MADCTL：ROT_0=0x08 竖屏 / ROT_90=0x68 横屏(默认) / ROT_180=0xC8 / ROT_270=0xA8。供后续 IMU 自动转屏复用 |
-| QSPI 时钟 | 写显存时钟 40MHz（厂商例程为 20MHz，本工程提速一倍）。若上板花屏/丢像素，依次降回 20/10MHz 定位 |
-| 中文字体 | 用 LVGL 内置**思源黑体** `LV_FONT_SOURCE_HAN_SANS_SC_16_CJK`（标题）/`_14_CJK`（副标题）。工程无 node 工具链，无法离线生成自定义字号中文，故只用内置两级 |
-| 撕裂同步 | IO48 为 LCD_TE，当前驱动未使用。LVGL 适配层走的是「异步传输 + 传输完成回调」：LVGL 提交一块区域后不再复用绘图缓冲，直到传输真正完成（见 `lcd_nv3030b_register_flush_done_cb()`） |
+| 触摸坐标映射 | 触摸 IC 输出**物理玻璃坐标**（px∈0..239, py∈0..283），不随显示方向变化。本层只做与旋转无关的固定校准（0° 实测锚点）：`(Px, Py) = (283 − py, 239 − px)`，把玻璃坐标换到 284×240 面板物理坐标；各角度的物理→逻辑旋转**交给 LVGL 内置**（`lv_display_set_rotation` + `lv_display_rotate_point`）。⚠ `read_cb` 只能返回物理坐标：若本层再按角度自行映射，会被 LVGL 二次旋转（90/180/270° 方向错乱）。原逐档位 `s_touch_map[]` 表已废弃 |
+| 旋转切换 | 统一入口 `lvgl_port_set_rotation(rot)`：只调用 `lv_display_set_rotation()`（LVGL 软件旋转，flush 时逐块 `lv_draw_sw_rotate`），并让 `lcd_nv3030b_set_rotation()` **仅记录档位**——运行期**不向面板写 MADCTL、不手动改分辨率**（避免命令与颜色 DMA 并发冻结）。面板物理方向永久固定 `MADCTL=0x68`（284×240 横屏）。用户角度映射见 `lvgl_port.c` 的 `s_angle_to_lvrot[]`：ROT_90→0°、ROT_180→90°、ROT_270→180°、ROT_0→270° |
+| QSPI 时钟 | 写显存时钟 **23MHz**（当前量产取值）。实测 40MHz 花屏、30MHz 持续刷屏数秒后面板失锁；若换批次/改板出现刷屏冻结，依次降回 20/10MHz 定位，反向调高必须长时间刷屏验证 |
+| 中文字体 | 主界面用 **Noto Sans SC 子集 TTF**（`/spiffs/fonts/notosc_reg.ttf`、`notosc_bold.ttf`，GB2312 一级+二级 6763 字），由 `tools/fonts/make_fonts.py` 生成后烧入 storage 分区；运行期后台整读入 PSRAM，建 8 档字号（12/14/16/20/24/32/36/40px）×2 字重。启动页另有编进 app 的极小子集（约 197 字、34KB/字重，`make_splash_font.py`），首帧即完整中文。文件缺失时回退内置 montserrat14（仅 ASCII） |
+| 撕裂同步 | IO48 为 LCD_TE，当前驱动未使用。显示缓冲复用由「异步传输 + 传输完成回调」保证：驱动内部注册 panel IO 的 color-done 回调，并导出 `lcd_nv3030b_register_flush_done_cb()` 供上层接收通知 |
 
 ## 6. 中断与内存约束（软件实现时必须遵守）
 
@@ -162,14 +162,15 @@ IO46 触摸 INT       IO47 I2C SDA       IO48 LCD_TE       EN   CHIP_PU
 |---|---|
 | `ADC_DRDY#`（IO12）走中断 | 中断里只发信号量 / 任务通知，采样与换算交给任务；**中断服务函数及其调用的代码、数据必须放在内部 RAM（`IRAM_ATTR`），绝不能访问 PSRAM** |
 | 禁止忙等 | 任务看门狗已启用（5 秒）且检查两个核的 IDLE 任务，忙等会饿死 IDLE 导致复位 |
-| 大缓冲放 PSRAM | LVGL 的显示缓冲（双缓冲约 240×284×2×2 ≈ 273KB）应放 PSRAM，避免占满内部 RAM |
+| 大缓冲放 PSRAM | 三级波形缓冲（约 680KB）等大块数据放 PSRAM；但 **LVGL 显示缓冲不能放 PSRAM**——PARTIAL 双缓冲 + 软件旋转缓冲共 `3 × 284×24×2 ≈ 40.9KB`，必须放内部 RAM（DMA 只能读内部 RAM），`LVGL_PORT_BUF_ROWS` 是内部 RAM 里最大的可压缩项 |
 | 热数据放内部 RAM | 采样缓冲、中断相关数据放内部 RAM，保证访问时序确定 |
 
 ### ADS131M02 的帧同步要求（重要，寄存器访问出问题先看这条）
 
 `DRDY#` 不只是"数据就绪"标志，它**界定了 SPI 帧边界**：
 
-- 一帧 = `[STATUS][CH0][CH1]` = 3 个 24bit 字 = 9 字节；
+- 一帧 = `[STATUS][CH0][CH1][CRC]` = 4 个 24bit 字 = 12 字节；帧尾输出 CRC
+  **不可关闭**（16bit CRC 占第 4 字高 2 字节，末字节补 0），必须整帧读满；
 - 主机必须在**每个 DRDY 下降沿之后时钟恰好一帧**；
 - 命令字放在**帧的首字**，其响应出现在**下一帧的首字**（TI 手册：
   the device outputs the register contents in the command response word of the following frame）。
@@ -179,8 +180,9 @@ IO46 触摸 INT       IO47 I2C SDA       IO48 LCD_TE       EN   CHIP_PU
 **实测教训**：曾不等 DRDY、一次性时钟两帧就想读完响应，结果帧边界漂移，
 把**转换数据**当成了寄存器值——症状是回读值随每次上电都不同
 （GAIN1 读到 `0x0013`/`0x40A6`/`0x00A6`，器件 ID 读到 `0x2818`/`0x333E`）。
-改成 DRDY 同步后，`WREG` 应答 `0x4200`、`GAIN1` 回读 `0x0040`、
-器件 ID 读回 `0x2205`（与手册一致）三者全部正确。
+另外早期驱动只读 3 字（漏掉 CRC 字），无 CS 接法下帧错位可持续数秒不自愈。
+改成「DRDY 同步 + 整帧 4 字 + CRC-16/CCITT 校验」后，`WREG` 应答 `0x4200`、
+`GAIN1` 回读 `0x0040`、器件 ID 读回 `0x2205`（与手册一致）三者全部正确。
 
 **通信锚点**：优先看**器件 ID 寄存器（0x00）**——只读、值固定（典型 `0x2205`），
 能读回即说明 SPI 模式、字序、DRDY 帧同步都正常。

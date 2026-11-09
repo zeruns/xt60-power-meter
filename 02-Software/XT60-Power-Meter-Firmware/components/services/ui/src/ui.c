@@ -16,7 +16,7 @@
  * 由本任务消费（绝不在回调里碰 LVGL）。
  *
  * 【给初学者的导航设计导读】
- * 三页之间的循环滑动（测量页右滑跳到设置页、设置页左滑跳回测量页）由
+ * 三页之间的横滑翻页（首末页到头即止，2026-10 起已取消环形翻页）由
  * ui_nav.c 实现。这里只提示一个关键点：方向判定必须在 LV_EVENT_RELEASED
  * 阶段用"总位移"（按下点→抬起点）计算，而不能在 LV_EVENT_SCROLL 里用
  * 单帧增量——原因是滑动过程中 tileview 在端页会被拖出边界，松手时 LVGL
@@ -25,7 +25,8 @@
  *
  * 本文件的启动流程（task_ui 内顺序执行）：
  *   ① 启动画面 splash（进度由 app_init 的真实初始化步骤/自检项驱动）；
- *   ①.5 若有外设初始化故障 → 弹 msgbox，等用户点"确定"才进主界面
+ *   ①.5 若有外设故障（初始化失败或自检未通过）→ 弹 msgbox，确认后才进
+ *        主界面：触摸点"确定"、按任意键、或 30s 超时三者任一即放行
  *        （为什么先弹再进：故障信息必须让用户看到并确认，不能一闪而过）；
  *   ② 构建主界面三页（ui_nav_build）；
  *   ③ 主循环：快照环采样 + 按页面节奏刷新 + 消费按键队列。
@@ -81,7 +82,7 @@ static const char *TAG = "ui";
 #define UI_BOOT_LABEL_LEN 48          /**< 启动页阶段文字缓冲（UTF-8，够放"测量前端 17/23"） */
 #define UI_REFRESH_DEFAULT_HZ 5       /**< 测量页默认刷新率 */
 #define UI_SAMPLE_PERIOD_US 25000     /**< 快照环采样周期（25ms=40Hz，与测量核
-                                       *   PM_DISPLAY_SUBWINDOW 的快拍频率一致） */
+                                       *   PM_DISPLAY_SUBWINDOW_US 的快拍频率一致） */
 #define UI_RING_SIZE 40               /**< 1 秒快照环（40 帧 @40Hz） */
 #define UI_WAVE_PERIOD_US 40000       /**< 波形页固定 25Hz（图面流畅，独立于测量页） */
 #define UI_STATUSBAR_PERIOD_US 200000 /**< 状态栏/设置页 5Hz */
@@ -95,7 +96,12 @@ static bool s_ui_inited = false; /**< ui_init 防重复初始化标志 */
  *
  * 写者：app_init 的初始化循环（app_main 任务）；读者：UI 任务。
  * 只共享"已完成/总数/阶段文字"三个简单字段，用 portMUX 临界区保护；
- * 双方都不在临界区里碰 LVGL，避免把渲染锁和进度锁缠在一起。 */
+ * 双方都不在临界区里碰 LVGL，避免把渲染锁和进度锁缠在一起。
+ *
+ * 【初学者】portMUX_TYPE 是 ESP-IDF 的"自旋锁"：portENTER_CRITICAL /
+ * portEXIT_CRITICAL 之间会关掉本核中断（必要时与其他核互斥），因此临界区
+ * 必须极短——只放几条字段赋值和一次短字符串拷贝（snprintf），绝不能调用
+ * vTaskDelay、日志打印、LVGL 等可能阻塞或耗时的函数。 */
 static portMUX_TYPE s_boot_mux = portMUX_INITIALIZER_UNLOCKED;
 static uint32_t s_boot_done = 0;                     /**< 已完成步数 */
 static uint32_t s_boot_total = 1;                    /**< 总步数（至少 1，防除零） */
@@ -126,9 +132,9 @@ static volatile uint8_t s_rate_hz = UI_REFRESH_DEFAULT_HZ;
 /* 快照历史环：40Hz 采样（测量核的快速显示帧），供测量页各档位做窗口平均。
  * 单写者是测量核；这里只读，seqlock 保证帧自洽。 */
 #define SNAP_HIST UI_RING_SIZE            /**< 历史环帧数（= 1 秒 @40Hz） */
-/* 【v0.6.2 内存优化】快照环从 BSS 移到 PSRAM 堆：40 × sizeof(snapshot) ≈ 4KB。
- * 它每秒被读写 40 次但每次只拷 ~96 字节（约 4KB/s），PSRAM 带宽完全够；
- * 换来的是内部 RAM 的 4KB 静态占用（.bss）改为按需堆分配。
+/* 【v0.6.2 内存优化】快照环从 BSS 移到 PSRAM 堆：40 × sizeof(snapshot) ≈ 2.7KB。
+ * 它每秒被读写 40 次但每次只拷 ~68 字节（约 2.7KB/s），PSRAM 带宽完全够；
+ * 换来的是内部 RAM 的约 2.7KB 静态占用（.bss）改为按需堆分配。
  * 分配失败时退化为"没有历史环"：UI 直接读最新快照，只是低刷新率档位
  * 失去多帧平均的平滑效果，不影响正确性。 */
 static data_store_snapshot_t *s_hist = NULL; /**< 快照环形缓冲：新帧覆盖最旧帧 */
@@ -414,7 +420,7 @@ void ui_note_user_activity(void)
  * @brief UI 任务：启动画面 → 主界面 → 循环驱动 LVGL
  *
  * 界面构建放在本任务（而非 ui_init()）的原因：app_main 任务栈仅 3.5KB，
- * LVGL 递归建对象极易栈溢出；本任务栈 12KB，职责边界清晰。
+ * LVGL 递归建对象极易栈溢出；本任务栈 16KB，职责边界清晰。
  *
  * 主循环节奏（重要）：
  *   LVGL 的 lv_timer_handler() 与心跳已由 ESP 官方 esp_lvgl_port 的内部任务
@@ -702,7 +708,10 @@ static void task_ui(void *arg)
      * 这比只看"渲染停滞"更精确。注意 CONFIG_ESP_TASK_WDT_PANIC 未开启，
      * 所以只告警、不重启，不影响现场（可安心作为常驻诊断）。
      * LVGL 任务（taskLVGL）由官方 esp_lvgl_port 创建、无法在其循环里喂狗，
-     * 故不订阅它——改用 app_tasks 的 flush 增量检测（见 app_tasks.c）。 */
+     * 故不订阅它——改用 app_tasks 的 flush 增量检测（见 app_tasks.c）。
+     * 【初学者】esp_task_wdt_add(NULL)：句柄传 NULL 表示"把当前任务"加入
+     * 任务看门狗（TWDT），加入后必须周期性 esp_task_wdt_reset() 喂狗，
+     * 否则超时（本工程 5s）会打印卡住的任务名与调用栈。 */
     if (esp_task_wdt_add(NULL) != ESP_OK) {
         ESP_LOGW(TAG, "UI 任务加入看门狗失败（不影响功能，仅少一项诊断）");
     }
@@ -967,7 +976,12 @@ esp_err_t ui_init(void)
         return ESP_ERR_INVALID_STATE;
     }
 
-    /* xTaskCreatePinnedToCoreWithCaps：创建任务并绑定 Core 0（交互核）。
+    /* xTaskCreatePinnedToCoreWithCaps(入口函数, 任务名, 栈字节数, 入参,
+     *                                 优先级, 句柄出参, 核号, caps)：
+     * 与 xTaskCreatePinnedToCore 的唯一区别是最后多一个 caps 参数——它指定
+     * "任务控制块 + 任务栈"从哪类内存分配（MALLOC_CAP_INTERNAL=内部 RAM，
+     * MALLOC_CAP_SPIRAM=PSRAM）。栈字节数在 ESP-IDF 里按字节计，不是"字"。
+     * 本工程用内部 RAM（见下面 v0.6.3 的取舍说明）。
      * 【v0.6.3 性能】栈由 PSRAM 改回**内部 RAM**：v0.6.1 把
      * SPIRAM_MALLOC_ALWAYSINTERNAL 降到 0 后内部 RAM 空闲约 130KB
      *（v0.6.0 当时"仅剩百字节级"的情况已不复存在），而 UI 任务栈是

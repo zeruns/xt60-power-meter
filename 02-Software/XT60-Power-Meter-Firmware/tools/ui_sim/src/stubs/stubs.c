@@ -1,6 +1,6 @@
 /**
  * @file stubs.c
- * @brief 模拟器桩实现：错误码名字 + 应用描述
+ * @brief 模拟器桩实现：错误码名字、应用描述、UI 刷新率、用户活动上报、时间戳
  */
 #include "esp_err.h"
 #include "esp_app_desc.h"
@@ -33,7 +33,9 @@ const char *esp_err_to_name(esp_err_t code)
 
 const esp_app_desc_t *esp_app_get_description(void)
 {
-    /* 版本号可在构建时用 -DSIM_FW_VERSION="x.y.z" 覆盖，默认与 version.txt 对齐 */
+    /* 版本号由构建参数 -DSIM_FW_VERSION="x.y.z" 注入（tools/ui_sim/CMakeLists.txt
+     * 当前写的是 0.2.0，并未从 version.txt 自动取值）；未注入时用下面的默认值。
+     * 注意：它与固件版本（version.txt）不是同一来源。 */
 #ifndef SIM_FW_VERSION
 #define SIM_FW_VERSION "0.1.0"
 #endif
@@ -69,9 +71,10 @@ void ui_note_user_activity(void)
 {
 }
 
-/* ---- ESP-IDF 软件定时器桩：与真机同语义的"单调微秒时间戳" ----
- * 真机上 esp_timer_get_time() 返回自启动以来的微秒数；模拟器用
- * timespec_get(CLOCK_MONOTONIC) 换算，保证单调递增、量级一致。 */
+/* ---- ESP-IDF 软件定时器桩：微秒时间戳 ----
+ * 真机上 esp_timer_get_time() 返回自启动以来的微秒数（单调递增）；
+ * 模拟器用 timespec_get(TIME_UTC) 取系统时间换算成微秒，量级一致，
+ * 但不保证严格单调（只用于超时/耗时比较，不作为计时基准）。 */
 int64_t esp_timer_get_time(void)
 {
     struct timespec ts;

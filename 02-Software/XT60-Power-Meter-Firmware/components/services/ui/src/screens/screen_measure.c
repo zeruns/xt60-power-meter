@@ -42,7 +42,7 @@
  *     （长按开/关菜单、单击移焦点、双击执行），适配不带触摸的使用场景；
  *   · **操作先确认再关闭子菜单**：「清除电能统计」先弹确认框（v0.6.8，
  *     与设置页同一共享弹窗），确定后执行清零并自动收起菜单；
- *   · 字体统一走 lvgl_port_get_font()（本项目按 12~40px 共 7 档预生成
+ *   · 字体统一走 lvgl_port_get_font()（本项目按 12~40px 共 8 档预生成
  *     Noto Sans SC tiny_ttf），不用 LVGL 内置字体，保证中英文风格一致。
  *
  * 页面生命周期：ui_nav 负责创建/刷新本页，屏幕旋转后 ui_nav 会销毁并重建
@@ -129,7 +129,8 @@ static measure_geom_t measure_geom(void)
     } else {
         /* 竖屏 240×284（90°/270°）：行高 44→54、数字 36→40px。
          * 40px Bold 下最宽 8 字符≈182px，加单位/箭头 ≤207px < 行内可用
-         * 212px，不溢出。行间距由 4 收到 2：四行底 30+4×54+3×2=252，
+         * 212px，不溢出。行间距同为 2（与横屏 ROW_GAP 相同）：四行底
+         * 30+4×54+3×2=252，
          * 底部空档 252..284=32px 恰好放下两行 16px 小字（252/268），
          * 既不压数据条也不贴出屏底。 */
         g.row_top = 30;
@@ -266,7 +267,8 @@ void screen_measure_create(lv_obj_t *tile)
     create_row(tile, (int)g.row_top + 2 * row_pitch, row_w, row_h, g.val_font, COL_P, &s_p, false);
     create_row(tile, (int)g.row_top + 3 * row_pitch, row_w, row_h, g.val_font, COL_E, &s_e, false);
     /* 电能数据条可点击：在 Wh / Ah 之间切换显示（需求 2026-10：底部取消恒显 Ah）。
-     * create_row 里对象默认不响应点击，此处显式加 CLICKABLE 并挂点击回调。 */
+     * 该行需要接收点击，故显式加 CLICKABLE 并挂点击回调（挂在整个色条上，
+     * 比只让数字可点更好按）。 */
     lv_obj_add_flag(s_e.row, LV_OBJ_FLAG_CLICKABLE);
     lv_obj_add_event_cb(s_e.row, energy_row_click_cb, LV_EVENT_CLICKED, NULL);
 
@@ -318,7 +320,8 @@ void screen_measure_create(lv_obj_t *tile)
  *   |v| < 1        → 5 位小数（0.01886）
  *   1 ≤ |v| < 100  → 4 位小数（19.9767）
  *   100 ≤ |v| <1e4 → 2 位小数（1234.56）
- *   ≥ 1e4          → 0 位小数（12345）
+ *   1e4 ≤ |v| <1e6 → 0 位小数（12345）
+ *   ≥ 1e6          → 科学计数法（1.23e+06，避免超宽挤掉单位）
  *   NaN / ±inf     → "----"（坏帧占位，不冒充真实读数）
  *
  * 为什么要分级：固定小数位会在小数值上丢精度（0.01886 显示成 0.02），

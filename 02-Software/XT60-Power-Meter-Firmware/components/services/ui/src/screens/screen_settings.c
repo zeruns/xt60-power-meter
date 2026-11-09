@@ -1,23 +1,24 @@
 /**
  * @file screen_settings.c
- * @brief 设置页：2×4 功能网格入口 + 六个功能二级页（v0.2.0 设置全可用）
+ * @brief 设置页：2×4 功能网格入口（8 个功能格）+ 各功能二级页
+ *        （测量设置/显示/蜂鸣器/WiFi/电能统计/告警，另有 WiFi 扫描独立页）
  *
  * ────────────────────────────────────────────────────────────
  * 版式（284×240；顶部 22px 状态栏由 ui_nav 共享，不在本页职责内）
  * ────────────────────────────────────────────────────────────
  * 首页（网格一屏尽收，无需滚动）：
  *   ┌ x=14 ──────────────────── x=270 ┐
- *   │ 设置                              │ y≈28 标题（Bold 20）
+ *   │ 设置                              │ y=24 标题（Bold 20）
  *   │ ┌──────────┐ ┌──────────┐        │ y=52
- *   │ │ 测量设置  │ │ 显示设置  │        │ 每格约 122×40
+ *   │ │ 测量设置  │ │ 显示设置  │        │ 每格约 123×40
  *   │ └──────────┘ └──────────┘        │
- *   │ ┌──────────┐ ┌──────────┐        │ y=98
+ *   │ ┌──────────┐ ┌──────────┐        │ y=100
  *   │ │ 蜂鸣器    │ │ WiFi     │        │
  *   │ └──────────┘ └──────────┘        │
- *   │ ┌──────────┐ ┌──────────┐        │ y=144
+ *   │ ┌──────────┐ ┌──────────┐        │ y=148
  *   │ │ 电能统计  │ │ 告警设置  │        │
  *   │ └──────────┘ └──────────┘        │
- *   │ ┌──────────┐ ┌──────────┐        │ y=190
+ *   │ ┌──────────┐ ┌──────────┐        │ y=196
  *   │ │ 关于本机  │ │ 恢复出厂  │        │ 第 8 格＝恢复出厂（F6）
  *   │ └──────────┘ └──────────┘        │
  *   └──────────────────────────────────┘
@@ -56,7 +57,9 @@
  * 关键交互约定（全项目 UI 通用，本页严格落实）
  * ────────────────────────────────────────────────────────────
  *   · **纯按键可达**：二级页全部操作都做成按钮/开关/滑条等可聚焦控件，
- *     不依赖触屏手势；"返回"固定在标题栏左上，任何子页都不会把用户困住。
+ *     不依赖触屏手势（例外：WiFi 密码这类文本输入仍需触屏键盘，但
+ *     "取消/连接"已做成按键可操作）；"返回"固定在标题栏左上，任何子页都
+ *     不会把用户困住。
  *     按键操作体系（详见文件尾 screen_settings_key 与"焦点链机制"一节）：
  *     设置首页长按 K2 进入网格焦点模式（单击移焦点、长按 K2 打开焦点格），
  *     任意二级页内单击 K1/K2 移焦点、长按 K2 激活（按钮=点击、开关=切换、
@@ -76,8 +79,9 @@
  * ────────────────────────────────────────────────────────────
  * 实时数值刷新
  * ────────────────────────────────────────────────────────────
- * 校准向导与电能统计页需要实时值，由 ui_nav_refresh 以 5Hz 转发快照到
- * screen_settings_refresh()，本文件按"当前二级页类型"分发更新对应标签。
+ * 校准向导与电能统计页需要实时值：真机由 ui.c 主循环以 5Hz 直接调用
+ * screen_settings_refresh()（模拟器经 ui_nav_refresh 转发同一快照），
+ * 本文件按"当前二级页类型"分发更新对应标签。
  */
 #include "screen_settings.h"
 
@@ -130,7 +134,7 @@ static const char *TAG = "set_ui";
 #define GRID_SIDE_PAD 14 /**< 左右内缩（避开面板圆角） */
 #define GRID_TOP_Y    52 /**< 网格起始 y */
 #define CELL_HEIGHT   40 /**< 单格高度（40px 仍达触摸目标下限；4 行后压到此高度
-                          *   才能一屏放下 7 个功能格） */
+                          *   才能一屏放下 8 个功能格） */
 #define CELL_GAP_X    10 /**< 网格两列之间的间距 */
 #define CELL_GAP_Y    8  /**< 网格四行之间的间距 */
 
@@ -234,7 +238,7 @@ static lv_obj_t *s_angle_btns[4] = { 0 }; /**< 0/90/180/270 度按钮 */
 static lv_obj_t *s_auto_switch = NULL;    /**< 重力自动旋转开关 */
 static const uint16_t s_angle_vals[4] = { 0, 90, 180, 270 };
 
-#define GRID_CELL_COUNT 8 /**< 设置首页网格功能格数（7 个功能 + 1 个留空位） */
+#define GRID_CELL_COUNT 8 /**< 设置首页网格功能格数（2×4 共 8 格，全部为功能格） */
 
 /* ---- 设置首页网格焦点（二级页全关时由长按 K2 进入） ---- */
 static lv_obj_t *s_grid_cells[GRID_CELL_COUNT] = { 0 }; /**< 各格按钮（登记顺序＝焦点顺序） */
@@ -243,7 +247,7 @@ static int s_grid_idx = 0;           /**< 网格焦点格下标（跨子页往�
 
 /** 校准完成 1.4s 自动关页定时器（句柄管理：关页/切页时显式删除，防误关新页面） */
 static lv_timer_t *s_close_timer = NULL;
-static lv_timer_t *s_zero_timer = NULL; /**< 清零采样定时器（40ms 轮询；声明在此因 subpage_close 等需提前引用） */
+static lv_timer_t *s_zero_timer = NULL; /**< 清零采样定时器（100ms 轮询；声明在此因 subpage_close 等需提前引用） */
 
 /* ============================================================
  * 对话框（【v0.6.8】基础设施上移为共享模块 ui_msgbox.c，本页只留薄封装）
@@ -396,7 +400,9 @@ static lv_obj_t *plain_button(lv_obj_t *parent, const char *text, int32_t w, int
  * 按键反馈鸣叫由 ui_nav_handle_key 统一播放，本文件不重复响。
  * ============================================================ */
 
-#define FOCUS_MAX 10  /**< 焦点链容量（最长子页 9 控件：告警页 3×2± + 3 开关） */
+#define FOCUS_MAX 10  /**< 焦点链容量（告警页最多 9 控件：3 行×2 个 ± 按钮 + 3 开关）。
+                       *   WiFi 扫描页「重扫 + 12 行」会超出容量：focus_add 直接
+                       *   忽略多余登记，按键只在前 10 项之间遍历。 */
 #define SLIDER_STEP 5 /**< 滑条按键步进（百分点：10~100 档 20 步走完） */
 
 static lv_obj_t *s_focus_widgets[FOCUS_MAX]; /**< 焦点链：当前子页可操作控件 */
@@ -564,8 +570,8 @@ static void slider_step(int dir)
 /**
  * @brief 退出滑条调节模式：补发 RELEASED 让回调落盘
  *
- * 亮度/响度回调的策略是"拖动中只改内存缓存、松手才 settings_save_now()"
- * （省 NVS 擦写寿命）。按键路径没有真实"松手"，退出调节时合成一次
+ * 亮度/响度回调的策略是"拖动中只改内存缓存、松手才 settings_request_save()"
+ * 请求落盘（省 NVS 擦写寿命）。按键路径没有真实"松手"，退出调节时合成一次
  * RELEASED 事件即可复用同一落盘逻辑（lv_event_get_user_data 在合成事件里
  * 会取到注册回调时的 user_data，回调行为与触摸路径完全一致）。
  */
@@ -576,7 +582,7 @@ static void slider_edit_exit(void)
     }
     lv_obj_t *w = s_focus_widgets[s_focus_idx];
     s_slider_edit = false;
-    lv_obj_send_event(w, LV_EVENT_RELEASED, NULL); /* 触发 settings_save_now() 落盘 */
+    lv_obj_send_event(w, LV_EVENT_RELEASED, NULL); /* 触发 settings_request_save() 请求落盘 */
     focus_paint();
 }
 
@@ -586,8 +592,8 @@ static void slider_edit_exit(void)
  * 按控件类型分派（lv_obj_check_type 比对 LVGL 控件类对象）：
  *   · 滑条  → 进入调节模式（后续单击=减/加，长按 K2=退出）；
  *   · 开关  → 翻转 CHECKED 状态并补发 VALUE_CHANGED（回调读状态执行业务）；
- *   · 其余（按钮/msgbox footer 按钮）→ 合成一次 LV_EVENT_CLICKED。
- * 合成 CLICKED 是可靠的：lv_event_send 会把注册回调时的 user_data 注入事件，
+ *   · 其余（普通按钮等）→ 合成一次 LV_EVENT_CLICKED。
+ * 合成 CLICKED 是可靠的：lv_obj_send_event 会把注册回调时的 user_data 注入事件，
  * 业务回调拿到的参数与触摸点击完全一致（如通道按钮的通道标志、确认框的 ok_cb）。
  */
 static void focus_activate(void)
@@ -751,7 +757,7 @@ static lv_obj_t *subpage_open(sub_kind_t kind, const char *title)
     lv_obj_remove_style_all(bar);
     lv_obj_set_size(bar, LV_PCT(100), SUB_TOPBAR_H);
     lv_obj_set_scrollable(bar, false);
-    lv_obj_set_style_border_side(bar, LV_BORDER_SIDE_BOTTOM, 0);
+    lv_obj_set_style_border_side(bar, LV_BORDER_SIDE_BOTTOM, 0); /* 只画底边：充当标题栏分隔线 */
     lv_obj_set_style_border_width(bar, 1, 0);
     lv_obj_set_style_border_color(bar, COL_BORDER, 0);
 
@@ -760,6 +766,10 @@ static lv_obj_t *subpage_open(sub_kind_t kind, const char *title)
     lv_obj_align(back, LV_ALIGN_LEFT_MID, 2, 0);    /* lv_obj_align：相对父对象（标题栏）左端垂直居中 */
     press_feedback_styles(back); /* 按下反馈与普通按钮一致（Bug2） */
     lv_obj_set_style_radius(back, 6, 0);
+    /* lv_obj_add_event_cb(对象, 回调, 事件码, user_data)：把 C 回调挂到对象的
+     * 事件上。LV_EVENT_CLICKED = 点击释放时触发；第 4 参 user_data 会原样带进
+     * 回调（用 lv_event_get_user_data(e) 取回），常用于"同一回调服务多个按钮、
+     * 靠参数区分是哪一个"。 */
     lv_obj_add_event_cb(back, back_clicked_cb, LV_EVENT_CLICKED, NULL);
     {
         lv_obj_t *bl = plain_label(back, "< 返回", LVGL_PORT_FONT_14, COL_INK, false);
@@ -1012,7 +1022,9 @@ static void calib_apply_cb(lv_event_t *e)
     lv_obj_set_style_text_align(done, LV_TEXT_ALIGN_CENTER, 0);
     lv_obj_set_style_margin_top(done, 24, 0); /* margin_top：外边距（与内边距 pad 不同，撑开与上文距离） */
 
-    /* lv_timer_create：1400ms 后触发一次自动关页。
+    /* lv_timer_create(回调, 周期毫秒, user_data)：创建 LVGL 定时器，周期到就在
+     * LVGL 任务上下文里调用回调（回调内可用 lv_timer_delete 自删，实现"一次性"）。
+     * 这里 1400ms 后触发一次自动关页。
      * ① 句柄存 s_close_timer：subpage_close() 会在用户提前切页/返回时显式删掉它
      *    （防"新页面被旧定时器误关"，见 close_timer_cb 注释）；
      * ② user_data 携带目标子页类型 SUB_CALIB_DONE：回调据此校验"要关的还是
@@ -1020,25 +1032,23 @@ static void calib_apply_cb(lv_event_t *e)
     s_close_timer = lv_timer_create(close_timer_cb, 1400, (void *)(intptr_t)SUB_CALIB_DONE);
 }
 
-/**
- * @brief 电流零点一键清零（空载校零，v0.6.6：改为采样 **3 秒块均值**）
- *
- * 输出空载时点击：把电流零偏 offset 调到「抵消采样平均值」的位置，使显示
- * 立即归零。物理量 = raw×gain + offset，故 offset_new = offset_old − 采样均值。
- *
- * 【v0.6.6 需求 5 的实现变更】
- *   旧版在 UI 侧用 lv_timer 每 40ms 读一次 data_store 快照、累计 1 秒求平均。
- *   现在统一交给**测量核**：`power_measure_zero_current_start()` 在 200ms 块边界
- *   累计电流块均值，满 3 秒（15 块）后调整零偏并 deferred 落盘。
- *   为什么更好：
- *     · 块均值是电流的权威口径（与正式测量同源），不受显示平滑/抽取影响；
- *     · 3 秒 15 块样本比 1 秒约 25 个显示帧更抗毛刺；
- *     · 网页控制台的「电流清零」按钮调用同一接口，两边口径一致。
- *   UI 侧只保留一个 100ms 轮询定时器，用来在采样结束后弹结果提示。
- *
- * @param e LVGL 点击事件（未使用）
- */
 /* 清零轮询定时器声明见文件前部（s_close_timer 旁） */
+/**
+ * @brief 清零采样结束轮询（100ms）：测量核采样完成后自删定时器并弹结果
+ *
+ * 【v0.6.6 需求 5 的实现】电流零点一键清零改为在**测量核**采样：
+ * `power_measure_zero_current_start()` 在 200ms 块边界累计电流块均值，
+ * 满 3 秒（15 块）后把零偏 offset 调到「抵消采样平均值」的位置
+ * （物理量 = raw×gain + offset，故 offset_new = offset_old − 采样均值），
+ * 并 deferred 落盘。相比旧版在 UI 侧用 lv_timer 每 40ms 读一次 data_store
+ * 快照、累计 1 秒求平均，这样做更好：
+ *   · 块均值是电流的权威口径（与正式测量同源），不受显示平滑/抽取影响；
+ *   · 3 秒 15 块样本比 1 秒约 25 个显示帧更抗毛刺；
+ *   · 网页控制台的「电流清零」按钮调用同一接口，两边口径一致。
+ * UI 侧只保留本定时器（100ms），用来在采样结束后弹结果提示。
+ *
+ * @param t 触发本次轮询的定时器（采样结束后本函数自删它）
+ */
 static void zero_sample_timer_cb(lv_timer_t *t)
 {
     (void)t;
@@ -1056,6 +1066,14 @@ static void zero_sample_timer_cb(lv_timer_t *t)
     show_notice("已清零", text);
 }
 
+/**
+ * @brief 电流通道"一键清零（空载）"按钮：启动测量核的 3 秒块均值采样
+ *
+ * 采样与零偏修正都在测量核完成（见 zero_sample_timer_cb 的说明），
+ * 本回调只负责发起请求并弹出"正在清零"提示。
+ *
+ * @param e LVGL 点击事件（未使用）
+ */
 static void calib_zero_cb(lv_event_t *e)
 {
     (void)e;
@@ -1295,7 +1313,8 @@ static void sync_slider_ui(lv_obj_t *sl, lv_obj_t *lbl, int32_t v, const char *f
  * @brief 亮度滑条变化/松手 → 立即调光 + 更新数值标签 + 落盘
  *
  * 拖动中（VALUE_CHANGED）实时生效并只改内存缓存；松手（RELEASED）才
- * settings_save_now() 写 Flash——避免拖动过程高频写 NVS（Flash 有擦写寿命）。
+ * settings_request_save() 请求落盘（后台任务异步写 Flash，不阻塞 UI）——
+ * 避免拖动过程高频写 NVS（Flash 有擦写寿命）。
  *
  * @param e LVGL 事件（VALUE_CHANGED=拖动中 / RELEASED=松手，同一个回调两种触发）
  */
@@ -1482,7 +1501,7 @@ static void display_open_cb(void)
  * @brief 响度滑条变化/松手 → 立即改音量 + 更新数值标签 + 落盘
  *
  * 与亮度滑条同款策略：拖动中只改内存缓存（buzzer_set_volume 立即生效），
- * 松手才 settings_save_now() 写 Flash（省 NVS 擦写寿命）。
+ * 松手才 settings_request_save() 请求落盘（省 NVS 擦写寿命）。
  *
  * @param e LVGL 事件（VALUE_CHANGED=拖动中 / RELEASED=松手）
  */
@@ -1687,7 +1706,7 @@ static void wifi_ap_row_clicked_cb(lv_event_t *e)
  * @brief 渲染扫描结果列表（扫描完成后调用一次）
  *
  * 取 wifi_manager 的扫描缓存（最多 WIFI_UI_LIST_MAX 条），按 RSSI 降序
- * 排列后逐行创建。行高 32px：触屏目标达标，且 12 行可在内容区滚动查看。
+ * 排列后逐行创建。行高 40px（v0.6.2 起）：触屏目标达标，且 12 行可在内容区滚动查看。
  * 每行都登记到焦点链，纯按键环境下也能用 K1/K2 选中并打开密码框。
  */
 static void wifi_render_ap_list(void)
@@ -2048,7 +2067,7 @@ static void passkey_submit_cb(lv_event_t *e)
  * 版式（284×240，顶部 22px 让开共享状态栏）：
  *   标题（"连接 <SSID>"，16px 粗体）
  *   密码输入框（单行、密码模式、34px）
- *   lv_keyboard（TEXT_LOWER，116px）
+ *   lv_keyboard（TEXT_LOWER，100px）
  *   [取消] [连接]（各 50%，32px）
  *
  * @param ssid 目标热点名（浮层标题显示它，连接时使用它）
@@ -2083,6 +2102,9 @@ static void passkey_open(const char *ssid)
     lv_obj_set_style_text_align(tl, LV_TEXT_ALIGN_CENTER, 0);
 
     /* 密码框：密码模式 + 自定义掩码字符。
+     * lv_textarea_create：创建文本输入框（字符/粘贴由 lv_keyboard 或实体键盘送进）。
+     * lv_textarea_set_one_line=true 禁止换行；set_password_mode=true 让输入显示成
+     * 掩码；set_max_length 限制字符数（缓冲区长度含结尾 0，故取 -1）。
      * 掩码必须用 ASCII "*"：LVGL 默认掩码是 U+2022（•），该字形不在本工程
      * 的中文字体子集里，真机可能显示成方框（字体审计会报缺失）。 */
     s_passkey_ta = lv_textarea_create(p);
@@ -2094,6 +2116,9 @@ static void passkey_open(const char *ssid)
     lv_textarea_set_max_length(s_passkey_ta, WIFI_MANAGER_PASS_MAX_LEN - 1);
     lv_obj_set_style_text_font(s_passkey_ta, lvgl_port_get_font(LVGL_PORT_FONT_16), 0);
 
+    /* lv_keyboard_create：创建屏幕键盘（自带按键矩阵的独立控件）。
+     * lv_keyboard_set_mode 选择键位布局（TEXT_LOWER=小写字母+数字+常用符号）；
+     * lv_keyboard_set_textarea 把键盘与输入框绑定——按键字符自动写进该 textarea。 */
     lv_obj_t *kb = lv_keyboard_create(p);
     lv_obj_set_width(kb, LV_PCT(100));
     lv_obj_set_height(kb, 100); /* 4 行按键 → 每键约 24px 高，且保证底部按钮在屏内 */
@@ -2127,7 +2152,8 @@ static void passkey_open(const char *ssid)
  * @brief 刷新 WiFi 状态行与提示行（建页时与 5Hz 刷新各调一次）
  *
  * 状态行格式（wifi_manager_get_state 中文名 + IP 或热点名）：
- *   已连接   → "已连接 · IP x.x.x.x"（取不到 IP 显示 "--"）；
+ *   已连接   → "已连接 · IP x.x.x.x · -52 dBm"（取不到 IP 显示 "--"，
+ *              取不到 RSSI 时省略 dBm 段）；
  *   配网模式 → "配网模式 · 热点 <wifi_manager_get_ap_ssid>"；
  *   连接中   → "连接中 · <已保存热点名>"（无凭据时只显示状态名）；
  *   未启动 / 连接失败 → 只显示状态名。
@@ -2144,9 +2170,10 @@ static void wifi_update_status(void)
     }
     /* 【v0.6.0 复核】本函数以 5Hz 在"持有 LVGL 锁"的 UI 主循环里被调用，
      * 因此它调用的每个 wifi_manager 接口都必须是**非阻塞**的。
-     * 已逐一核对实现（wifi_manager.c）：get_state/get_ip/get_ssid/get_ap_ssid
-     * 全部是 portENTER_CRITICAL 保护的快照拷贝，不等待内部命令任务，
-     * 不会阻塞 LVGL 锁。若将来给它们加"等待应答"的语义，必须回头改本函数。 */
+     * 已逐一核对实现（wifi_manager.c）：get_state/get_ip/get_ssid/get_ap_ssid/
+     * get_rssi/get_ap_pass 全部是 portENTER_CRITICAL 保护的快照拷贝，不等待
+     * 内部命令任务，不会阻塞 LVGL 锁。若将来给它们加"等待应答"的语义，
+     * 必须回头改本函数。 */
     wifi_manager_state_t st = wifi_manager_get_state();
     const char *name = (st <= WIFI_MANAGER_STATE_FAILED) ? s_wifi_state_names[st] : "未知";
     char line[64];
@@ -2294,12 +2321,12 @@ static void wifi_forget_clicked_cb(lv_event_t *e)
 }
 
 /**
- * @brief 打开"WiFi 与热点"二级页（真实状态页：状态/IP 或热点名 + 忘记网络）
+ * @brief 打开"WiFi 与热点"二级页（状态/IP 或热点名 + 模式三档 + 搜索/忘记网络）
  *
  * 状态来自 wifi_manager（middleware 数据面）：未启动/连接中/已连接/配网模式/
  * 连接失败；已连接显示 IP、配网模式显示热点名与配网指引。
- * 纯按键可达：唯一可操作控件（忘记网络按钮）登记焦点链，
- * "返回"固定在标题栏（长按 K1），长按 K2 激活焦点按钮弹确认框。
+ * 纯按键可达：页内可操作控件（三档模式按钮 → 搜索 Wi-Fi → 忘记网络）
+ * 依次登记焦点链，"返回"固定在标题栏（长按 K1），长按 K2 激活焦点控件。
  */
 static void wifi_open_cb(void)
 {
@@ -2463,7 +2490,7 @@ static void energy_open_cb(void)
 typedef void (*numkey_ok_cb_t)(float value);
 
 /* 同一时刻只允许一个数字键盘弹窗，故这些状态用文件级静态变量即可 */
-static lv_obj_t *s_numkey_box = NULL;   /**< 弹窗本体（lv_msgbox）；NULL=未打开 */
+static lv_obj_t *s_numkey_box = NULL;   /**< 浮层本体（普通 lv_obj 全屏浮层，非 lv_msgbox）；NULL=未打开 */
 static lv_obj_t *s_numkey_ta = NULL;    /**< 弹窗内的输入框 */
 static lv_obj_t *s_numkey_hint = NULL;  /**< 校验失败提示行（复用正文区最后一行） */
 static numkey_ok_cb_t s_numkey_ok = NULL; /**< 确定回调 */
@@ -2897,7 +2924,9 @@ static lv_obj_t *alarm_add_limit_row(lv_obj_t *c, int row, const char *name)
     s_alarm_value_labels[row] = plain_label(grp, "--", LVGL_PORT_FONT_16, COL_PRIMARY, true);
     lv_obj_set_width(s_alarm_value_labels[row], 72);
     lv_obj_set_style_text_align(s_alarm_value_labels[row], LV_TEXT_ALIGN_CENTER, 0);
-    /* 可点击 + 下划线提示（点击弹数字键盘，见 alarm_value_clicked_cb） */
+    /* 可点击 + 下划线提示（点击弹数字键盘，见 alarm_value_clicked_cb）。
+     * lv_obj_add_flag 给对象加标志位：label 默认不参与触摸命中，必须加
+     * LV_OBJ_FLAG_CLICKABLE 才会收到 CLICKED 事件。 */
     lv_obj_add_flag(s_alarm_value_labels[row], LV_OBJ_FLAG_CLICKABLE);
     lv_obj_set_style_border_side(s_alarm_value_labels[row], LV_BORDER_SIDE_BOTTOM, 0);
     lv_obj_set_style_border_width(s_alarm_value_labels[row], 1, 0);
@@ -2954,7 +2983,7 @@ static void alarm_add_switch_row(lv_obj_t *c, int row, const char *name, bool on
 /**
  * @brief 打开"告警设置"二级页（三阈值 ± 调节 + 三使能开关）
  *
- * 初值从 settings_get_alarm 读；读失败用安全默认（三阈值 50% 量程、全使能）。
+ * 初值从 settings_get_alarm 读；读失败用安全默认（15V / 10A / 100W，三项全使能）。
  * 任一改动经 alarm_apply 写回 settings_set_alarm（防抖落盘），
  * 子页关闭时 subpage_close 还会请求一次尽快落盘（settings_request_save，非阻塞）。
  * 【v0.6.0】阈值数值可直接点击 → 弹数字键盘输入精确值（触屏入口）。
@@ -3071,7 +3100,7 @@ typedef void (*cell_cb_t)(void); /**< 网格单元的打开动作（无参无返
  * @brief 网格点击的中间回调（LVGL 回调签名适配）
  *
  * LVGL 事件回调签名是 void(lv_event_t*)，与业务函数签名不同；用 user_data
- * 把业务函数指针传进来，由本回调转发，六个格子共用一个 LVGL 回调。
+ * 把业务函数指针传进来，由本回调转发，全部功能格共用一个 LVGL 回调。
  *
  * @param e LVGL 点击事件；user_data 携带 cell_cb_t 业务函数
  */
@@ -3125,10 +3154,11 @@ static lv_obj_t *make_cell_dispatch(lv_obj_t *row, const char *icon, const char 
 /**
  * @brief 在设置 tile 上构建设置首页（2×4 功能网格）
  *
- * 由 ui_nav 初始化时调用一次；二级页浮层以 tile 为父级，随 tile 一起被
- * 横向滑动（不跨页）。
+ * 由 ui_nav 首次构建时调用，横竖屏旋转后重建 tile 时也会再次调用；
+ * 二级页浮层以 tile 为父级，随 tile 一起被横向滑动（不跨页）。
  *
- * @param tile tileview 的设置页对象（本页所有内容的根父级）
+ * @param tile tileview 的设置页对象（lv_tileview 是 LVGL 的横向分页容器，
+ *             每页一个 tile 子对象；本页所有内容的根父级）
  */
 void screen_settings_create(lv_obj_t *tile)
 {
@@ -3158,7 +3188,7 @@ void screen_settings_create(lv_obj_t *tile)
     lv_obj_t *title = plain_label(tile, "设置", LVGL_PORT_FONT_20, COL_INK, true);
     lv_obj_set_pos(title, GRID_SIDE_PAD, 24);
 
-    /* 2×4 网格（7 个功能格 + 1 个留空位）：高度精确等于 4 行 + 3 行距，不给滚动留余地 */
+    /* 2×4 网格（8 个功能格全部占满）：高度精确等于 4 行 + 3 行距，不给滚动留余地 */
     lv_obj_t *grid = lv_obj_create(tile);
     lv_obj_remove_style_all(grid);
     lv_obj_set_size(grid, LV_PCT(100), 4 * CELL_HEIGHT + 3 * CELL_GAP_Y);
@@ -3204,7 +3234,8 @@ void screen_settings_create(lv_obj_t *tile)
 }
 
 /**
- * @brief 数据刷新（ui_nav_refresh 以 5Hz 转发快照，见 screen_settings.h）
+ * @brief 数据刷新（UI 任务以 5Hz 调用，真机 ui.c 直调 / 模拟器经 ui_nav_refresh
+ *        转发；见 screen_settings.h）
  *
  * 无论当前打开哪个二级页，都先把快照存进 s_last_snap（校准向导应用增益
  * 时要用"当前读数"，即使此刻不在校准页也保持最新）。随后按 s_sub_kind
@@ -3298,6 +3329,7 @@ void screen_settings_refresh(const data_store_snapshot_t *snap)
 /* 【v0.6.8】弹窗按键动作已上移到 ui_msgbox.c（ui_msgbox_key：K1=取消 / K2=确定）。
  * screen_settings_key 的弹窗分支改为转发，见下方"① 弹窗层"。 */
 
+/** @brief 当前二级页中文名称（诊断用；返回字符串常量，可跨任务只读） */
 const char *screen_settings_current_subpage_name(void)
 {
     /* 返回静态字符串（不写共享缓冲）：调用方是 app_tasks 巡检任务，

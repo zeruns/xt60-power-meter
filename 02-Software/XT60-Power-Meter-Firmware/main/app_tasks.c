@@ -108,7 +108,7 @@ static void task_sys_monitor(void *arg)
          * taskLVGL 栈溢出复位（详见 lvgl_port.c 的 LVGL_PORT_TASK_STACK 注释）。
          * 该任务由官方 esp_lvgl_port 创建（句柄不对外），因此按任务名查找
          * 并常驻打印其剩余栈——今后新增字号/大批新汉字后，复查本值即可
-         * 提前发现栈吃紧（余量建议不低于 25%，当前栈 12288 → 不低于约 3KB）。
+         * 提前发现栈吃紧（余量建议不低于 25%，当前栈 16384 → 不低于约 4KB）。
          *
          * 同时打印"冻结三角"诊断（2026-10 实机 UI 冻结排查）：
          *   flush 增量 = 渲染管线是否在出帧（LV_EVENT_FLUSH_FINISH 计数差）；
@@ -474,7 +474,11 @@ esp_err_t app_tasks_start(void)
         ESP_LOGW(TAG, "显示链路故障，跳过主界面构建");
     }
 
-    /* xTaskCreatePinnedToCore 的最后一个参数就是绑定的核编号。
+    /* xTaskCreatePinnedToCore(入口函数, 任务名, 栈字节数, 入参, 优先级,
+     *                         句柄出参, 核号)：
+     *   · 栈字节数：ESP-IDF 里按**字节**计（上游 FreeRTOS 文档写的是"字"）；
+     *   · 优先级：数值越大越高，0 为最低；
+     *   · 最后一个参数就是绑定的核编号。
      * 相比 xTaskCreate（由调度器任意分配），显式绑核才能保证
      * "测量核不被通信任务打扰"这一设计目标。
      * 【v0.6.4 需求 4】巡检任务由 Core0(APP_CORE_UI) → Core1：它是周期 5s 的
@@ -497,6 +501,8 @@ esp_err_t app_tasks_start(void)
      * 先让测量/UI 各自占好内存，联网最后进场。 */
     net_services_start();
 
+    /* ⚠ 下方日志的核号实参仍是 APP_CORE_UI，而巡检任务实际绑在 Core 1
+     *（见上面的 xTaskCreatePinnedToCore 调用），属遗留笔误，待代码侧修正。 */
     ESP_LOGI(TAG, "应用任务创建完成（巡检任务绑定 Core %d，周期 %d ms）", APP_CORE_UI,
              CONFIG_APP_SYS_MONITOR_PERIOD_MS);
     return ESP_OK;

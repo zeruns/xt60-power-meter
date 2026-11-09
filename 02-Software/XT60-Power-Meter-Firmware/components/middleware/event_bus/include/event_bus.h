@@ -51,7 +51,7 @@ typedef enum {
     APP_EVENT_BUTTON,                   /**< 按键事件（短按/长按） */
     APP_EVENT_ORIENTATION_CHANGED,      /**< 屏幕朝向变化（加速度计检测到，UI 需要转屏） */
     APP_EVENT_ENV_UPDATED,              /**< 温湿度数据更新 */
-    APP_EVENT_MEASURE_ALERT,            /**< 测量告警（过压/过流/过功率） */
+    APP_EVENT_MEASURE_ALERT,            /**< 测量告警（过压/过流/过功率/过温，见 DATA_ALERT_*） */
     APP_EVENT_WIFI_STATE_CHANGED,       /**< WiFi 连接状态变化 */
     APP_EVENT_MAX,                      /**< 哨兵：事件类型总数，必须放在最后 */
 } app_event_type_t;
@@ -96,7 +96,7 @@ typedef struct {
         app_event_button_t button;       /**< type == APP_EVENT_BUTTON 时有效 */
         app_event_env_t env;             /**< type == APP_EVENT_ENV_UPDATED 时有效 */
         app_event_alert_t alert;         /**< type == APP_EVENT_MEASURE_ALERT 时有效 */
-        uint32_t raw[3];                 /**< 通用后备区，保证结构体大小固定为 12 字节 */
+        uint32_t raw[3];                 /**< 通用后备区：把联合体固定为 12 字节（整个 app_event_t 为 16 字节） */
     } data;
 } app_event_t;
 

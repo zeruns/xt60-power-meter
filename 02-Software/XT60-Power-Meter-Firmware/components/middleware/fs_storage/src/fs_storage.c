@@ -28,7 +28,7 @@
 /** 日志标签（ESP_LOGx 宏的第一个参数，按模块过滤日志用） */
 static const char *TAG = "fs_storage";
 
-/** 同时打开的文件数（字体文件每字号一个 fd，7 档×2 字重，留余量） */
+/** 同时打开的文件数上限（按 8 个字号 × 2 个字重 = 16 个文件句柄设定） */
 #define FS_STORAGE_MAX_FILES 16
 
 /** 是否已成功挂载（幂等标志，防止重复 register 与 VFS 已注册错误） */

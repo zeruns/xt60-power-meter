@@ -20,7 +20,10 @@ static const char *TAG = "board";
 
 /* 传感器 I2C 总线参数（AHT20 + SC7A20H 共享，见 board_pins.h） */
 #define BOARD_SENSOR_I2C_PORT     I2C_NUM_1
-#define BOARD_SENSOR_I2C_FREQ_HZ  100000 /* 100kHz，两类传感器都足够 */
+#define BOARD_SENSOR_I2C_FREQ_HZ  100000 /* 100kHz，两类传感器都足够
+                                         * （新版 i2c_master 的速率由各器件在
+                                         *  add_device 时用 scl_speed_hz 各自指定，
+                                         *  本宏仅作参考值，不参与总线配置） */
 
 /** 传感器 I2C 总线句柄（create-or-get，见 board_i2c_sensor_bus_get） */
 static i2c_master_bus_handle_t s_sensor_bus = NULL;
@@ -35,7 +38,8 @@ static i2c_master_bus_handle_t s_sensor_bus = NULL;
  */
 esp_err_t board_init(void)
 {
-    /* 读取芯片信息，便于从日志确认实际运行环境（型号/核数/版本） */
+    /* 读取芯片信息，便于从日志确认实际运行环境（型号/核数/版本）。
+     * esp_chip_info 把芯片型号、核数、版本等一次性填进结构体，无需访问外设。 */
     esp_chip_info_t chip = { 0 };
     esp_chip_info(&chip);
 
@@ -69,6 +73,13 @@ esp_err_t board_i2c_sensor_bus_get(i2c_master_bus_handle_t *out)
         .flags.enable_internal_pullup = true, /* 板上已有 2.2k 上拉，内部上拉兜底 */
     };
 
+    /* i2c_new_master_bus：创建一条 I2C 主机总线（新版 esp_driver_i2c 的入口）。
+     * 关键字段：
+     *   i2c_port             ：用哪个 I2C 外设（I2C_NUM_1 即 I2C1）；
+     *   sda/scl_io_num       ：数据/时钟引脚；
+     *   clk_source           ：时钟源，DEFAULT 由驱动自动选；
+     *   glitch_ignore_cnt    ：滤除窄于该采样数的毛刺（7 为官方推荐值）；
+     *   enable_internal_pullup：内部上拉开关（板上已有外部上拉，这里仅兜底）。 */
     esp_err_t err = i2c_new_master_bus(&bus_cfg, &s_sensor_bus);
     if (err != ESP_OK) {
         s_sensor_bus = NULL;

@@ -5,19 +5,21 @@
  * ─────────────────────────────────────────────────────────────
  * 分层定位与设计取舍
  * ─────────────────────────────────────────────────────────────
- * web_console 属于 middleware 层，只允许依赖同层的 data_store 与
- * ESP-IDF 组件（esp_http_server），**禁止** include services/ 的任何头文件。
+ * web_console 属于 middleware 层，依赖同层的 data_store / wifi_manager 与
+ * ESP-IDF 组件（esp_http_server）；另外为满足 GET /api/config 的只读回读，
+ * v0.6.2 / v0.6.6 起直接 include services 的 settings.h 与 power_measure.h
+ * （只调用查询接口，不承载业务写入逻辑）。
  *
- * 参数下发（网页 → settings 落 NVS）因此采用「回调注入」而不是直接调用：
+ * 参数下发（网页 → settings 落 NVS）仍采用「回调注入」而不是直接调用：
  *   上层（main）在 web_console_start() 之前调用 web_console_set_config_handler()
  *   把「写设置」的具体逻辑注册进来；本组件只负责收 JSON、拆键值对、逐对回调，
  *   再把回调结果翻译成 JSON 应答。
- *   好处：middleware 不认识业务——将来换设置存储（NVS/文件/云端），
+ *   好处：middleware 不认识写业务——将来换设置存储（NVS/文件/云端），
  *   或者网页要下发新的参数键，都不需要改动本组件一个字。
  *
  * 数据来源只有 data_store_get() 的只读快照（电压/电流/功率/电能/
- * 温湿度/电池电压/运行时间），由测量核持续写入，本组件以约 5Hz
- * 通过 WebSocket 推给浏览器，并提供 GET /api/state 供无 WS 的客户端轮询。
+ * 温湿度/电池电压/运行时间），由测量核持续写入，本组件以约 15Hz
+ * （66ms 一帧）通过 WebSocket 推给浏览器，并提供 GET /api/state 供无 WS 的客户端轮询。
  *
  * 接口一览：
  *   web_console_set_config_handler()  注册/注销参数写入回调

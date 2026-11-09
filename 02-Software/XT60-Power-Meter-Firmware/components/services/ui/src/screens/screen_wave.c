@@ -7,12 +7,12 @@
  *   │        电压+电流 · 10s        │ y=26  标题（居中，天然避开圆角）
  *   │ ┌──────────────────────────┐ │ y=44
  *   │ │19.98 V             0.019 A│ │ 轴刻度带上单位（左主轴/右副轴）
- *   │ │         ╱╲  双轴折线      │ │ chart 高 138
+ *   │ │         ╱╲  双轴折线      │ │ chart 高 132
  *   │ │19.90 V             0.018 A│ │
- *   │ └──────────────────────────┘ │ y=182
- *   │ -10s                    0s   │ 时间轴（相对"现在"）
+ *   │ └──────────────────────────┘ │ y=176
+ *   │ -10s                    0s   │ 时间轴 y=178（相对"现在"）
  *   │ 实 19.97670V 0.01886A 0.37683W│ y=194
- *   │ 均 19.97612V 0.01880A 0.37540W│ y=207
+ *   │ 均 19.97612V 0.01880A 0.37540W│ y=216
  *   └───────────────────────────────┘
  *
  * 关键设计（针对实测问题）：
@@ -27,7 +27,7 @@
  *   · **时间槽桶聚合**：pm_wave_copy 把整窗切成 CHART_MAX_POINTS 个固定时长
  *     槽，索引即屏幕列、右端=现在。槽宽与采样周期不同步时旧"最近样本+容差"
  *     方案会约半数槽落空断线，改桶聚合后每槽恒定覆盖 窗长/点数 的时间；
- *   · **min/max 包络防混叠**：480 槽 > 屏宽 280 像素，多槽挤进同一像素列，
+ *   · **min/max 包络防混叠**：480 槽 > 屏宽 284 像素，多槽挤进同一像素列，
  *     LVGL 对 LINE 系列自动画 min/max 竖线包络（示波器 peak-detect 同款），
  *     毛刺尖峰不会因抽稀被丢掉；
  *   · **1-2-5 标准格值自动量程**（wave_nice_div）：每格取 1/2/5×10ⁿ 标准格值
@@ -376,7 +376,7 @@ static void format_axis_val(char *dst, size_t n, int ch, float v)
 /**
  * @brief 摆放底部「实时/平均」数据列（列数变化时才调用）
  *
- * 布局：[前缀 24px][列 0: 数值(定宽) + 单位(定宽)] × ncol
+ * 布局：[前缀 16px][列 0: 数值(定宽) + 单位(定宽)] × ncol
  * 列宽 = (屏宽 - 2×SAFE_X - 前缀宽) / ncol；每列内数值右对齐、单位固定右端。
  * 数值框宽 = 列宽 - 单位宽 - 固定间隔，负号/位数变化时数字向左生长不推挤。
  *
@@ -727,6 +727,7 @@ bool screen_wave_menu_key(button_id_t id, button_event_t ev)
  *
  * 三页循环滑动中，竖向滑动不归 tileview（它只管横滑翻页），而是经
  * indev_swipe_event_cb 的「按下记起点、抬起算总位移」判定后回调到本函数。
+ * 下滑关闭等同 K2 长按：按当前 roller 选择应用后关闭（apply=true）。
  *
  * @param dir 滑动方向（LV_DIR_TOP=上滑 / LV_DIR_BOTTOM=下滑）
  */
@@ -814,7 +815,7 @@ static bool robust_range(const float *buf, int n, float *lo, float *hi)
     int i0 = (int)((float)(m - 1) * 0.02f);
     int i1 = (int)((float)(m - 1) * 0.98f);
     if (i1 <= i0) {
-        i0 = 0;      /* 样本太少（<50 个）时退化为全范围，保证不越界 */
+        i0 = 0;      /* 样本极少（m ≤ 2 时 2%/98% 下标重合）退化为全范围，保证不越界 */
         i1 = m - 1;
     }
     /* 两次快速选择必须**分区间**做，否则后者会挪动前者的结果：
@@ -1141,7 +1142,8 @@ static void trend_update(int n, const mode_desc_t *d)
 /**
  * @brief 波形页主刷新：拉数据 → 平滑 → 量程 → 写入 chart → 刷新数据行
  *
- * 每帧由 UI 任务周期调用（约 100ms 级）。核心契约是"时间槽一比一映射"：
+ * 由 UI 任务固定 **25Hz**（40ms 周期，见 ui.c 的 UI_WAVE_PERIOD_US）调用，
+ * 与状态栏/设置页的 5Hz 刷新互不影响。核心契约是"时间槽一比一映射"：
  * 缓冲区第 j 槽 = 屏幕第 j 列，右端 = 现在。
  */
 void screen_wave_refresh(void)
@@ -1311,8 +1313,8 @@ void screen_wave_refresh(void)
  * @brief chart 尺寸确定后摆放 6 个轴刻度（浮于曲线之上，左右贴边）
  *
  * 2026-10 改：波形铺满整宽，刻度不再占 padding 留白（原先两侧各让出
- * 66px，曲线被挤在中间很不协调）。刻度改贴左右边缘、加半透明白底，
- * 压在曲线之上仍可读。
+ * 66px，曲线被挤在中间很不协调）。刻度改贴左右边缘、加半透明深色底
+ * （COL_WAVE_BG + LV_OPA_70），压在曲线之上仍可读。
  *
  * @param e 事件对象（绑定在 chart 的 LV_EVENT_SIZE_CHANGED 上，
  *          chart 尺寸变化时由 LVGL 自动调用）
@@ -1329,7 +1331,10 @@ static void chart_size_event_cb(lv_event_t *e)
         lv_coord_t y = (k == 0) ? -3 : (k == 1) ? (h - AXIS_LABEL_H) / 2 : (h - 11);
         /* 标签宽度是 LV_SIZE_CONTENT（随文本变化），不能再按固定宽度算右缘。
          * 改用对齐：左列贴内容区左缘、右列贴右缘，LVGL 会在标签宽度变化后
-         * 自动重新对齐，半透明底色始终只包住数字本身。 */
+         * 自动重新对齐，半透明底色始终只包住数字本身。
+         * lv_obj_align(对象, 对齐方式, x_ofs, y_ofs)：相对**父对象内容区**按对齐
+         * 方式定位（区别于 set_pos 的左上角绝对坐标），x_ofs/y_ofs 为对齐点上的
+         * 额外偏移。 */
         lv_obj_align(s_axis_a[k], LV_ALIGN_TOP_LEFT, 0, y);
         lv_obj_align(s_axis_b[k], LV_ALIGN_TOP_RIGHT, 0, y);
     }
@@ -1491,7 +1496,8 @@ static void create_panel(lv_obj_t *scr, const wave_geom_t *g)
  * @brief 构建波形页（tile 重建＝横竖屏旋转后 ui_nav 会调用）
  *
  * 先清理旧滑板/置空全部对象指针，再按 wave_geom() 逐层搭 UI。
- * @param tile lv_tileview 的波形页 tile（本页所有内容的父级）
+ * @param tile lv_tileview 的波形页 tile——lv_tileview 是 LVGL 的横向分页容器
+ *             （每页一个 tile 子对象，三页由 ui_nav 创建），本页所有内容的父级
  */
 void screen_wave_create(lv_obj_t *tile)
 {
@@ -1588,6 +1594,10 @@ void screen_wave_create(lv_obj_t *tile)
     lv_obj_set_style_border_color(s_chart, COL_WAVE_GRID, 0);
     lv_obj_set_style_border_width(s_chart, 1, 0);
     lv_obj_set_style_radius(s_chart, 8, 0);
+    /* 样式要按「部件(part)」分别设置：LV_PART_MAIN = 控件主体（图表的格线走
+     * 这里），最后一个参数即部件号；line_width/line_color 是主体上线条的
+     * 粗细/颜色。LV_PART_INDICATOR = 图表的数据点标记部件，宽高置 0 表示
+     * 只画折线、不画点。 */
     lv_obj_set_style_line_width(s_chart, 2, LV_PART_MAIN);
     lv_obj_set_style_line_color(s_chart, COL_WAVE_GRID, LV_PART_MAIN); /* 格线暗灰 */
     lv_obj_set_style_size(s_chart, 0, 0, LV_PART_INDICATOR);
@@ -1609,7 +1619,9 @@ void screen_wave_create(lv_obj_t *tile)
     lv_chart_set_all_values(s_chart, s_ser_a, LV_CHART_POINT_NONE);
     lv_chart_set_all_values(s_chart, s_ser_b, LV_CHART_POINT_NONE);
 
-    /* 轴刻度（上/中/下 × 左/右），浮于曲线之上：深色半透底保证黑底上可读。
+    /* 轴刻度（上/中/下 × 左/右），浮于曲线之上：刻度文字用通道亮色（见
+     * update_header 的 set_style_text_color），底色为半透明的波形区黑，
+     * 挡住曲线保证黑底上可读。
      * 宽度用 LV_SIZE_CONTENT：底色随刻度文本（"3 V" / "19.98 V"）自适应，
      * 不再固定 62px 占用左右波形区；右列由 chart_size_event_cb 右对齐。 */
     const lv_font_t *f12 = lvgl_port_get_font(LVGL_PORT_FONT_12);

@@ -27,11 +27,13 @@ void app_main(void)
     /* ---------- ① 系统初始化（含分级容错） ---------- */
     esp_err_t err = app_init_startup();
     if (err != ESP_OK) {
-        /* 走到这里说明有关键模块（如测量前端）初始化失败。
+        /* 走到这里说明关键模块（如测量前端）初始化失败，或关键自检项未通过。
          * 不做复位，而是让设备停在异常状态：
-         *   · 指示灯快闪 5Hz，现场一眼可辨；
+         *   · 状态停在 INIT（未调用 system_state_start_running()，不会推导成
+         *     FAULT），指示灯按 INIT 常亮，故障细节由串口日志中的故障位图给出；
          *   · 串口有完整日志；
-         *   · 后续接入 WiFi 后仍可通过网页升级固件救回。 */
+         *   · WiFi 与网页控制台仍会起来，可读状态/日志辅助定位；但当前
+         *     web_console 未注册 OTA 路由，救回仍需 USB/串口重新烧录。 */
         char fault_text[96];
         system_state_fault_to_str(system_state_get_fault_mask(), fault_text, sizeof(fault_text));
         ESP_LOGE(TAG, "启动未完成：存在致命故障（%s），系统保持异常状态等待处理", fault_text);

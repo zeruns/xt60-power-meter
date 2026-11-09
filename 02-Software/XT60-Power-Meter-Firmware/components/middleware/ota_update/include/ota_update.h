@@ -13,6 +13,7 @@
  *         都不会影响正在运行的旧系统——最坏情况只是"没升成"而不是"变砖"。
  *         设备装到用户手里之后还能修，靠的就是这一点。
  *   代价：Flash 占用翻倍（本工程 16MB Flash 里占 2×4MB）；
+ *         storage 数据分区（字体资源）不参与 OTA，升级只写 ota_0 / ota_1；
  *         下载/擦写 Flash 期间旧固件仍在运行，需保证与业务逻辑互不干扰
  *         （本工程已用 IRAM 化 GPIO/定时器中断兜住 cache 关闭窗口）。
  *
@@ -26,8 +27,8 @@
  * 启动早期调用 ota_update_rollback_if_pending() 即可完成上述流程。
  *
  * ⚠ 前提：PENDING_VERIFY 状态由 bootloader 写入，依赖
- *   CONFIG_BOOTLOADER_APP_ROLLBACK_ENABLE=y。该配置关闭时（当前工程
- *   sdkconfig 默认如此）新固件首启状态为 NEW/VALID，回滚函数退化为空操作，
+ *   CONFIG_BOOTLOADER_APP_ROLLBACK_ENABLE=y。本工程 sdkconfig 已开启该选项；
+ *   若关闭，新固件首启状态为 NEW/VALID，回滚函数退化为空操作，
  *   "A/B 回滚"只剩「升级失败不动 boot 分区」这一半保障。
  *
  * ─────────────────────────────────────────────────────────────

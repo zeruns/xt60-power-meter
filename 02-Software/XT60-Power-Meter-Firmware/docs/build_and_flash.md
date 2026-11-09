@@ -15,8 +15,8 @@
 | `build/bootloader/bootloader.bin` | `0x0` | ~22 KB | 二级引导程序。上电后初始化 Flash/PSRAM、读分区表、校验并跳转到应用；含 OTA 回滚判定逻辑 | 改分区表、改引导相关 sdkconfig、换 Flash/PSRAM 模式时 |
 | `build/partition_table/partition-table.bin` | `0x8000` | ~3 KB | 分区表本体（定义 NVS / OTA / storage 各段在哪） | 改 `partitions.csv` 时（**必须连同 bootloader 一起**） |
 | `build/ota_data_initial.bin` | `0xf000` | ~8 KB | OTA 选择数据的初始值（告诉 bootloader 首次从 `ota_0` 启动） | 首次烧录、或想强制回到出厂槽位时 |
-| `build/XT60-Power-Meter-Firmware.bin` | `0x20000` | ~1.5 MB | **应用固件**（全部业务代码 + 内嵌网页控制台）。日常改功能只动它 | 每次改代码都要 |
-| `build/storage.bin` | `0x830000` | 8.0 MB（镜像）| SPIFFS 文件系统镜像，里面是**两套中文字体**（`/spiffs/fonts/notosc_reg.ttf`、`notosc_bold.ttf`，约 4.2 MB 实际内容） | 改字库/改 SPIFFS 内文件时；**OTA 不会更新它** |
+| `build/XT60-Power-Meter-Firmware.bin` | `0x20000` | ~1.6 MB | **应用固件**（全部业务代码 + 内嵌网页控制台 + 启动页内嵌字库子集）。日常改功能只动它 | 每次改代码都要 |
+| `build/storage.bin` | `0x830000` | 8,192,000 字节（0x7D0000）| SPIFFS 文件系统镜像，里面是**两套主界面中文字体**（`/spiffs/fonts/notosc_reg.ttf`、`notosc_bold.ttf`，约 4.2 MB 实际内容） | 改字库/改 SPIFFS 内文件时；**OTA 不会更新它** |
 
 ### 分区表长什么样（`partitions.csv`）
 
@@ -31,9 +31,10 @@
 0x1000000 = 16 MB 用满
 ```
 
-**为什么字体不放进 app**：全量中文字体 4 MB 级，若塞进 4 MB 的 app 分区会直接放不下；
-放独立 `storage` 分区还能让 OTA 只传 1.5 MB 的 app（升级快、流量省）。
-**代价**：改字体必须**全量烧录**（OTA 只覆盖 `ota_0/ota_1`，碰不到 `storage`）——
+**为什么字体不放进 app**：主界面全量中文字体 4 MB 级，若塞进 4 MB 的 app 分区会直接放不下；
+放独立 `storage` 分区还能让 OTA 只传 1.6 MB 的 app（升级快、流量省）。
+启动页用的极小子集（约 34KB/字重）已编进 app，所以启动页首帧不依赖 storage。
+**代价**：改主界面字体必须**全量烧录**（OTA 只覆盖 `ota_0/ota_1`，碰不到 `storage`）——
 这是本项目最容易踩的一个坑，表现为"OTA 升级成功但中文仍显示方框"。
 
 ### 可选：打包成"单文件工厂镜像"
@@ -107,7 +108,8 @@ ESP 烧录/串口工具，通过 **Web Serial** 直接与芯片通信，不需�
    - **分文件（更快）**：逐个添加 5 行文件 + 偏移，见第 1 节表格
      （`0x0` / `0x8000` / `0xf000` / `0x20000` / `0x830000`）；
 3. 确认 Flash 参数：**Mode = DIO**、**Size = 16MB**、**Freq = 80MHz**
-   （与本工程 `sdkconfig.defaults` 一致，选错会起不来）；
+   （与本工程的合并镜像命令 `--flash-mode dio --flash-size 16MB --flash-freq 80m` 一致；
+   bootloader 启动后会按 `sdkconfig.defaults` 的 QIO 模式运行。参数选错会起不来）；
 4. 点 **Program / Flash**，等待进度完成（分文件方式通常比单文件快很多，
    因为只写实际内容、不写 0xFF 填充）；
 5. 完成后点 **Reset / Disconnect**，或拔插 USB 重新上电；
@@ -129,7 +131,8 @@ ESP 烧录/串口工具，通过 **Web Serial** 直接与芯片通信，不需�
 
 | 你改了什么 | 最少需要烧 |
 |---|---|
-| 业务代码 / 网页控制台 / UI | `XT60-Power-Meter-Firmware.bin`（或网页 OTA） |
+| 业务代码 / 网页控制台 / UI | `XT60-Power-Meter-Firmware.bin`（`idf.py app-flash`） |
+| 启动页文案（`make_splash_font.py` 重新生成） | `XT60-Power-Meter-Firmware.bin`（子集编入 app） |
 | 字库（`tools/fonts/make_fonts.py` 重新生成） | **全量 5 个文件**（关键是 `storage.bin`） |
 | `partitions.csv` | `bootloader.bin` + `partition-table.bin` + app（建议全量） |
 | `sdkconfig.defaults`（Flash/PSRAM/CPU 等） | 建议全量（bootloader 会受影响） |
@@ -141,14 +144,21 @@ ESP 烧录/串口工具，通过 **Web Serial** 直接与芯片通信，不需�
 
 ## 5. OTA 升级（不需要数据线）
 
-设备连上路由器后，在网页控制台的设置/系统区域上传 `XT60-Power-Meter-Firmware.bin`
-即可升级（写入另一个 OTA 槽，失败自动回滚）。
+OTA 由中间件 `components/middleware/ota_update/` 提供，接口是**拉取式**：
+调用 `ota_update_start(url)` 让设备从 `http(s)://` 地址下载镜像，写入当前未运行的
+另一个 OTA 槽；校验镜像头（magic / project_name）后切换启动分区，重启生效。
+新固件首启处于 `PENDING_VERIFY`，启动自检通过才确认有效，否则 bootloader 可回滚旧槽。
+
+> 当前**网页控制台没有注册 OTA 上传入口**，也没有菜单项直接触发升级；
+> 需要在业务代码/调试命令中调用 `ota_update_start()`。
 
 **必须知道的两条限制**：
 
-1. OTA **只更新 app**（`ota_0/ota_1`），**不会更新字体**（在 `storage` 分区）；
+1. OTA **只更新 app**（`ota_0/ota_1`），**不会更新主界面字体**（在 `storage` 分区）；
 2. OTA **不会改 bootloader/分区表**。因此：只要是"改字库、改分区、换大版本"，
    就必须插 USB 全量烧录。
+
+> 启动页字库子集编在 app 内，会随 OTA 一起更新；主界面全量字库不会。
 
 ---
 

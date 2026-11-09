@@ -7,37 +7,43 @@
  *
  * 真机 sdkconfig 值                     本文件对应
  *   CONFIG_LV_COLOR_DEPTH=16              LV_COLOR_FORMAT_DEFAULT = RGB565
- *                                         （LVGL 9.6 起 LV_COLOR_DEPTH 已废弃）
- *   CONFIG_LV_MEM_SIZE=131072             LV_MEM_SIZE 128*1024
- *   CONFIG_LV_USE_STDLIB_MALLOC=0         LV_STDLIB_BUILTIN（内建内存池）
+ *                                         （LVGL 9 已改用 LV_COLOR_FORMAT_DEFAULT，
+ *                                          LV_COLOR_DEPTH 废弃、将在 v10 移除）
+ *   CONFIG_LV_USE_STDLIB_MALLOC=1         LV_USE_STDLIB_MALLOC LV_STDLIB_CLIB
+ *                                         （C 库 malloc；真机未启用内建内存池，
+ *                                          因此 sdkconfig 里没有 LV_MEM_SIZE）
  *   CONFIG_LV_USE_OS=0                    LV_OS_NONE
- *   CONFIG_LV_USE_TINY_TTF=y              LV_USE_TINY_TTF 1（+ 缓存 64/16）
+ *   CONFIG_LV_USE_TINY_TTF=y              LV_USE_TINY_TTF 1
+ *                                         （字形缓存 64/16；真机为 32/16，
+ *                                          仅影响缓存容量，不改变字形）
  *   CONFIG_LV_FONT_MONTSERRAT_14=y        LV_FONT_MONTSERRAT_14 1（图标回退）
  *   CONFIG_LV_DRAW_SW_COMPLEX=y           LV_DRAW_SW_COMPLEX 1
  *   CONFIG_LV_DRAW_LAYER_SIMPLE_BUF_SIZE  LV_DRAW_LAYER_SIMPLE_BUF_SIZE 24KB
  *   CONFIG_LV_DRAW_BUF_STRIDE_ALIGN=1     LV_DRAW_BUF_STRIDE_ALIGN 1
  *   CONFIG_LV_DRAW_BUF_ALIGN=4            LV_DRAW_BUF_ALIGN 4
  *
- * 未在此列出的项走 LVGL 默认值（与真机 Kconfig 默认一致的部分无需重复）。
+ * 未在此列出的项走 LVGL 默认值；与真机不同的小差异已在对应条目里注明。
  */
 #ifndef LV_CONF_H
 #define LV_CONF_H
 
 /* ---- 颜色与内存 ----
- * 注意：LVGL 9.6 起 LV_COLOR_DEPTH 已废弃（定义它会让 lv_conf_internal.h 发出
- * `#warning`，而 MSVC 不支持该指令、直接报 C1021 致命错误），
+ * 注意：LVGL 9 已改用 LV_COLOR_FORMAT_DEFAULT，LV_COLOR_DEPTH 废弃（定义它会让
+ * lv_conf_internal.h 发出 `#warning`，而 MSVC 不支持该指令、直接报 C1021 致命错误），
  * 统一改用 LV_COLOR_FORMAT_DEFAULT。真机 Kconfig 的 CONFIG_LV_COLOR_DEPTH=16
  * 由 ESP-IDF 侧转换，与此处配置互相独立。 */
 #define LV_COLOR_FORMAT_DEFAULT LV_COLOR_FORMAT_RGB565
 /* ---- 内存分配 ----
- * 真机：内建内存池（sdkconfig CONFIG_LV_MEM_SIZE=131072，即 128KB）。
- * 模拟器：改用 CRT 堆（malloc/free）——分配器实现不影响任何渲染像素结果，
- *   但可避免"22 个场景连续渲染 + 多档字号 tiny_ttf 字形缓存"把 128KB 小池
- *   耗尽（PC 无内存上限约束）。真机的内存水位风险由系统巡检独立监控。 */
+ * 真机 sdkconfig 为 CONFIG_LV_USE_STDLIB_MALLOC=1（即 LV_STDLIB_CLIB）：
+ * malloc/free 走 C 库堆，没有 LVGL 内建内存池、也没有固定 128KB 上限。
+ * 模拟器保持一致（CLIB），因此"整套场景连续渲染（数十张截图）+ 多档字号 tiny_ttf
+ * 字形缓存"不会因小内存池耗尽而失败；分配器来源不同也不影响渲染像素。
+ * 唯一差异：真机字符串函数用 LVGL 内建实现（CONFIG_LV_USE_BUILTIN_STRING=y），
+ * 这里换用 CRT（语义等价）。 */
 #define LV_USE_STDLIB_MALLOC LV_STDLIB_CLIB
 #define LV_USE_STDLIB_STRING LV_STDLIB_CLIB
 #define LV_USE_STDLIB_SPRINTF LV_STDLIB_CLIB
-/* 若将来切回内建池（与真机对齐）时使用；CLIB 模式下本项未被引用 */
+/* 仅作占位：CLIB 模式下 LVGL 不引用本宏（真机同样未设置 LV_MEM_SIZE） */
 #define LV_MEM_SIZE (128 * 1024)
 
 /* ---- 单线程（模拟器无需 RTOS；真机同样是 LV_USE_OS=0） ---- */
@@ -56,7 +62,7 @@
 #define LV_TINY_TTF_CACHE_GLYPH_CNT 64
 #define LV_TINY_TTF_CACHE_KERNING_CNT 16
 
-/* ---- 日志（正常情况 WD 级以下不输出，避免刷屏） ---- */
+/* ---- 日志（只输出 WARN 及以上，避免连续跑整套场景时刷屏） ---- */
 #define LV_USE_LOG 1
 #define LV_LOG_LEVEL LV_LOG_LEVEL_WARN
 #define LV_LOG_PRINTF 1

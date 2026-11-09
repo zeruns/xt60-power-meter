@@ -7,7 +7,9 @@
  *
  * 职责边界：
  *   · 本驱动负责「总线 + 面板初始化 + 刷新 + 背光」；
- *   · 面板初始化序列由官方组件 espressif/esp_lcd_spd2010 提供，本驱动不自写；
+ *   · 面板驱动组件用官方的 espressif/esp_lcd_spd2010，但**初始化序列由本驱动内置**
+ *     （s_lcd_init_cmds，经 vendor_config 注入）：组件自带的默认序列表对本模组
+ *     会满屏花屏，故整段替换为厂商验证过的短序列；
  *   · LVGL 适配（显示/输入设备注册、心跳、锁）在 middleware/lvgl_port。
  *
  * 命名说明：模组规格书叫 NV3030B，厂商官方 ESP32 例程用 esp_lcd_spd2010 驱动它，
