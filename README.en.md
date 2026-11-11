@@ -4,14 +4,16 @@
 > A 1.83-inch IPS color LCD shows readings and waveforms in real time.
 > Built-in rechargeable battery and a WiFi web console. **Hardware, firmware and enclosure are fully open-source.**
 
-[![License: CERN OHL-S v2](https://img.shields.io/badge/hardware-CERN%20OHL--S--2.0-blue)](LICENSE)[![Firmware: MIT](https://img.shields.io/badge/firmware-MIT-green)](02-Software/XT60-Power-Meter-Firmware/LICENSE)![MCU](https://img.shields.io/badge/MCU-ESP32--S3-orange)![ADC](https://img.shields.io/badge/ADC-ADS131M02%2024bit-yellow)![Firmware](https://img.shields.io/badge/firmware-v0.6.9-brightgreen)
+[![License: CERN OHL-S v2](https://img.shields.io/badge/hardware-CERN%20OHL--S--2.0-blue)](LICENSE) [![Firmware: MIT](https://img.shields.io/badge/firmware-MIT-green)](02-Software/XT60-Power-Meter-Firmware/LICENSE) ![MCU](https://img.shields.io/badge/MCU-ESP32--S3-orange) ![ADC](https://img.shields.io/badge/ADC-ADS131M02%2024bit-yellow) ![Firmware](https://img.shields.io/badge/firmware-v0.6.9-brightgreen)
 
-> 🎬 **Demo video**: to be added (Bilibili link)
-> 📦 **OSHWHub / LCEDA open-hardware project**: to be added
-> 🔗 **Repository**: [https://gitee.com/zeruns/xt60-power-meter](https://gitee.com/zeruns/xt60-power-meter)
-> 💬 Electronics community: [https://bbs.eeclub.top/](https://bbs.eeclub.top/)
-> 📖 Author's blog: [https://blog.zeruns.com/](https://blog.zeruns.com/)
-> 🇨🇳 **中文文档**: [README.md](README.md)
+> - 🎬 **Demo video**: to be added (Bilibili link)
+> - 📦 **OSHWHub / LCEDA open-hardware project**: [https://oshwhub.com/zeruns/xt60-power-meter-esp32](https://oshwhub.com/zeruns/xt60-power-meter-esp32)
+> - 🔗 **Gitee repository**: [https://gitee.com/zeruns/xt60-power-meter](https://gitee.com/zeruns/xt60-power-meter)
+> - 🔗 **GitHub repository**: [https://github.com/zeruns/xt60-power-meter](https://github.com/zeruns/xt60-power-meter)
+> - 💬 Electronics community: [https://bbs.eeclub.top/](https://bbs.eeclub.top/)
+> - 📖 Author's blog: [https://blog.zeruns.com/](https://blog.zeruns.com/)
+> - 💬 Electronics / MCU tech QQ group: [307449735](https://qm.qq.com/q/VLwqDaY508)
+> - 🇨🇳 **中文文档**: [README.md](README.md)
 
 ![](https://tc2.zeruns.com/Pic/2026/10/IMG_20261031_163238%281%29_f6cebf8d83645903a56acc390aabcf88.webp)
 
