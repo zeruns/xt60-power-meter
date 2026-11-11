@@ -3,13 +3,16 @@
  * @brief button_fsm 按键状态机的主机单元测试（PC 编译运行，无需开发板）
  *
  * 编译运行：
- *   gcc -std=c11 -Wall -Wextra -I../../components/drivers/button/include \
- *       test_button_fsm.c ../../components/drivers/button/src/button_fsm.c \
+ *   gcc -std=c11 -Wall -Wextra -I../../components/drivers/key_button/include \
+ *       test_button_fsm.c ../../components/drivers/key_button/src/button_fsm.c \
  *       -o test_button_fsm.exe
  *   ./test_button_fsm.exe
  *
  * 覆盖：消抖毛刺过滤、单击（延迟确认）、双击、长按、长按不重复、
  *       两次独立单击不粘连、单击与长按互斥。
+ *
+ * 喂样本节奏与真机一致：真机每 10ms 采样一次并调用 button_fsm_update()，
+ * 这里也用 10ms 步长推进时间轴，保证测的是真实时序行为。
  */
 #include <stdio.h>
 
@@ -73,8 +76,8 @@ int main(void)
     uint32_t t;
 
     /* 每个用例的约定：初始化后先喂一个 t=0 的释放态样本。
-     * 真实驱动里 FSM 开始工作时按键必为释放态（按下的情况被 strapping
-     * 保护挡住，见 button.c），时间轴不允许从"悬空按下"开始。 */
+     * 真实驱动里 FSM 开始工作时按键必为释放态（K1/BOOT 在复位期间被按住的
+     * 情况会被 strapping 保护挡住，见 button.c），时间轴不允许从"悬空按下"开始。 */
 #define FSM_RESET()                                                                               \
     do {                                                                                           \
         button_fsm_init(&fsm);                                                                     \
@@ -92,16 +95,16 @@ int main(void)
     CHECK(log.count[BUTTON_FSM_LONG_PRESS_START] == 0);
     CHECK(log.count[BUTTON_FSM_LONG_PRESS_RELEASE] == 0);
 
-    /* ---- 用例 2：两次按下间隔 100ms → 双击 1 次，且无单击 ---- */
+    /* ---- 用例 2：两击间空闲 100ms（<300ms 双击窗口）→ 双击 1 次，且无单击 ---- */
     FSM_RESET();
     t = click_once(&fsm, &log, t, 50);                 /* 第一击，t≈60 */
-    t = feed_level(&fsm, &log, false, t, t + 100, 10); /* 间隔 100ms（<300ms） */
+    t = feed_level(&fsm, &log, false, t, t + 100, 10); /* 两击间空闲 100ms（按下间隔约 160ms，仍 <300ms） */
     t = click_once(&fsm, &log, t, 50);                 /* 第二击 */
     flush_idle(&fsm, &log, t);
     CHECK(log.count[BUTTON_FSM_DOUBLE_CLICK] == 1);
     CHECK(log.count[BUTTON_FSM_SINGLE_CLICK] == 0);
 
-    /* ---- 用例 3：两次按下间隔 400ms（>300ms）→ 两次独立单击 ---- */
+    /* ---- 用例 3：按下间隔约 490ms（>300ms）→ 两次独立单击 ---- */
     FSM_RESET();
     t = click_once(&fsm, &log, t, 50);
     t = flush_idle(&fsm, &log, t);                     /* 第一击确认 */

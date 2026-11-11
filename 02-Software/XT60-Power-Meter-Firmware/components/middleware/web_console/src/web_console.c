@@ -17,8 +17,9 @@
  * ③ WS 推送走「独立任务 + httpd_ws_send_data_async()」：
  *    esp_http_server 的 socket 写入必须在 httpd 任务里执行，跨任务只能用
  *    httpd_queue_work 系的异步接口（send_data_async 内部就是排了这样一个
- *    工作项）。它只拷贝帧结构、不拷贝 payload，所以每个客户端各拷贝一份
- *    堆缓冲，发送完成后在 transfer_complete_cb 里释放。
+ *    工作项）。它只拷贝帧结构、不拷贝 payload，所以每个客户端都要有一份
+ *    常驻发送槽（v0.6.3 起改为启动时一次性分配 8 个槽，不再每帧 malloc/free），
+ *    发送完成后在 transfer_complete_cb 里把槽标回空闲。
  *    发送失败只记 DEBUG 日志（静默降级——断线的客户端不值得刷屏），
  *    并触发服务器回收该会话，避免反复向死连接发送。
  *
@@ -39,12 +40,16 @@
  *                    503 {"ok":false,"code":"no_handler",...}   回调未注册
  *                    500 {"ok":false,"code":"apply_failed","key":出错键,
  *                         "esp_err":错误码,...}
- * WS   /ws          → 服务端每 200ms 推一帧 TEXT，内容与 /api/state 的 200 响应相同；
+ * GET  /api/config  → 200 application/json   回读用户设置 + 告警阈值 + 标定参数 + WiFi 模式
+ * GET  /api/info    → 200 application/json   版本 / IDF / IP / MAC / 运行时间 / 堆水位 / WiFi
+ * GET  /api/wifi/scan[?go=1] → 200 application/json  触发并读取扫描结果（aps[]）
+ * GET  /api/export.csv → 200 text/csv        最近 60 分钟历史（附件下载）
+ * WS   /ws          → 服务端每 66ms（约 15Hz）推一帧 TEXT，内容与 /api/state 的 200 响应相同；
  *                    上行仅支持 {"cmd":"ping"}（回 {"ok":true,"pong":true}）
  *                    与 {"cmd":"state"}（立即回一帧快照）；其他帧静默忽略——
  *                    但一定消费掉，防止残留字节破坏 WS 帧流。
  *
- * 快照 JSON 字段（与 data_store_snapshot_t 一一对应）：
+ * 快照 JSON 字段（data_store 快照 + WiFi 运行态，v0.6.0 起追加后三项）：
  *   {"ok":true,
  *    "voltage_v":12.345678,  电压（V，v0.5.1 起下发 6 位小数全精度）
  *    "current_a":1.234567,   电流（A，6 位小数）
@@ -56,7 +61,10 @@
  *    "soc_temp_c":42.10,     SOC 结温（℃，2 位小数，v0.5.1 新增；null = 无数据）
  *    "battery_mv":3980,      电池电压（mV，整数，0 = 尚未采集）
  *    "runtime_s":3600,       运行时间（秒，整数）
- *    "alert_mask":0}         越限告警位图（DATA_ALERT_*，v0.5.1 新增，0=无告警）
+ *    "alert_mask":0,         越限告警位图（DATA_ALERT_*，v0.5.1 新增，0=无告警）
+ *    "wifi_state":3,         WiFi 状态（wifi_manager_state_t，v0.6.0 新增）
+ *    "wifi_mode":0,          WiFi 模式偏好（wifi_manager_mode_t）
+ *    "wifi_rssi":-57}        STA 信号强度（dBm）；未连接路由器时为 null
  *
  *   说明：设备端屏幕用「动态小数位」（fmt_val）显示；JSON 下发全精度，
  *   由网页 JS 用同一规则（fmtVal）截取，保证两边显示位数一致。
@@ -538,6 +546,9 @@ static char *read_request_body(httpd_req_t *req, size_t max_len)
 
     size_t received = 0;
     while (received < req->content_len) {
+        /* httpd_req_recv(请求, 缓冲, 最多读多少字节)：从当前 HTTP 请求体读一段，
+         * 返回实际读到的字节数（<=0 表示对端断开或超时）。HTTP 体可能分多次
+         * 到达，所以必须循环直到凑满 content_len。 */
         int ret = httpd_req_recv(req, buf + received, req->content_len - received);
         if (ret <= 0) { /* 对端中断 / 超时：放弃本请求 */
             free(buf);
@@ -667,6 +678,10 @@ static esp_err_t api_info_get_handler(httpd_req_t *req)
     }
 
     char buf[WEB_CONSOLE_INFOJSON_BUF_LEN];
+    /* esp_timer_get_time()：开机至今的微秒数，除以 1e6 得到运行秒数；
+     * esp_get_free_heap_size()：当前可用堆（默认堆，含 PSRAM）；
+     * esp_get_minimum_free_heap_size()：历史最低水位，判断是否曾接近耗尽；
+     * heap_caps_get_free_size/total_size(MALLOC_CAP_SPIRAM)：单独看 PSRAM。 */
     int n = snprintf(buf, sizeof(buf),
                      "{\"ok\":true,\"version\":\"%s\",\"idf\":\"%s\",\"ip\":\"%s\","
                      "\"mac\":\"%s\",\"uptime_s\":%lld,"
@@ -699,7 +714,7 @@ typedef struct {
     data_store_snapshot_t snap;
 } hist_point_t;
 /* 【v0.6.2 内存优化】历史环从 BSS 移到 PSRAM 堆：
- * 60 点 × sizeof(hist_point_t) ≈ 6KB。它是"一分钟才写一次、导出时才读"的
+ * 60 点 × sizeof(hist_point_t)（80 字节）≈ 4.7KB。它是"一分钟才写一次、导出时才读"的
  * 冷数据，放在内部 RAM 的 .bss 里纯属浪费——内部 RAM 要留给 DMA/ISR/任务栈。
  * 分配失败时退化为"不记录历史"（导出接口返回空表），不影响测量与实时数据。 */
 static hist_point_t *s_hist = NULL;
@@ -954,7 +969,7 @@ static esp_err_t api_config_post_handler(httpd_req_t *req)
  * 广播时**取一个空闲槽**写数据、发送完成回调里把它标回空闲。
  *
  * 【丢掉一帧而不是等待】槽被占用（上一帧还没发完）时直接跳过本次推送：
- * 这是 10Hz 的快照流，下一周期自然会带上更新的数据，比排队等待更安全。
+ * 这是 15Hz 的快照流，下一周期自然会带上更新的数据，比排队等待更安全。
  */
 typedef struct {
     char buf[WEB_CONSOLE_JSON_BUF_LEN]; /**< 发送缓冲（常驻，避免每帧堆分配） */
@@ -968,7 +983,7 @@ static ws_tx_slot_t *s_ws_slots = NULL;
  * @brief 异步发送完成回调（在 httpd 任务里执行）
  *
  * 失败静默降级：只留 DEBUG 痕迹，不刷屏；顺手让服务器回收该会话，
- * 避免之后每 100ms 都向死连接排一次发送。
+ * 避免之后每 66ms 都向死连接排一次发送。
  *
  * @param err    发送结果
  * @param socket 目标 socket fd
@@ -1007,6 +1022,8 @@ static void ws_broadcast(const char *json)
 
     int fds[WEB_CONSOLE_MAX_CLIENTS];
     size_t n_fds = WEB_CONSOLE_MAX_CLIENTS;
+    /* httpd_get_client_list：取出服务器当前所有客户端 socket 描述符。
+     * 入参 n_fds 既是数组容量、也是出参实际数量（必须 >= max_open_sockets）。 */
     if (httpd_get_client_list(server, &n_fds, fds) != ESP_OK) {
         return;
     }
@@ -1138,7 +1155,7 @@ static esp_err_t ws_handler(httpd_req_t *req)
 }
 
 /**
- * @brief WS 快照推送任务：每 200ms 读一次 data_store 并广播
+ * @brief WS 快照推送任务：每 66ms（约 15Hz）读一次 data_store 并广播
  *
  * 收尾方式（刻意为之）：退出循环后**挂起而不是自删**，由 web_console_stop()
  * 统一 vTaskDelete()。如果任务自删、stop() 又在超时后强删，两条删除路径
@@ -1169,7 +1186,7 @@ static void ws_push_task(void *arg)
 /**
  * @brief 未启用 CONFIG_HTTPD_WS_SUPPORT 时的 /ws 兜底：回 501
  *
- * 页面的 JS 会因握手失败自动退化为「每 500ms 轮询 /api/state」，
+ * 页面的 JS 会因握手失败自动退化为「每 100ms 轮询 /api/state」，
  * 功能不缺失，只是少了推送。
  */
 static esp_err_t ws_unsupported_handler(httpd_req_t *req)
@@ -1217,6 +1234,9 @@ esp_err_t web_console_start(void)
         }
     }
 
+    /* esp_http_server 是 ESP-IDF 内置的 HTTP 服务器：httpd_start() 后由内部
+     * httpd 任务监听端口、解析请求，再按"方法 + 路径"分发到注册的 handler。
+     * 下面这份配置决定端口、并发连接数、URI 槽位、handler 任务栈等资源上限。 */
     httpd_config_t config = HTTPD_DEFAULT_CONFIG();
     config.server_port = WEB_CONSOLE_PORT;
     config.max_open_sockets = WEB_CONSOLE_MAX_CLIENTS;
@@ -1232,7 +1252,7 @@ esp_err_t web_console_start(void)
                                   * 的（cache 一致性），但把 flash 写入者与 4kHz
                                   * 采样任务放在不同核上，调度上更稳妥；且 handler
                                   * 逻辑短平快，留 Core0 对交互核影响可忽略。
-                                  * WS 推送任务已迁 Core1（见上方创建处）。 */
+                                  * WS 推送任务已迁 Core1（见下方任务创建处）。 */
 
     httpd_handle_t server = NULL;
     esp_err_t err = httpd_start(&server, &config);
@@ -1357,7 +1377,7 @@ esp_err_t web_console_stop(void)
      * 顺序反了的话，推送任务可能拿着已销毁的句柄去排发送 */
     s_push_stop_req = true;
     for (int i = 0; i < 100 && s_push_task != NULL; i++) {
-        vTaskDelay(pdMS_TO_TICKS(10)); /* 推送周期 200ms，等 1s 足够收尾 */
+        vTaskDelay(pdMS_TO_TICKS(10)); /* 推送周期 66ms，等 1s 足够收尾 */
     }
     if (s_push_task != NULL) {
         ESP_LOGW(TAG, "WS 推送任务未按时退出，强制删除");

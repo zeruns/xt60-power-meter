@@ -145,7 +145,9 @@ static void led_advance(void)
      *    若定时器本来就没在跑，会返回错误，这里刻意忽略。 */
     esp_timer_stop(s_timer);
 
-    /* ② 读出当前模式与步骤下标 */
+    /* ② 读出当前模式与步骤下标
+     *    portENTER_CRITICAL：临界区，屏蔽中断/任务切换，保证 pattern 与 index
+     *    这对共享变量不会读到「一半新一半旧」的组合；区内只做赋值，极其短小。 */
     portENTER_CRITICAL(&s_lock);
     status_led_pattern_t pattern = s_pattern;
     uint8_t index = s_step_index;

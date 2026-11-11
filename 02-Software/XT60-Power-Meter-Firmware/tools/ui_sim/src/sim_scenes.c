@@ -9,6 +9,9 @@
  * 点击目标用**文本语义查找**（find_text），避免硬编码坐标：
  * 先在屏幕与顶层图层里按文本找 label，再向上找可点击祖先、
  * 滚动到可见后取中心点点击 —— 与真人手指操作等价且更稳。
+ *
+ * 回归判定：控制台不得出现 `[scene] !!` 告警（tools/ci/run_ci.ps1 会检查），
+ * 出现即说明某个按钮/文本在当前布局下点不到或未按预期响应。
  */
 #include "sim.h"
 
@@ -462,6 +465,12 @@ void sim_run_scenes(void)
     splash_set_progress_text("正在初始化传感器…");
     shot("01_splash");
 
+    /* ---- 01c 启动页 ASCII 阶段（中文字库加载完成前）---- */
+    splash_set_cjk(false);
+    splash_set_progress_text("BOOTING 45%");
+    shot("01c_splash_ascii");
+    splash_set_cjk(true);
+
     /* ---- 01b 启动页（竖屏）：验证进度条居中、不与版本行冲突 ---- */
     lv_obj_clean(lv_screen_active());
     lvgl_port_set_rotation_angle(90);
@@ -470,6 +479,10 @@ void sim_run_scenes(void)
     splash_set_progress(45);
     splash_set_progress_text("正在初始化传感器…");
     shot("01b_splash_90");
+    splash_set_cjk(false);
+    splash_set_progress_text("BOOTING 45%");
+    shot("01d_splash_ascii_90");
+    splash_set_cjk(true);
     lv_obj_clean(lv_screen_active());
     lvgl_port_set_rotation_angle(0);
     sim_step(100);
@@ -676,7 +689,7 @@ void sim_run_scenes(void)
     ui_nav_refresh(sim_get_measurement());
     shot("29_measure_270");
 
-    rotate_to_angle(90, 1); /* 竖屏波形页：图表加高到 170 */
+    rotate_to_angle(90, 1); /* 竖屏波形页：图表加高到 166（见 screen_wave 的竖屏几何） */
     ui_nav_refresh(sim_get_measurement());
     shot("30_wave_90");
 
@@ -691,14 +704,14 @@ void sim_run_scenes(void)
     /* K2 长按打开（真机由 ui_nav 路由；场景直接投递等价事件） */
     ui_nav_handle_key(BUTTON_ID_USER, BUTTON_EVENT_LONG_PRESS_START);
     sim_step(200);
-    shot("24_measure_menu"); /* 初始焦点在「清除电能统计数据」行（橙边） */
+    shot("24_measure_menu"); /* 初始焦点在「清除电能统计数据」行（焦点框为品牌蓝，首次按键后才显示） */
 
     /* K2 单击：焦点下移到「数据刷新率」行 */
     ui_nav_handle_key(BUTTON_ID_USER, BUTTON_EVENT_SINGLE_CLICK);
     sim_step(150);
     shot("25_measure_menu_focus_rate");
 
-    /* K2 双击：激活焦点行 → 刷新率 5Hz → 10Hz（循环） */
+    /* K2 双击：激活焦点行 → 刷新率在 1/5/10/20/30Hz 间循环（当前 5Hz → 10Hz） */
     ui_nav_handle_key(BUTTON_ID_USER, BUTTON_EVENT_DOUBLE_CLICK);
     sim_step(200);
     shot("26_measure_menu_10hz");
@@ -707,16 +720,56 @@ void sim_run_scenes(void)
                (unsigned)ui_get_display_rate_hz());
     }
 
-    /* K2 单击：焦点回到清除行；K2 双击：执行清零，菜单应自动关闭 */
+    /* K2 单击：焦点回到清除行；K2 双击：【v0.6.8】弹确认框，菜单应自动关闭 */
     ui_nav_handle_key(BUTTON_ID_USER, BUTTON_EVENT_SINGLE_CLICK);
     sim_step(150);
     ui_nav_handle_key(BUTTON_ID_USER, BUTTON_EVENT_DOUBLE_CLICK);
     sim_step(300);
     if (screen_measure_menu_is_open()) {
-        printf("[scene] !! 清除电能后菜单未自动关闭\n");
+        printf("[scene] !! 触发清零后菜单未自动关闭\n");
+    }
+    if (find_text("取消") == NULL || find_text("确定") == NULL) {
+        printf("[scene] !! 清零确认框未弹出（v0.6.8 应先二次确认）\n");
     }
     ui_nav_refresh(sim_get_measurement());
+    shot("27a_measure_clear_confirm");
+    click_text("确定"); /* 确认清零 */
+    sim_step(350);
+    click_text("确定"); /* 关闭"已清零"提示 */
+    sim_step(300);
+    ui_nav_refresh(sim_get_measurement());
     shot("27_measure_after_clear");
+
+    /* ---- v0.6.8 竖屏弹窗自适应验证：确认框不得左右越界（屏宽 240） ---- */
+    rotate_to_angle(90, 0); /* 竖屏 240×284 */
+    ui_nav_refresh(sim_get_measurement());
+    screen_measure_open_menu();
+    sim_step(200);
+    click_text("清除电能统计数据"); /* 触屏路径 → 弹确认框 */
+    sim_step(250);
+    shot("47_portrait_clear_confirm");
+    {
+        lv_obj_t *box = find_text("确定");
+        /* 从按钮标签沿父链找到 msgbox 本体，检查其屏幕坐标是否越界 */
+        while (box != NULL && !lv_obj_check_type(box, &lv_msgbox_class)) {
+            box = lv_obj_get_parent(box);
+        }
+        if (box == NULL) {
+            printf("[scene] !! 竖屏确认框未找到 msgbox\n");
+        } else {
+            lv_area_t a;
+            lv_obj_get_coords(box, &a);
+            printf("[scene] 竖屏确认框 x1=%d x2=%d（屏宽 240，期望 0<=x1<x2<=240）\n",
+                   (int)a.x1, (int)a.x2);
+            if (a.x1 < 0 || a.x2 > 240) {
+                printf("[scene] !! 竖屏确认框左右被裁\n");
+            }
+        }
+    }
+    click_text("取消"); /* 关闭确认框（不执行清零） */
+    sim_step(250);
+    rotate_to_angle(0, 0); /* 回到横屏，后续触屏回归按横屏坐标 */
+    ui_nav_refresh(sim_get_measurement());
 
     /* 触屏路径回归：再次打开点档位 + K1 长按关闭 */
     screen_measure_open_menu();
@@ -736,7 +789,7 @@ void sim_run_scenes(void)
     shot("23_settings_final");
 
     /* ============================================================
-     * v0.6.0 新增场景：WiFi 页改版 + 状态栏信号条 + 数字键盘
+     * v0.6.0 新增场景：WiFi 页改版 + 状态栏 WiFi 图标 + 数字键盘
      * ============================================================ */
 
     /* ---- WiFi 页：模式三档 + 扫描列表 + 密码键盘 ---- */
@@ -783,25 +836,25 @@ void sim_run_scenes(void)
     ensure_page(2);
     close_subpage_if_open();
 
-    /* ---- 状态栏 WiFi 信号条四态（测量页截图即可看到状态栏） ---- */
+    /* ---- 状态栏 WiFi 图标四态（测量页截图即可看到状态栏） ---- */
     ensure_page(0);
     mock_wifi_set_state(WIFI_MANAGER_STATE_CONNECTED);
-    mock_wifi_set_rssi(-52); /* 强信号 → 4 格绿 */
+    mock_wifi_set_rssi(-52); /* 强信号（≥-60dBm）→ 绿色图标 */
     ui_nav_refresh(sim_get_measurement());
     sim_step(250);
     shot("36_wifi_bar_connected");
-    mock_wifi_set_rssi(-85); /* 弱信号 → 1 格黄 */
+    mock_wifi_set_rssi(-85); /* 很差信号（<-80dBm）→ 红色图标 */
     ui_nav_refresh(sim_get_measurement());
     sim_step(250);
     shot("37_wifi_bar_weak");
     mock_wifi_set_state(WIFI_MANAGER_STATE_AP_MODE);
     ui_nav_refresh(sim_get_measurement());
     sim_step(250);
-    shot("38_wifi_bar_ap"); /* 配网热点 → 4 格蓝 */
+    shot("38_wifi_bar_ap"); /* 配网热点 → 蓝色图标 + "AP" 徽标 */
     mock_wifi_set_state(WIFI_MANAGER_STATE_FAILED);
     ui_nav_refresh(sim_get_measurement());
     sim_step(250);
-    shot("39_wifi_bar_off"); /* 未连接 → 全灰 */
+    shot("39_wifi_bar_off"); /* 未连接/失败 → 灰色图标 + 斜杠 */
     /* 还原成"已连接"给后续场景 */
     mock_wifi_set_state(WIFI_MANAGER_STATE_CONNECTED);
     mock_wifi_set_rssi(-52);
@@ -820,6 +873,36 @@ void sim_run_scenes(void)
     shot("42_alarm_after_input");
     close_subpage_if_open();
     sim_step(150);
+
+    /* ---- v0.6.9 告警上限（90V / 70A / 6300W）显示不溢出 ---- */
+    {
+        settings_alarm_t max_alm = {
+            .v_en = 1,
+            .i_en = 1,
+            .p_en = 1,
+            .v_limit = 90.0f,
+            .i_limit = 70.0f,
+            .p_limit = 6300.0f,
+        };
+        (void)settings_set_alarm(&max_alm);
+        open_sub_page("告警设置");
+        shot("40b_alarm_max"); /* 检查 "90.00 V" / "70.00 A" 显示 */
+        scroll_all_to_bottom(lv_screen_active());
+        sim_step(200);
+        shot("40c_alarm_max_bottom"); /* 检查 "6300 W" 在 72px 数值标签内不被裁 */
+        close_subpage_if_open();
+        /* 还原默认值，避免影响后续场景 */
+        settings_alarm_t def_alm = {
+            .v_en = 0,
+            .i_en = 0,
+            .p_en = 0,
+            .v_limit = 15.0f,
+            .i_limit = 5.0f,
+            .p_limit = 50.0f,
+        };
+        (void)settings_set_alarm(&def_alm);
+        sim_step(150);
+    }
 
     /* 收尾回到设置首页（与旧场景一致，便于人工对照 23_settings_final） */
     ensure_page(2);

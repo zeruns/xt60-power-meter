@@ -64,7 +64,7 @@ typedef struct {
     uint8_t wave_smooth; /**< 波形曲线平滑（1=开启，0=关闭，出厂默认 0） */
     /* ---- v0.5.0 新增（B20 波形持久化 / F4 自动降亮）---- */
     uint8_t wave_window; /**< 波形时间窗档位（0=1s 1=10s 2=30s 3=60s 4=120s 5=10min，默认 1=10s） */
-    uint8_t wave_mode;   /**< 波形显示模式（0~4 与 PM_WAVE_MODE_* 对应，默认 0） */
+    uint8_t wave_mode;   /**< 波形显示模式（0~4 与 PM_WAVE_MODE_* 对应，默认 3=电压+电流） */
     /* 自动降亮时长档位（v0.6.2 语义调整，需求 11）：
      * 0=永不 1=15s 2=30s 3=60s（档位×15s 即对应秒数）。
      * 无操作到点后背光降到 10%（变暗不黑屏）；触摸或按键立即恢复原亮度。
@@ -83,9 +83,9 @@ typedef struct {
     uint8_t v_en;   /**< 过压告警使能（1=开启） */
     uint8_t i_en;   /**< 过流告警使能 */
     uint8_t p_en;   /**< 过功率告警使能 */
-    float v_limit;  /**< 过压阈值（V） */
-    float i_limit;  /**< 过流阈值（A） */
-    float p_limit;  /**< 过功率阈值（W） */
+    float v_limit;  /**< 过压阈值（V），范围 (0, 90] */
+    float i_limit;  /**< 过流阈值（A），范围 (0, 70] */
+    float p_limit;  /**< 过功率阈值（W），范围 (0, 6300] */
 } settings_alarm_t;
 
 /**
@@ -198,7 +198,8 @@ esp_err_t settings_get_alarm(settings_alarm_t *out);
 /**
  * @brief 更新告警阈值配置：写入内存缓存并安排延迟落盘（防抖）
  *
- * 非法输入（阈值 ≤0、NaN/inf）拒绝并保持原值不变。
+ * 非法输入（阈值 ≤0、NaN/inf，或超过整机量程上限 90V / 70A / 6300W）
+ * 拒绝并保持原值不变。上限与设备端 UI、网页滑条/输入框使用同一组数值。
  *
  * @param in 新配置，不可为 NULL
  * @return ESP_OK 成功；ESP_ERR_INVALID_ARG 参数非法；ESP_ERR_INVALID_STATE 尚未初始化

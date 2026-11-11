@@ -153,7 +153,8 @@ int pm_wave_copy(pm_wave_window_t win, pm_wave_mode_t mode, float *a, float *b, 
     mode_fields(mode, &fa, &fb, &has_b);
 
     /* 与真机同一时间槽契约：槽 j = 屏幕第 j 列，右端(max_points-1)=现在，
-     * 每槽固定 = 窗长/槽数。模拟器假定窗口已填满，故每槽都有数据。 */
+     * 每槽固定 = 窗长/槽数。模拟器假定窗口已填满，故每槽都有数据，
+     * 返回值恒为 max_points（真机返回有效槽位数，可能更少）。 */
     const float step_s = ((float)s_win_ms[win] / 1000.0f) / (float)max_points;
     for (int j = 0; j < max_points; j++) {
         const float t = (float)(max_points - 1 - j) * step_s;

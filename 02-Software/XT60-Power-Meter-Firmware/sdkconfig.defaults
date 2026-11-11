@@ -151,37 +151,46 @@ CONFIG_ESP_BROWNOUT_DET=y
 # ============================================================
 # 颜色深度 16bit（RGB565）：与面板驱动的像素格式一致
 CONFIG_LV_COLOR_DEPTH_16=y
-# **像素字节序必须用 Big-endian（RGB565_SWAPPED）**：
+# **LVGL 内部使用普通 RGB565，字节序在 flush 阶段统一交换（swap_bytes=1）**：
 #   面板 QSPI 线上要求每像素「高字节在前」（厂商 STM32 例程 Lcd_ColorBox
-#   即先发 Color>>8 再发 Color）。LVGL 渲染缓冲按小端组织，直接发会整屏
-#   偏色/列错位。用 SWAPPED 后 LVGL 直接渲染成线上所需字节序，
-#   既不用软件逐像素交换、性能也更好。
-#   对应 LVGL 9 的 lv_display_set_color_format(LV_COLOR_FORMAT_RGB565_SWAPPED)。
-CONFIG_LV_COLOR_FORMAT_RGB565_SWAPPED=y
+#   即先发 Color>>8 再发 Color）。但 LVGL 9 的软件旋转 lv_draw_sw_rotate
+#   只支持普通 RGB565，不支持 RGB565_SWAPPED（旋转分支落空 → 输出垃圾内存，
+#   90/180/270° 整屏花屏）。因此显示注册显式用 LV_COLOR_FORMAT_RGB565，
+#   旋转完成后由官方 flush 的 swap_bytes 逐像素交换成大端。
+#   Kconfig 默认值必须与运行期一致，避免后来者误以为工程依赖 SWAPPED 格式。
+CONFIG_LV_COLOR_FORMAT_RGB565=y
 # 正式测量界面已上线，不再编译官方 widgets demo
 # CONFIG_LV_USE_DEMO_WIDGETS is not set
 # 关闭 FPS/CPU 性能监视器（台阶1 验收已完成，恢复无角标的干净界面）
 # CONFIG_LV_USE_SYSMON is not set
 # 中文字体方案：tiny_ttf，字体文件放 SPIFFS（storage 分区，挂载于 /spiffs）
-#   字体由 tools/fonts/make_fonts.py 生成（Noto Sans SC Regular/Bold，
-#   GB2312 一级字库子集，OFL 授权），构建时打入 SPIFFS 镜像随固件烧入，
-#   不占 app 程序分区空间。lvgl_port_init 时用标准 fopen 把两个 TTF 整读入
-#   PSRAM（约 2.2MB），之后渲染走内存，运行期对 flash 零访问（避免渲染中
-#   读 SPIFFS 与 flash 擦除/LCD DMA 交错引发的 cache 故障）。
+#   主界面字体由 tools/fonts/make_fonts.py 生成（Noto Sans SC 500/700 两字重，
+#   GB2312 一级+二级共 6763 字，OFL 授权），构建时打入 SPIFFS 镜像随固件烧入，
+#   不占 app 程序分区空间；两字重合计约 4.2MB。后台任务用 fopen 把两个 TTF
+#   整读入 PSRAM，之后渲染走内存，运行期对 flash 零访问（避免渲染中读 SPIFFS
+#   与 flash 擦除/LCD DMA 交错引发的 cache 故障）。
 #   文件缺失时 lvgl_port 回退内置 montserrat14（仅 ASCII）。
+#   v0.6.9 起主界面字库改为**后台任务异步加载**（约 3.3s）；启动页另用编进
+#   app 分区的极小子集（tools/fonts/make_splash_font.py，约 197 字/34KB 每字重），
+#   首帧即完整中文，不再先显示 ASCII。
+#   启动页内嵌子集使用 40px 粗体；Montserrat 32px 保留给子集创建失败时的
+#   ASCII 兜底大标题（14px 已默认开启，兼作图标回退）。
+CONFIG_LV_FONT_MONTSERRAT_32=y
 #   tiny_ttf 运行时只使用内存接口 lv_tiny_ttf_create_data，不需要文件支持。
 CONFIG_LV_USE_TINY_TTF=y
 # CONFIG_LV_TINY_TTF_FILE_SUPPORT is not set
 # ⚠ 字形缓存条数（每字体的槽位结构 + 位图）：64 → 32。
-#   14 个字体实例时缓存结构本身就要几十 KB；32 条配合 LRU 驱逐足够覆盖
-#   单页可见字形（每页常用字形约 20 个），代价仅为少量重光栅化。
+#   8 档字号 × 2 字重 = 16 个字体实例时缓存结构本身就要几十 KB；32 条配合
+#   LRU 驱逐足够覆盖单页可见字形（每页常用字形约 20 个），代价仅为少量重光栅化。
 CONFIG_LV_TINY_TTF_CACHE_GLYPH_CNT=32
 CONFIG_LV_TINY_TTF_CACHE_KERNING_CNT=16
-# LVGL 内存池大小（lv_malloc 的堆）。
+# LVGL 内建内存池大小（lv_malloc 的静态堆）。
 # ⚠ 符号名注意：LVGL 9.6 已废弃 LV_MEM_SIZE_KILOBYTES（KB），改为
 #   LV_MEM_SIZE（字节，默认 65536）。写旧名会得到「DEPRECATED」且不生效。
-# 正式界面（tileview + chart + 三级对象）与此前 demo 实测同档，保持 128KB。
-# 该内存池是静态数组，占用内部 RAM（S3 有 512KB，可承受）。
+# ⚠ 本工程实际使用系统堆（下方 CONFIG_LV_USE_CLIB_MALLOC=y），内建池不生效；
+#   这里的 128KB 仅作为「切回内建池」时的参考值保留，不代表运行期占用。
+#   历史背景：曾用 128KB 内建静态池占内部 RAM，后被"字形缓存 + 二级页对象"
+#   逐步耗尽并触发 stbtt__new_active 断言，故改为系统堆方案。
 CONFIG_LV_MEM_SIZE=131072
 # 内存分配器：改用系统堆（malloc/free）而非内建池。
 # 实机 coredump 定位：内建池被"字形缓存 + 二级页对象"逐步耗尽，
@@ -209,10 +218,11 @@ CONFIG_LWIP_MAX_SOCKETS=16
 # 开启 httpd WebSocket 支持（web_console /ws 实时推送；关闭时页面退化为轮询）
 CONFIG_HTTPD_WS_SUPPORT=y
 # WiFi 静态收发缓冲按低吞吐场景调小（v0.5.0 上板实测修复）：
-# 默认 RX16+TX16 个 ×1.6KB≈51KB，而 SPIRAM_MALLOC_ALWAYSINTERNAL=16384
-# 会把 1.6KB 级小分配全部判入内部 RAM → esf_buf alloc eb fail（WiFi 起不来）。
-# 本设备仅 Web 5Hz 推送 + CSV 导出，RX/TX 调小足够；同时显式约束
-# BA_WIN 一致性（esp_wifi 编译期校验：BA_WIN ≤ DYNAMIC_RX 且 ≤ 2×STATIC_RX）。
+# 默认 RX16+TX16 个 ×1.6KB≈51KB。历史上 SPIRAM_MALLOC_ALWAYSINTERNAL=16384
+# 时，1.6KB 级小分配会被强制判入内部 RAM → esf_buf alloc eb fail（WiFi 起不来）；
+# 现已把该值改为 0（见上文），但 RX/TX 仍按"网页控制台 + CSV 导出"的低吞吐
+# 场景显式调小，避免默认值白白占用内部 RAM；同时显式约束 BA_WIN 一致性
+# （esp_wifi 编译期校验：BA_WIN ≤ DYNAMIC_RX 且 ≤ 2×STATIC_RX）。
 CONFIG_ESP_WIFI_STATIC_RX_BUFFER_NUM=2
 CONFIG_ESP_WIFI_STATIC_TX_BUFFER_NUM=4
 CONFIG_ESP_WIFI_DYNAMIC_RX_BUFFER_NUM=12

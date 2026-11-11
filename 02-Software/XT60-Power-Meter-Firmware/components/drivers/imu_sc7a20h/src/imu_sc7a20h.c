@@ -91,6 +91,7 @@ static imu_sc7a20h_orientation_t s_last_orient = IMU_SC7A20H_ORIENT_LANDSCAPE;
  */
 static esp_err_t imu_write_reg(uint8_t reg, uint8_t value)
 {
+    /* i2c_master_transmit：纯写事务，把 {寄存器地址, 数据} 两个字节一次发出 */
     uint8_t buf[2] = { reg, value };
     return i2c_master_transmit(s_dev, buf, sizeof(buf), IMU_I2C_TIMEOUT_MS);
 }
@@ -110,6 +111,7 @@ static esp_err_t imu_read_xyz(int16_t *x, int16_t *y, int16_t *z)
 {
     uint8_t reg = IMU_REG_OUT_X_L | IMU_AUTO_INCREMENT;
     uint8_t buf[IMU_OUT_LEN] = { 0 };
+    /* 地址最高位置 1 = 读多字节时地址自动 +1，这样一次事务就能连读 X/Y/Z 三轴 */
     esp_err_t err = i2c_master_transmit_receive(s_dev, &reg, 1, buf, IMU_OUT_LEN,
                                                 IMU_I2C_TIMEOUT_MS);
     if (err != ESP_OK) {
@@ -132,8 +134,8 @@ static esp_err_t imu_read_xyz(int16_t *x, int16_t *y, int16_t *z)
  *     返回驱动初始默认值 PORTRAIT，导致"平放开机 + 自动旋转开启"时被误判为
  *     竖屏，开机约 1.2s 后自动旋转 90° 并触发全 UI 重建——实机 UI 冻结的
  *     触发路径之一）；
- *   · 横竖判据（v0.6.2 需求 10）：|x| × 10 ≥ |y| × 7 判横屏，即水平分量偏向
- *     X 轴 35° 以内即判横屏（旧版为 |x| ≥ |y|，等效 45°），转动更易触发切换。
+ *   · 横竖判据（v0.6.2 需求 10）：|x| × 10 ≥ |y| × 7 判横屏，即水平分量
+ *     偏离 Y 轴超过约 35° 就判横屏（旧版为 |x| ≥ |y|，边界 45°），转动更易触发切换。
  *
  * 符号到朝向的映射与屏幕/芯片安装方向强相关，若反向请按实际装配调整
  * （见文件头「上板调试要点」）。
@@ -144,7 +146,7 @@ static void classify_orientation(int16_t x, int16_t y, int16_t z,
     int32_t ax = abs(x), ay = abs(y), az = abs(z);
     int32_t hmax = (ax > ay) ? ax : ay; /* 水平面（XY）最大分量 */
 
-    /* 平放判据：|z| < 1.4 × 水平最大分量 才视为平放（等效倾斜角约 35°）。
+    /* 平放判据：|z| ≥ 1.4 × 水平最大分量 才视为平放（即离开水平面约 35° 以内）。
      * 例：水平放置 az≈g、hmax≈0 → 平放；竖起 40° 时 hmax=g·sin40°≈0.64g、
      * az=g·cos40°≈0.77g，0.77g < 1.4×0.64g=0.90g → 判定为已竖起。
      * 全部整数运算（×10 / ×14）：量程 ±32768，×14 后约 ±459k，int32_t 不溢出。 */
@@ -154,7 +156,7 @@ static void classify_orientation(int16_t x, int16_t y, int16_t z,
     }
 
     if (ax * 10 >= ay * 7) {
-        /* 水平分量主要落在 X 轴（偏离横屏 35° 以内）-> 横屏 */
+        /* 水平分量偏离 Y 轴超过约 35°（落在 X 轴附近）-> 横屏 */
         *out = (x > 0) ? IMU_SC7A20H_ORIENT_LANDSCAPE : IMU_SC7A20H_ORIENT_LANDSCAPE_INV;
     } else {
         /* 水平分量主要落在 Y 轴 -> 竖屏 */

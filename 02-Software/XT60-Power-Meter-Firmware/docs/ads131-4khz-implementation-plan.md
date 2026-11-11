@@ -1,5 +1,15 @@
 # ADS131M02 4 kHz 采样恢复实施方案：20 MHz SPI + DRDY ISR 直启 GDMA
 
+> **实施状态（2026-11，v0.6.9）**：M1~M3 已落地并合并进主线——
+> `ads131m02_engine.c` 已实现 SPI3 + GDMA 引擎、8 槽环形缓冲、DRDY ISR 直启、
+> CRC-16/CCITT 校验与连续失败重同步，`ads131m02_stats_t` 暴露统计计数；
+> 采样档位 OSR=1024 / 4 kHz、SPI 20 MHz、`input_delay_ns = 20` 均已生效。
+> M4 下游适配也已完成：`power_measure` 按 4 kHz / 200 ms（约 800 样本）运行，
+> 显示侧用 8 点滑动平均 + 一阶 EMA。
+> **尚未落地**：§4.1 第 2 条“`spi_get_freq_limit()` 自动降频”护栏（当前固定 20 MHz，
+> 换板/换线异常时需人工降档）；§8 的 24 h 长跑与逻辑分析仪 δ 分布尚未归档成数据。
+> 因此下文“现状”列描述的是**方案立项时**的基线（4 MHz / OSR=8192），不是当前代码。
+
 ## 1. 目标与验收标准
 
 目标：将 ADS131M02 恢复到 OSR=1024 档（ODR = 4.096 MHz / 1024 = 4 kHz，250 µs/样本），并在整个运行期稳定拿到每一个转换结果。
@@ -12,7 +22,7 @@
 | DRDY→首个 SCLK 启动延迟 | p99 ≤ 20 µs（逻辑分析仪实测） |
 | 读窗口终点距下一转换完成 | ≥ 200 µs（即读窗口绝不跨越转换时刻） |
 | 24 h 长跑 | CRC 失败 = 0、丢帧 = 0、重同步 = 0 |
-| 200 ms 块统计（V/I/RMS/P） | 与现行 500 Hz 档偏差在测量噪声范围内 |
+| 200 ms 块统计（V/I/P） | 与现行 500 Hz 档偏差在测量噪声范围内（直流口径，非 RMS） |
 
 不变项：data_store 40 Hz 写入节奏、200 ms 块统计口径、UI 与显示链路均不改动。
 
@@ -71,7 +81,7 @@ drdy_count++                                    [GDMA RX done 回调]
 三层护栏：
 
 1. `spi_device_interface_config_t.input_delay_ns = 20`（或裸引擎等效补偿）；
-2. init 时调 `spi_get_freq_limit(true, 20000)`，若返回值 < 20 MHz，**自动降频到该上限**（15/12.5/10 MHz 任一档都远够用：10 MHz 时读窗仅 9.6 µs，占 250 µs 周期 3.8%）；
+2. init 时调 `spi_get_freq_limit(true, 20000)`，若返回值 < 20 MHz，**自动降频到该上限**（15/12.5/10 MHz 任一档都远够用：10 MHz 时读窗仅 9.6 µs，占 250 µs 周期 3.8%）——**当前未实现**，见文首实施状态；
 3. 逻辑分析仪实测 MISO 与锁存沿的相位关系（§8 验证计划）。
 
 **降频不影响 4 kHz 目标**——4 kHz 的约束是"读窗不跨界"，不是带宽。20 MHz 是目标值，护栏保证任何降档都自动完成、无需人工干预。
@@ -145,9 +155,9 @@ OSR 从 8192 降到 1024，单样本噪声按 √8 ≈ 2.8 倍上升（过采样
 | 文件 | 改动 |
 |---|---|
 | `components/drivers/ads131m02/`（拆新文件 `ads131m02_engine.c`，或并入现有 .c，倾向拆分） | SPI3+GDMA 引擎：描述符管理、DRDY ISR、RX done 回调、两帧 RREG/WREG、重同步状态机、统计计数 |
-| [ads131m02.h](../components/drivers/ads131m02/include/ads131m02.h) | `ADS_ODR_HZ` 4000；`ADS_CLOCK_VALUE` 0x030E（= 复位值，注释呼应此前修正）；新增 `ads131m02_stats_t` 与查询/重同步 API |
+| [ads131m02.h](../components/drivers/ads131m02/include/ads131m02.h) | `ads131m02_stats_t` 与查询/重同步 API；`ADS_ODR_HZ = 4000`、`ADS_CLOCK_VALUE = 0x030E`（= 复位值）定义在驱动 `ads131m02.c` 内 |
 | [power_measure.c](../components/services/power_measure/src/power_measure.c) / `.h` | 采样周期、块样本数 800、500 Hz→4 kHz 口径注释 |
-| [app_tasks.c](../main/app_tasks.c) | `pm_sample` 优先级/亲和调整说明（路线 A 需 prio 25；路线 B 消费任务维持 22 即可） |
+| [app_tasks.c](../main/app_tasks.c) | `pm_sample` 优先级/亲和调整说明（实际 prio 24；`configMAX_PRIORITIES=25`，合法上限即 24，两条路线同一优先级） |
 | `components/drivers/ads131m02/CMakeLists.txt` | 依赖 `esp_driver_dma`（`gdma.h` 为 esp_private 头，同组件内可用）、`esp_hal_gpspi`、`esp_hal_dma`（组件名以 v6.1 实测为准） |
 | `sdkconfig.defaults` | 无需新增项；若弃用 spi_master 则清理 `CONFIG_SPI_MASTER_*` 相关注释口径 |
 
@@ -167,7 +177,7 @@ OSR 从 8192 降到 1024，单样本噪声按 √8 ≈ 2.8 倍上升（过采样
 |---|---|---|
 | 物理层 | 逻辑分析仪（DRDY + SCLK + MISO） | DRDY 周期 250 µs；δ 直方图 p99 ≤ 20 µs；读窗终点距转换完成 ≥ 200 µs；20 MHz 下 MISO 与锁存沿相位目检 |
 | 固件计数 | `ads131m02_stats_t` 定期快照 | 24 h：crc_fail = 0、lost_frame = 0、resync = 0；drdy_count = 4000×t |
-| 测量一致性 | 与 500 Hz 档同负载对比 | 200 ms 块 V/I/RMS/P 一致（噪声范围内）；单样本噪声按预期升 ~2.8 倍 |
+| 测量一致性 | 与 500 Hz 档同负载对比 | 200 ms 块 V/I/P 一致（噪声范围内，直流口径）；单样本噪声按预期升 ~2.8 倍 |
 | 压力 | UI 连滑 + NVS 保存 + 长跑 | δ 与丢帧指标不劣化（flash 擦写窗口是 ISR 直启的核心价值场景 [cite:8]） |
 | 恢复 | 上电、复位、人为打断 SPI 后 | 重同步状态机自愈，无需断电 |
 
@@ -175,7 +185,7 @@ OSR 从 8192 降到 1024，单样本噪声按 √8 ≈ 2.8 倍上升（过采样
 
 | 风险 | 概率/影响 | 缓解 / 回退 |
 |---|---|---|
-| 20 MHz MISO 裕量不足（t_p(SCDO)=20 ns vs 半周期 25 ns）[cite:2] | 中/中 | `input_delay_ns` + `spi_get_freq_limit` 自动降频（10–15 MHz 仍满足全部指标）；逻辑分析仪定档 |
+| 20 MHz MISO 裕量不足（t_p(SCDO)=20 ns vs 半周期 25 ns）[cite:2] | 中/中 | `input_delay_ns` 已生效；`spi_get_freq_limit` 自动降频**当前未实现**，异常时人工降档（10–15 MHz 仍满足全部指标）并做逻辑分析仪定档 |
 | HAL/私有 API（`esp_private/gdma.h`、`spi_ll`）随 IDF 版本演进 | 中/低 | 项目锁定 v6.1；引擎收敛在单文件；路线 A（公开 API）为回退形态 |
 | 无 CS 帧错位不自愈 | 低/高 | CRC 校验 + 重同步状态机 + 兜底硬复位；统计计数可观测 |
 | flash 擦写禁用 cache 打断中断 | 中/中 | ISR 全 IRAM、描述符/缓冲放 DRAM 且 32 B 对齐；DRDY 中断 `ESP_INTR_FLAG_IRAM` [cite:8] |

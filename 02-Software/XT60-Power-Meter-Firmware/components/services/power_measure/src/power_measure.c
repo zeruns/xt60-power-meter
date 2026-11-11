@@ -59,7 +59,7 @@
  * ─────────────────────────────────────────────────────────────
  * 四、波形缓冲（PSRAM，三级降采样）
  * ─────────────────────────────────────────────────────────────
- *   tier0  4000Hz × 4000 点  —— 1s 窗（原始逐点，已过 4 点滑动平均轻滤）
+ *   tier0  4000Hz × 4000 点  —— 1s 窗（逐点写入，仅经 8 点滑动平均轻滤）
  *   tier1    50Hz × 24000 点 —— 60s 窗（每 80 点均值，可回看 480s）
  *   tier2  1.25Hz × 6000 点  —— 10min 窗（每 40 个 tier1 点均值，可回看 80min）
  * 每个点含 V/I/P/E 四个 float + 时间戳；UI 用 pm_wave_copy() 按
@@ -136,7 +136,7 @@ typedef struct {
                       *   因此实际采样率偏低/波动时时间尺度依然正确。 */
 } wave_point_t;
 
-#define PM_TIER0_CAP 4000u   /**< 4000Hz × 1s（恰好覆盖 1s 窗；4kHz 下回看余量=窗长） */
+#define PM_TIER0_CAP 4000u   /**< 4000Hz × 1s（恰好覆盖 1s 窗，4kHz 下无额外回看余量） */
 #define PM_TIER1_CAP 24000u  /**< 50Hz × 480s（覆盖最长 60s 窗） */
 #define PM_TIER2_CAP 6000u   /**< 1.25Hz × 4800s（覆盖最长 10min 窗） */
 #define PM_TIER1_DECIM 80u   /**< tier0→tier1：80 点均值（4000/80=50Hz，tier1 速率与旧版一致） */
@@ -189,9 +189,10 @@ static power_measure_calib_t s_calib;        /**< 当前生效的标定参数 */
 static SemaphoreHandle_t s_calib_mutex = NULL; /**< 互斥锁：保护 s_calib 跨核读改写 */
 
 /** 累计电能（Wh）：内部用 double 累计。
- *  float 只有 24 位尾数，累计值超过约 1024 Wh 后相邻可表示间隔大于
- *  典型的每块增量（50W×0.2s≈0.0028Wh），增量会被"舍入吞掉"，电能不再走动；
- *  double 有 53 位尾数，按 1W·h 分辨率算可累计约 900 万 Wh，永不丢增量。
+ *  float 只有 24 位尾数，累计值越大相邻可表示间隔越粗（1024 Wh 处约
+ *  1.2e-4 Wh）：小功率负载的每块增量（1W×0.2s≈5.6e-5 Wh）从这一刻起会被
+ *  整体舍掉，电能不再走动；double 有 53 位尾数，按 1W·h 分辨率算可累计约
+ *  900 万 Wh，永不丢增量。
  *  对外接口仍是 float（见 power_measure.h），取值时再转换。 */
 static double s_energy_wh = 0.0;
 /** 累计容量（Ah）：同上用 double 累计，与电能并列积分（v0.2.0 仪器功能批 F2） */
@@ -206,11 +207,11 @@ static bool s_peak_init = false;
  *  块边界判定、块边界清零；上升沿才发 APP_EVENT_MEASURE_ALERT 事件。 */
 static uint32_t s_alert_mask = 0;
 /** 累计运行时间（秒）。
- *  单写者约定：上面两个值只由 task_sample 写（清零/积分都在块边界），
- *  task_aux 落盘时只读。 */
+ *  单写者约定：电能/容量/运行时间三个累计量都只由 task_sample 写
+ *  （清零/积分都在块边界），task_aux 落盘时只读。 */
 static uint32_t s_runtime_s = 0;
 
-/** 保护 s_energy_wh / s_runtime_s 的互斥锁
+/** 保护 s_energy_wh / s_capacity_ah / s_runtime_s 的互斥锁
  *
  * 写者虽只有 task_sample，但 task_aux 落盘时要读它们组包：double 在
  * 32 位核上是两条 32 位写，落盘读到一半会被插进来的写者撕裂。
@@ -288,7 +289,8 @@ static wave_point_t s_tier2_acc;    /**< tier2 降采样累计和 */
 /**
  * @brief 初始化环形缓冲描述（数据区由 power_measure_init 稍后分配）
  * @param r   目标环形缓冲
- * @param cap 容量（点数），仅记录，真正分配在 init
+ * @param cap 预留参数（当前未使用）：容量与数据区都由 power_measure_init
+ *            分配成功后写入 r->cap，本函数只把描述清空
  */
 static void ring_init(ring_t *r, uint32_t cap)
 {
@@ -324,8 +326,8 @@ static void ring_push(ring_t *r, const wave_point_t *p)
  *   age ∈ [(slots-1-j)*step, (slots-1-j+1)*step)，step = window_ms / slots
  *
  * 【2026-10 波形重构 Step1】桶聚合取代"最近样本+容差"：
- *   旧算法取「距 target 最近且 ≤半个槽」的单样本，当采样间隔（tier1 在
- *   500Hz 下为 40ms）与槽宽（10s/240≈41.7ms）不同步时约一半槽超出容差
+ *   旧算法取「距 target 最近且 ≤半个槽」的单样本，当采样间隔（约 40ms）
+ *   与槽宽（10s/240≈41.7ms）不同步时约一半槽超出容差
  *   → 留 NaN → 曲线断成竖条碎片（视频实证）。
  *   新算法把时段内**所有样本**聚合取均值：每桶必有样本（只要采样间隔
  *   ≤ 槽宽），天然连续；顺带对桶内多样本求均值，抑制噪声（示波器
@@ -480,9 +482,9 @@ static void ring_fill_slots(const ring_t *r, uint32_t now_ms, uint32_t window_ms
     }
 
     /* ③ 全桶线性插值（Step4·min/max 包络前提）：
-     *   480 槽 > 屏宽 280 像素，LVGL 对 LINE 系列自动画 min/max 竖线包络
-     *   （示波器 peak-detect 同款，防混叠丢峰）。但包络只覆盖**连续**段，
-     *   NaN 断点会把包络也切成碎片——所以这里把空桶全插值补齐，
+     *   480 槽 > 屏宽 284 像素（图表区约 252px），LVGL 对 LINE 系列自动画
+     *   min/max 竖线包络（示波器 peak-detect 同款，防混叠丢峰）。但包络只覆盖
+     *   **连续**段，NaN 断点会把包络也切成碎片——所以这里把空桶全插值补齐，
      *   让包络覆盖整个窗口。末端空桶（历史不足）回退单桶填补限 2 个，
      *   更靠左的仍留 NaN（画假曲线没意义）。 */
     for (int j = 1; j < slots; j++) {
@@ -521,7 +523,7 @@ static void ring_fill_slots(const ring_t *r, uint32_t now_ms, uint32_t window_ms
     }
 }
 
-/** 4 点滑动平均的历史值（仅采样线程访问） */
+/** 8 点滑动平均的历史值（仅采样线程访问） */
 static float s_mavg_v[PM_WAVE_MAVG_N]; /**< 电压滑动平均历史窗口 */
 static float s_mavg_i[PM_WAVE_MAVG_N]; /**< 电流滑动平均历史窗口 */
 static uint32_t s_mavg_idx = 0;        /**< 滑动窗口写入位置（循环推进） */
@@ -537,7 +539,7 @@ static uint32_t s_mavg_idx = 0;        /**< 滑动窗口写入位置（循环推
  */
 static void wave_push_sample(float v, float i)
 {
-    /* 轻滤：4 点滑动平均，抑制高频噪声使波形可读 */
+    /* 轻滤：8 点滑动平均，抑制高频噪声使波形可读 */
     s_mavg_v[s_mavg_idx] = v;
     s_mavg_i[s_mavg_idx] = i;
     s_mavg_idx = (s_mavg_idx + 1u) % PM_WAVE_MAVG_N;
@@ -1232,8 +1234,8 @@ static void task_sample(void *arg)
             /* 电能矩形积分：dt 用本块**真实墙钟时长**
              * （实际帧率 ≠ 标称值时（如 DRDY 被抑制、丢帧），按样本数
              *   折算会系统性算错；墙钟自动覆盖任何实际帧率）。
-             * 【数值修复 P2】内部用 double 累计：float 超约 1024 Wh 后
-             * 增量被舍入吞掉、电能不再走动（见 s_energy_wh 的注释） */
+             * 【数值修复 P2】内部用 double 累计：float 在大累计值下会吞掉
+             * 小增量、电能停止走动（见 s_energy_wh 的注释） */
             const float dt_s = (float)(block_now_us - block_start_us) / 1e6f;
             block_start_us = block_now_us;
             xSemaphoreTake(s_persist_mutex, portMAX_DELAY);
@@ -1435,7 +1437,7 @@ esp_err_t power_measure_init(void)
         }
     }
 
-    /* 三级波形缓冲：容量大（合计约 1.5MB），必须放 PSRAM
+    /* 三级波形缓冲：容量大（34000 点 × 20 字节 ≈ 680KB），必须放 PSRAM
      * （heap_caps_malloc + MALLOC_CAP_SPIRAM 只从外部 SPI RAM 分配，
      *  片内 RAM 留给栈和 DMA；失败返回 NULL，本模块选择整体失败）。 */
     ring_init(&s_tier[0], PM_TIER0_CAP);
@@ -1630,7 +1632,7 @@ float power_measure_zero_current_last_avg(void)
 
 /**
  * @brief 查询采样率（Hz）
- * @return 驱动上报的实测采样率；驱动不可用时回退标称值
+ * @return ADS131M02 配置的 ODR（4000 SPS）；驱动未初始化时回退标称值
  */
 uint32_t power_measure_sample_rate_hz(void)
 {

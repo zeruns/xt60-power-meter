@@ -19,9 +19,10 @@
 void screen_settings_create(lv_obj_t *tile);
 
 /**
- * @brief 数据刷新（由 ui_nav_refresh 转发当前快照，5Hz）
+ * @brief 数据刷新（UI 任务以 5Hz 调用；真机 ui.c 直调，模拟器经 ui_nav_refresh）
  *
- * 仅当设置页内有需要实时数值的二级页（校准向导/电能统计）打开时才有动作。
+ * 每次先缓存快照，再按当前二级页类型分发：校准向导/电能统计刷新数值，
+ * 显示设置/蜂鸣器同步滑条，WiFi 页刷新状态行；未打开的页直接跳过。
  * @param snap 最新测量快照，不可为 NULL
  */
 void screen_settings_refresh(const data_store_snapshot_t *snap);
@@ -29,9 +30,9 @@ void screen_settings_refresh(const data_store_snapshot_t *snap);
 /**
  * @brief 查询设置页是否需要接管按键（ui_nav 按键路由的门）
  *
- * 返回 true 的情形：① 二级页打开中；② 弹窗打开中（模态）；
- * ③ 当前就是设置页首页——首页网格入口（长按 K2 进入网格焦点模式）
- * 也要靠按键打开功能格，所以首页同样需要接管。
+ * 返回 true 的情形（都要求当前就在设置页）：① 二级页打开中；
+ * ② 弹窗打开中（模态）；③ 设置页首页——首页网格入口（长按 K2 进入
+ * 网格焦点模式）也要靠按键打开功能格，所以首页同样需要接管。
  * 未进入网格模式时 screen_settings_key 会返回 false 把按键交还给
  * ui_nav 的三页导航（翻页/回测量页键位不变）。
  *

@@ -118,10 +118,10 @@ static void task_orientation(void *arg)
     int confirm = 0; /**< 候选姿态已连续确认的次数 */
 
     for (;;) {
-        /* 200ms 周期；orientation_set_auto(true) 会发通知提前唤醒，
+        /* 150ms 周期；orientation_set_auto(true) 会发通知提前唤醒，
          * 用于"开启自动旋转后立即校正一次"（无需等防抖确认）。 */
         uint32_t notified = ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(ORIENT_PERIOD_MS));
-        /* ^ FreeRTOS 任务通知：最多阻塞等待 200ms，期间若有人发过通知
+        /* ^ FreeRTOS 任务通知：最多阻塞等待 150ms，期间若有人发过通知
          *   （xTaskNotifyGive）则立即返回非 0 的通知计数并清零，否则超时返回 0。
          *   比自建信号量更轻量，正好用来做"周期节拍 + 可被外部提前唤醒"。 */
 
@@ -167,8 +167,10 @@ static void task_orientation(void *arg)
 /**
  * @brief 创建姿态监测任务（幂等：重复调用返回 ESP_ERR_INVALID_STATE）
  *
- * 任务固定跑在 Core0：让出 Core1 给显示/触摸等重负载，避免 I2C 读取
- * 偶发的几毫秒阻塞干扰 UI 刷新。
+ * 任务固定跑在 Core1（v0.6.4 起）：本任务优先级很低（4），Core1 上的采样任务
+ * pm_sample（prio 24）随时可以抢占它，所以 150ms 一次的 I2C 读取阻塞不会
+ * 拖慢采样；同时 Core0 少一个周期性 I2C 任务，UI/LVGL 调度更从容。
+ * 读出姿态后调 lvgl_port_set_rotation_angle()（内部持 LVGL 互斥锁，跨核安全）。
  *
  * @return ESP_OK 成功；ESP_ERR_INVALID_STATE 已初始化；ESP_ERR_NO_MEM 任务创建失败
  * @note 一般不直接调用本函数，开机走 orientation_boot_restore() 一次性完成恢复+启动。
@@ -202,7 +204,7 @@ esp_err_t orientation_init(void)
  * @brief 开关重力自动旋转（只改运行态，持久化由 settings 负责）
  *
  * 开启时顺带唤醒监测任务立即校正一次，用户勾选"自动旋转"后屏幕马上
- * 就跟着握持方向走，不用干等 1.2s 防抖周期。
+ * 就跟着握持方向走，不用干等约 450ms 的防抖确认。
  *
  * @param enable true=开启自动旋转；false=关闭（保持当前角度）
  */
@@ -211,7 +213,7 @@ void orientation_set_auto(bool enable)
     s_auto = enable;
     ESP_LOGI(TAG, "重力自动旋转：%s", enable ? "开" : "关");
     if (enable && s_task != NULL) {
-        /* 立即唤醒监测任务按当前姿态校正一次（开启即生效，不等 1.2s 防抖） */
+        /* 立即唤醒监测任务按当前姿态校正一次（开启即生效，不等 450ms 防抖） */
         xTaskNotifyGive(s_task);
         /* ^ 给监测任务发一条任务通知：使它在 ulTaskNotifyTake 处提前醒来，
          *   任务醒来后看到通知计数非 0 就走"立即校正"分支 */

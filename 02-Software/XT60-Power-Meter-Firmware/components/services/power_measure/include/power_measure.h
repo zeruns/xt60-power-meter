@@ -16,11 +16,15 @@
  * NVS（命名空间 "pm"），启动时恢复。
  *
  * 波形缓冲（PSRAM，三级降采样）：
- *   tier0  4000Hz × 4000 点  —— 1s 窗（原始逐点）
+ *   tier0  4000Hz × 4000 点  —— 1s 窗（逐点写入，仅经 8 点滑动平均轻滤）
  *   tier1    50Hz × 24000 点 —— 60s 窗（每 80 点均值，可回看 480s）
  *   tier2  1.25Hz × 6000 点  —— 10min 窗（每 40 个 tier1 点均值，可回看 80min）
  * 每个点含 V/I/P/E 四个 float；UI 用 pm_wave_copy() 按**固定时间槽
  * 桶聚合**取数（每槽固定时长、槽内多样本取均值，与采样率无关）。
+ *
+ * 量程（v0.6.9 文档校正）：电压设计测量 0~90V——101:1 分压链路理论满量程
+ * ±121V，但辅助电源最高输入 100V，故限制到 90V；电流 ADC 满量程 ±75A
+ * （1mΩ 分流器 + PGA 16x），5W 分流器功率上限 70A，XT60 接口额定 ±30A。
  */
 #pragma once
 
@@ -167,6 +171,9 @@ uint32_t power_measure_sample_rate_hz(void);
  * @param b          副轴序列缓冲（单序列模式可为 NULL）
  * @param max_points 槽（列）数，建议 240~480，与屏宽对齐
  * @return 有效（非 NaN）的槽位数；参数非法返回 0
+ *
+ * @note 函数内部复用静态暂存区（省栈），因此**必须由同一个任务串行调用**
+ *       （UI 里就是 UI 任务）；多任务并发调用会互相覆盖。
  */
 int pm_wave_copy(pm_wave_window_t win, pm_wave_mode_t mode, float *a, float *b, int max_points);
 

@@ -2,7 +2,8 @@
 #   构建（MSVC + VS 自带 CMake/Ninja）→ 运行场景 → 生成截图 → 转 PNG
 #
 # 依赖：Visual Studio 2017+（含 C++ 工具链与"CMake 工具"组件；
-#       本机 VS 2022 Build Tools 已就绪）。无需额外安装。
+#       本机 VS 2022 Build Tools 已就绪）。C/C++ 侧无需额外安装；
+#       最后一步 BMP→PNG 需要 Python + Pillow（缺失时截图仍是 BMP，脚本会报错退出）。
 #
 # 用法：powershell -ExecutionPolicy Bypass -File build.ps1
 param(

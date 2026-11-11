@@ -2,15 +2,18 @@
  * @file sim_main.c
  * @brief 模拟器主程序：headless 渲染引擎（确定性虚拟时钟）+ BMP 截图导出
  *
- * 渲染一致性设计（与真机逐字节对齐的路径）：
- *   · 显示分辨率 284×240、PARTIAL 渲染模式、缓冲 40 行
- *     —— 与真机 lvgl_port 的 LVGL_PORT_BUF_ROWS=40 一致；
- *   · 颜色格式 RGB565_SWAPPED —— 与真机面板线上格式一致，
- *     flush 回调收到的像素缓冲即真机 DMA 缓冲的同格式数据；
- *   · 虚拟时钟步进 5ms —— 与真机 LVGL_PORT_TICK_MS=5 一致，
- *     时间推进可控 ⇒ 动画/定时器行为可复现，截图完全确定性。
+ * 渲染一致性设计（尽量贴近真机）：
+ *   · 显示分辨率 284×240（默认横屏）、PARTIAL 分块渲染 —— 与真机一致；
+ *     分块高度取 40 行（真机 LVGL_PORT_BUF_ROWS=24）：分块大小只影响每次
+ *     刷新的粒度，不影响最终画面；
+ *   · 颜色格式 RGB565_SWAPPED —— 与真机送给面板的线上字节序一致，
+ *     flush 回调收到的像素即真机 DMA 缓冲的同格式数据；
+ *   · 虚拟时钟固定 5ms/步（真机 LVGL_PORT_TICK_MS=16）：不等待真实时间，
+ *     时间推进完全可控 ⇒ 动画/定时器行为可复现、截图确定；代价是动画的
+ *     "绝对时长"与真机不同，故场景脚本用固定的等待步数保证停在稳定态。
  *
- * 截图：直接从帧缓冲导出 24bpp BMP（RGB888），由 capture.py 转 PNG。
+ * 截图：直接从帧缓冲导出 24bpp BMP（RGB888，导出时按面板 BGR 交换 R/B），
+ * 由 capture.py 转 PNG。
  */
 #include "sim.h"
 
@@ -22,11 +25,11 @@
 #include "lvgl_port.h"
 
 #define SIM_W 284 /**< 默认横屏宽（与 LCD_NV3030B_H_RES 一致） */
-#define SIM_H 240
+#define SIM_H 240 /**< 默认横屏高（与 LCD_NV3030B_V_RES 一致） */
 /** 帧缓冲行距：按横竖屏最大边（284）固定，避免旋转后重分配 */
 #define FB_STRIDE 284
 #define FB_MAX_H 284
-/** flush 缓冲行数与心跳（与真机 lvgl_port 保持一致） */
+/** 显示缓冲行数（真机 24 行）与虚拟时钟步进（真机 16ms），差异见文件头说明 */
 #define DISP_BUF_ROWS 40
 #define TICK_MS 5
 
@@ -56,7 +59,13 @@ static bool s_touch_pressed = false;
  * 显示与输入
  * ============================================================ */
 
-/** @brief flush：把渲染块写入帧缓冲（数据格式与真机 DMA 缓冲一致） */
+/**
+ * @brief flush 回调：把 LVGL 渲染好的一块区域拷进整帧缓冲
+ *
+ * PARTIAL 模式下 px_map 里只有 area 这一块（宽×高×2 字节），并不是整屏；
+ * 拷完后必须调 lv_display_flush_ready() 告诉 LVGL“这块已经上屏”，否则渲染
+ * 流水线会一直等下去。真机在这里把缓冲交给 DMA，并在传输完成回调里 ready。
+ */
 static void flush_cb(lv_display_t *disp, const lv_area_t *area, uint8_t *px_map)
 {
     int w = area->x2 - area->x1 + 1;
@@ -69,6 +78,12 @@ static void flush_cb(lv_display_t *disp, const lv_area_t *area, uint8_t *px_map)
     sim_flush_count_inc();
 }
 
+/**
+ * @brief 输入设备读取回调：LVGL 每次处理时来“取”当前触摸状态
+ *
+ * 模拟器把场景脚本设置的坐标/按下标志原样返回；坐标是当前逻辑坐标，
+ * 旋转后由 LVGL 自行换算，与真机触摸驱动上报的语义一致。
+ */
 static void indev_read_cb(lv_indev_t *indev, lv_indev_data_t *data)
 {
     (void)indev;
@@ -246,6 +261,7 @@ void sim_shot(const char *name)
         return;
     }
 
+    /* BMP 规定每行像素数据按 4 字节对齐，不足补 0 */
     int row_bytes = (w * 3 + 3) & ~3;
     uint32_t data_size = (uint32_t)row_bytes * (uint32_t)h;
     uint32_t file_size = 54u + data_size;

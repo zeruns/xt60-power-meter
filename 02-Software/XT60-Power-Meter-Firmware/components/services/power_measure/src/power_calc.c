@@ -9,7 +9,8 @@
  *
  * 调用关系：power_measure.c 的 task_sample 每样本调用
  * power_calc_raw_to_value 换算 V/I；电能积分由 power_measure.c 内部以
- * double 矩形积分完成（float 接口在 >1024Wh 后增量被舍入吞，故不走
+ * double 矩形积分完成（float 接口在累计值很大时会吞掉小增量，例如 1024 Wh
+ * 处 1W 负载每块仅 5.6e-5 Wh，小于半个 ULP，故不走
  * power_calc_energy_wh，见其注释）；power_calc_energy_wh / power_calc_power_w /
  * power_calc_is_over_limit 目前由主机单元测试覆盖（固件未直接调用）。
  * 本文件只做数学，不做任何 IO。

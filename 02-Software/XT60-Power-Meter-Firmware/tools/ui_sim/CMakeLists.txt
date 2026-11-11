@@ -54,8 +54,9 @@ add_executable(ui_sim
   src/mocks/mock_buzzer.c
   src/mocks/mock_power_measure.c
   src/mocks/mock_wifi_manager.c # v0.6.0：WiFi 页与状态栏信号条依赖 wifi_manager
-  # ↓ 与真机完全相同的界面源码（设置页/波形页/测量页/启动页/导航）
+  # ↓ 与真机完全相同的界面源码（设置页/波形页/测量页/启动页/导航/共享弹窗）
   "${UI_DIR}/ui_nav.c"
+  "${UI_DIR}/screens/ui_msgbox.c"
   "${UI_DIR}/screens/splash.c"
   "${UI_DIR}/screens/screen_measure.c"
   "${UI_DIR}/screens/screen_wave.c"

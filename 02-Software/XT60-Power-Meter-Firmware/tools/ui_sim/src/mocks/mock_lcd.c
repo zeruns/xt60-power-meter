@@ -25,6 +25,7 @@ lcd_nv3030b_rotation_t lcd_nv3030b_get_rotation(void)
     return s_rot;
 }
 
+/** 竖屏档（ROT_0/ROT_180）返回 240×284，横屏档（ROT_90/ROT_270）返回 284×240 */
 void lcd_nv3030b_get_resolution(lcd_nv3030b_rotation_t rot, int *width, int *height)
 {
     bool portrait = (rot == LCD_NV3030B_ROT_0 || rot == LCD_NV3030B_ROT_180);

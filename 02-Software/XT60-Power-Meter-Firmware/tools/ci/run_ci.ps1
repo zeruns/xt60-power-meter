@@ -4,13 +4,15 @@
 
 .DESCRIPTION
     与 CI（.github/workflows/ci.yml）互补：
-      · Linux CI 只跑 idf.py build；
-      · Windows 专属的主机单测与 UI 模拟器回归在本脚本执行。
+      · Linux CI 跑 idf.py build 与 gcc 主机单测（两个独立 job）；
+      · 依赖 Windows 的 UI 模拟器回归只能在本脚本执行；本脚本把构建、
+        主机单测、UI 回归串起来，便于本机一次跑完全部检查。
     任一步骤失败（退出码非 0，或 UI 场景输出含 "[scene] !!" 告警），
     本脚本最终以非零码退出。
 
     步骤：
-      1. build_fw.bat                固件构建（自动探测 IDF_PATH）
+      1. build_fw.bat                固件构建（沿用已设置的 IDF_PATH，
+                                     未设置时用脚本内的默认安装路径）
       2. test\host\run_host_tests.ps1 主机端纯逻辑单元测试
       3. tools\ui_sim\build.ps1       LVGL UI 模拟器回归（要求 [scene] !! 为 0）
 
@@ -19,6 +21,9 @@
 #>
 
 $ErrorActionPreference = 'Continue'
+# 批处理脚本（build_fw.bat / flash_fw.bat）执行结束默认 pause 以便双击查看结果；
+# CI/自动化场景必须跳过暂停，否则回归会卡在“请按任意键继续”。
+$env:XT60_NO_PAUSE = '1'
 $root = Resolve-Path (Join-Path (Split-Path -Parent $MyInvocation.MyCommand.Path) '..\..')
 Set-Location $root
 

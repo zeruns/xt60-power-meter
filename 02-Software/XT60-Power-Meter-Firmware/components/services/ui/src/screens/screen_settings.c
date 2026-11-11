@@ -1,23 +1,24 @@
 /**
  * @file screen_settings.c
- * @brief 设置页：2×4 功能网格入口 + 六个功能二级页（v0.2.0 设置全可用）
+ * @brief 设置页：2×4 功能网格入口（8 个功能格）+ 各功能二级页
+ *        （测量设置/显示/蜂鸣器/WiFi/电能统计/告警，另有 WiFi 扫描独立页）
  *
  * ────────────────────────────────────────────────────────────
  * 版式（284×240；顶部 22px 状态栏由 ui_nav 共享，不在本页职责内）
  * ────────────────────────────────────────────────────────────
  * 首页（网格一屏尽收，无需滚动）：
  *   ┌ x=14 ──────────────────── x=270 ┐
- *   │ 设置                              │ y≈28 标题（Bold 20）
+ *   │ 设置                              │ y=24 标题（Bold 20）
  *   │ ┌──────────┐ ┌──────────┐        │ y=52
- *   │ │ 测量设置  │ │ 显示设置  │        │ 每格约 122×40
+ *   │ │ 测量设置  │ │ 显示设置  │        │ 每格约 123×40
  *   │ └──────────┘ └──────────┘        │
- *   │ ┌──────────┐ ┌──────────┐        │ y=98
+ *   │ ┌──────────┐ ┌──────────┐        │ y=100
  *   │ │ 蜂鸣器    │ │ WiFi     │        │
  *   │ └──────────┘ └──────────┘        │
- *   │ ┌──────────┐ ┌──────────┐        │ y=144
+ *   │ ┌──────────┐ ┌──────────┐        │ y=148
  *   │ │ 电能统计  │ │ 告警设置  │        │
  *   │ └──────────┘ └──────────┘        │
- *   │ ┌──────────┐ ┌──────────┐        │ y=190
+ *   │ ┌──────────┐ ┌──────────┐        │ y=196
  *   │ │ 关于本机  │ │ 恢复出厂  │        │ 第 8 格＝恢复出厂（F6）
  *   │ └──────────┘ └──────────┘        │
  *   └──────────────────────────────────┘
@@ -56,7 +57,9 @@
  * 关键交互约定（全项目 UI 通用，本页严格落实）
  * ────────────────────────────────────────────────────────────
  *   · **纯按键可达**：二级页全部操作都做成按钮/开关/滑条等可聚焦控件，
- *     不依赖触屏手势；"返回"固定在标题栏左上，任何子页都不会把用户困住。
+ *     不依赖触屏手势（例外：WiFi 密码这类文本输入仍需触屏键盘，但
+ *     "取消/连接"已做成按键可操作）；"返回"固定在标题栏左上，任何子页都
+ *     不会把用户困住。
  *     按键操作体系（详见文件尾 screen_settings_key 与"焦点链机制"一节）：
  *     设置首页长按 K2 进入网格焦点模式（单击移焦点、长按 K2 打开焦点格），
  *     任意二级页内单击 K1/K2 移焦点、长按 K2 激活（按钮=点击、开关=切换、
@@ -76,8 +79,9 @@
  * ────────────────────────────────────────────────────────────
  * 实时数值刷新
  * ────────────────────────────────────────────────────────────
- * 校准向导与电能统计页需要实时值，由 ui_nav_refresh 以 5Hz 转发快照到
- * screen_settings_refresh()，本文件按"当前二级页类型"分发更新对应标签。
+ * 校准向导与电能统计页需要实时值：真机由 ui.c 主循环以 5Hz 直接调用
+ * screen_settings_refresh()（模拟器经 ui_nav_refresh 转发同一快照），
+ * 本文件按"当前二级页类型"分发更新对应标签。
  */
 #include "screen_settings.h"
 
@@ -91,6 +95,7 @@
 #include "esp_timer.h"
 #include "lvgl.h"
 #include "lvgl_port.h"
+#include "ui_msgbox.h" /* 【v0.6.8】对话框基础设施上移为共享模块，本页只留薄封装 */
 
 /* FreeRTOS：忘记网络的一次性任务需要创建/自删任务（见 wifi_forget_task）。
  * xTaskCreatePinnedToCore / vTaskDelete 由 task.h 提供；
@@ -129,7 +134,7 @@ static const char *TAG = "set_ui";
 #define GRID_SIDE_PAD 14 /**< 左右内缩（避开面板圆角） */
 #define GRID_TOP_Y    52 /**< 网格起始 y */
 #define CELL_HEIGHT   40 /**< 单格高度（40px 仍达触摸目标下限；4 行后压到此高度
-                          *   才能一屏放下 7 个功能格） */
+                          *   才能一屏放下 8 个功能格） */
 #define CELL_GAP_X    10 /**< 网格两列之间的间距 */
 #define CELL_GAP_Y    8  /**< 网格四行之间的间距 */
 
@@ -168,11 +173,7 @@ static lv_obj_t *s_sub_content = NULL; /**< 二级页内容容器 */
  *  是给列表/内容腾高度的关键手段（v0.6.3 WiFi 扫描页即用它换出 42px）。 */
 static lv_obj_t *s_sub_topbar = NULL;
 static sub_kind_t s_sub_kind = SUB_NONE; /**< 当前二级页类型（刷新分发的依据） */
-static bool s_layer_hooked = false;  /**< 对话框样式与关闭处理是否已安装 */
-static lv_obj_t *s_msgbox_scrim = NULL; /**< 当前对话框的压暗遮罩（随框删除） */
-static lv_obj_t *s_active_msgbox = NULL; /**< 当前打开的对话框（NULL=无；按键路由据此判模态） */
 
-static void close_active_msgbox(void);   /* 前向声明（定义见下方；弹新框前关旧框，防叠窗） */
 static void passkey_close(void);         /* 前向声明：WiFi 密码浮层（v0.6.0），见下方 WiFi 一节 */
 static void numkey_close(void);          /* 前向声明：数字键盘浮层（v0.6.0），见下方告警一节 */
 
@@ -237,7 +238,7 @@ static lv_obj_t *s_angle_btns[4] = { 0 }; /**< 0/90/180/270 度按钮 */
 static lv_obj_t *s_auto_switch = NULL;    /**< 重力自动旋转开关 */
 static const uint16_t s_angle_vals[4] = { 0, 90, 180, 270 };
 
-#define GRID_CELL_COUNT 8 /**< 设置首页网格功能格数（7 个功能 + 1 个留空位） */
+#define GRID_CELL_COUNT 8 /**< 设置首页网格功能格数（2×4 共 8 格，全部为功能格） */
 
 /* ---- 设置首页网格焦点（二级页全关时由长按 K2 进入） ---- */
 static lv_obj_t *s_grid_cells[GRID_CELL_COUNT] = { 0 }; /**< 各格按钮（登记顺序＝焦点顺序） */
@@ -246,253 +247,32 @@ static int s_grid_idx = 0;           /**< 网格焦点格下标（跨子页往�
 
 /** 校准完成 1.4s 自动关页定时器（句柄管理：关页/切页时显式删除，防误关新页面） */
 static lv_timer_t *s_close_timer = NULL;
-static lv_timer_t *s_zero_timer = NULL; /**< 清零采样定时器（40ms 轮询；声明在此因 subpage_close 等需提前引用） */
+static lv_timer_t *s_zero_timer = NULL; /**< 清零采样定时器（100ms 轮询；声明在此因 subpage_close 等需提前引用） */
 
 /* ============================================================
- * 对话框（lv_msgbox + 顶层图层可点击技巧，沿用原实现）
+ * 对话框（【v0.6.8】基础设施上移为共享模块 ui_msgbox.c，本页只留薄封装）
+ *
+ * 历史沿革：对话框整套基础设施（顶层图层可点击技巧 + 压暗遮罩 + 中文字体
+ * + 按键取消/确定 + 叠窗防御）原本只在本文件实现；v0.6.8 首页快速菜单的
+ * "清除电能统计"也要弹一模一样的确认框（破坏性操作必须二次确认），
+ * 遂把实现整体上移到 services/ui/src/screens/ui_msgbox.c 供两页共享，
+ * "跟设置里的一样"由同一份代码保证，而不是两处各写一份。
+ * 本文件内大量调用的 show_notice / show_confirm / close_active_msgbox
+ * 三个名字保持不变（薄封装到 ui_msgbox_*），调用点零改动。
+ * 按键处理也已上移：ui_nav 把模态弹窗的按键最优先交给 ui_msgbox_key()。
  * ============================================================ */
 
-/**
- * @brief 点击顶层图层空白处 → 关闭当前对话框（点遮罩关闭）
- *
- * 用**同步** lv_msgbox_close 而非 close_async：按键路径（screen_settings_key
- * → msgbox_key_action）也是同步关闭，两条路径若一同步一异步，异步排队的
- * 回调可能在对象已被另一路径删除后才执行（悬空指针）。统一同步关闭后
- * 无论点遮罩、点按钮还是按 K1/K2，都走同一个立即关闭出口。
- *
- * @param e LVGL 点击事件（目标是顶层图层 lv_layer_top()）
- */
-static void layer_clicked_cb(lv_event_t *e)
-{
-    lv_obj_t *layer = lv_event_get_current_target(e);
-    /* lv_obj_get_child_count()：数一数容器里现有几个子对象，用来判断
-     * "还有没有对话框开着"（对话框就是顶层图层的最后一个子对象）。 */
-    uint32_t n = lv_obj_get_child_count(layer);
-    if (n > 0) {
-        /* lv_obj_get_child(layer, n-1) 取最后创建的子对象 = 当前对话框 */
-        lv_msgbox_close(lv_obj_get_child(layer, n - 1));
-    }
-}
-
-/**
- * @brief 延迟一帧复查：图层已无子对象则恢复"不可点击"
- *
- * 时序说明：LV_EVENT_DELETE 触发时，被删对象**可能仍留在父对象的子列表中**，
- * 此刻直接查 child_count 会拿到非 0 值，导致顶层图层永远保持 clickable、
- * 把后续所有触摸全部吞掉（表现为"对话框关掉后返回按钮点不动"）。
- * 因此把复查放到下一帧（lv_async_call）执行。
- *
- * @param layer_ptr 顶层图层指针（void* 形参是为了匹配 lv_async_call 的回调签名）
- */
-static void layer_restore_check_cb(void *layer_ptr)
-{
-    lv_obj_t *layer = (lv_obj_t *)layer_ptr;
-    if (layer != NULL && lv_obj_get_child_count(layer) == 0) {
-        /* lv_obj_set_clickable(false)：让对象不再参与触摸命中测试，
-         * 触摸会"穿过"它落到下层页面控件上（否则整个页面被图层吞掉点击）。 */
-        lv_obj_set_clickable(layer, false);
-    }
-}
-
-/**
- * @brief 对话框被删除 → 删除压暗遮罩 + 安排一次延迟复查（恢复图层不可点击）
- *
- * 同时清 s_active_msgbox：弹窗句柄随对象一起失效，按键路由（screen_settings_key）
- * 靠它判断"此刻有没有弹窗要接管按键"，不清理会一直误判为模态。
- *
- * @param e LVGL 删除事件；user_data 携带顶层图层指针
- */
-static void box_deleted_cb(lv_event_t *e)
-{
-    lv_obj_t *box = lv_event_get_target(e); /* 被删的对话框本体 */
-    lv_obj_t *layer = (lv_obj_t *)lv_event_get_user_data(e);
-    if (s_active_msgbox == box) {
-        s_active_msgbox = NULL;
-    }
-    if (s_msgbox_scrim != NULL) {
-        /* lv_obj_delete()：立即删除遮罩对象（连同其样式一起释放） */
-        lv_obj_delete(s_msgbox_scrim);
-        s_msgbox_scrim = NULL;
-    }
-    if (layer != NULL) {
-        /* lv_async_call()：把复查函数挂到下一帧的异步队列执行，
-         * 避开"删除事件触发时对象还在子列表里"的时序陷阱（见上方注释） */
-        lv_async_call(layer_restore_check_cb, layer);
-    }
-}
-
-/**
- * @brief 把对话框里的文字全部换成中文字体（主题字体已是 Noto，这里是双保险）
- *
- * @param box lv_msgbox_create 创建的对话框对象
- */
-static void style_msgbox(lv_obj_t *box)
-{
-    /* lv_msgbox_get_title / get_content / get_footer：分别取对话框的
-     * 标题栏、正文区、底部按钮区三段的子对象（LVGL 9 的 msgbox 由这三块组成）。 */
-    lv_obj_t *title = lv_msgbox_get_title(box);
-    if (title != NULL) {
-        lv_obj_set_style_text_font(title, lvgl_port_get_font_bold(LVGL_PORT_FONT_16), 0);
-    }
-    lv_obj_t *content = lv_msgbox_get_content(box);
-    if (content != NULL) {
-        for (uint32_t i = 0; i < lv_obj_get_child_count(content); i++) {
-            lv_obj_set_style_text_font(lv_obj_get_child(content, i),
-                                       lvgl_port_get_font(LVGL_PORT_FONT_14), 0);
-            lv_obj_set_style_text_color(lv_obj_get_child(content, i), lv_color_hex(0x374151),
-                                        0);
-        }
-    }
-    lv_obj_t *footer = lv_msgbox_get_footer(box);
-    if (footer != NULL) {
-        for (uint32_t i = 0; i < lv_obj_get_child_count(footer); i++) {
-            lv_obj_t *btn = lv_obj_get_child(footer, i);
-            lv_obj_t *lbl = lv_obj_get_child(btn, 0);
-            if (lbl != NULL) {
-                lv_obj_set_style_text_font(lbl, lvgl_port_get_font(LVGL_PORT_FONT_14), 0);
-            }
-            lv_obj_set_style_min_width(btn, 84, 0);
-        }
-    }
-}
-
-/**
- * @brief 创建挂到顶层图层上的模态框（公共部分）
- *
- * @param title 标题文本
- * @param text  正文文本
- * @return 创建好的 lv_msgbox 对象（已加标题/正文并居中，按钮由调用方补）
- */
-static lv_obj_t *msgbox_begin(const char *title, const char *text)
-{
-    /* 叠窗防御（一键清零卡死修复）：已有活动弹窗先同步关闭，保证任意时刻
-     * 至多一个弹窗——否则单例 scrim/active 指针被新框覆盖，旧框成孤儿。 */
-    close_active_msgbox();
-
-    /* lv_layer_top()：LVGL 的"顶层图层"，永远画在所有页面之上。
-     * 对话框挂在这里，翻页/滚动都不会把它带走，天然呈现模态效果。 */
-    lv_obj_t *layer = lv_layer_top();
-
-    /* 关键：让顶层图层参与命中测试，否则里面的按钮点不动（见原实现注释） */
-    lv_obj_set_clickable(layer, true);
-    if (!s_layer_hooked) {
-        s_layer_hooked = true;
-        lv_obj_add_event_cb(layer, layer_clicked_cb, LV_EVENT_CLICKED, NULL);
-    }
-
-    /* 压暗遮罩：先于对话框创建（渲染在下层），模态感 + 突出对话框。
-     * 不可点击 → 命中测试穿透到顶层图层本体，点遮罩空白处仍走
-     * layer_clicked_cb 关闭对话框（与原交互一致）。
-     * lv_obj_remove_style_all()：清掉主题默认样式，得到一块干净的"画布"；
-     * lv_obj_set_style_bg_opa(..., LV_OPA_40, 0) 把黑色底调到 40% 不透明度，
-     * 即"压暗 60%"，视觉上提示"背后页面暂时不可用"。 */
-    lv_obj_t *scrim = lv_obj_create(layer);
-    lv_obj_remove_style_all(scrim);
-    lv_obj_set_size(scrim, LV_PCT(100), LV_PCT(100)); /* LV_PCT(100)：占父对象满宽/满高 */
-    lv_obj_set_style_bg_color(scrim, lv_color_black(), 0);
-    lv_obj_set_style_bg_opa(scrim, LV_OPA_40, 0);
-    lv_obj_set_clickable(scrim, false);
-    s_msgbox_scrim = scrim;
-
-    /* lv_msgbox_create()：LVGL 9 内置对话框部件，自带标题/正文/按钮区三段结构 */
-    lv_obj_t *box = lv_msgbox_create(layer);
-    lv_obj_set_width(box, 250); /* 固定宽度，避免长文本撑到圆角外 */
-    lv_msgbox_add_title(box, title); /* 往对话框里追加标题段 */
-    lv_msgbox_add_text(box, text);   /* 往对话框里追加正文段 */
-    style_msgbox(box);
-    lv_obj_center(box); /* 相对父对象（顶层图层）居中 */
-
-    /* 对话框删除后恢复图层可点击性 */
-    lv_obj_add_event_cb(box, box_deleted_cb, LV_EVENT_DELETE, layer);
-    s_active_msgbox = box; /* 记录当前弹窗：按键路由据此把 K1/K2 让给弹窗 */
-    return box;
-}
-
-static void notice_ok_cb(lv_event_t *e); /* 前向声明（定义见下方） */
-
-/**
- * @brief 单按钮提示框（"确定"，点击显式关闭）
- *
- * @param title 标题文本
- * @param text  正文文本
- */
+/** 单按钮提示框（"确定"，看完点掉）——转发到共享模块 */
 static void show_notice(const char *title, const char *text)
 {
-    lv_obj_t *box = msgbox_begin(title, text);
-    /* lv_msgbox_add_footer_button()：在对话框底部按钮区追加一个按钮 */
-    lv_obj_t *ok = lv_msgbox_add_footer_button(box, "确定");
-    lv_obj_add_event_cb(ok, notice_ok_cb, LV_EVENT_CLICKED, NULL); /* 点击触发关闭 */
-    style_msgbox(box); /* footer 按钮后补的子对象也要过一遍字体设置 */
+    ui_msgbox_notice(title, text);
 }
 
-/** 确认框的"确定"动作回调 */
+/** 确认框"确定"动作回调类型（与 ui_msgbox.h 的 ui_confirm_cb_t 同型） */
 typedef void (*confirm_cb_t)(void);
 
 /**
- * @brief 从 footer 按钮向上找到所属 msgbox 并**显式关闭**（幂等）
- *
- * 防御式设计：对话框的关闭不依赖 LVGL footer 按钮的内建关闭行为——
- * 若该行为在某种情况下失效，对话框将一直留在顶层图层上，把后续所有触摸
- * 全部吞掉（表现为"对话框关不掉、返回按钮也点不动"）。显式关闭双保险。
- *
- * @param btn 被点击的 footer 按钮（沿父链向上找到所属 msgbox）
- */
-static void msgbox_close_from_btn(lv_obj_t *btn)
-{
-    /* 从按钮一路向上找父对象，直到命中 lv_msgbox 的类对象为止。
-     * lv_obj_check_type(o, &lv_msgbox_class)：判断对象是不是 msgbox 类型；
-     * lv_obj_get_parent(o)：取直接父对象。 */
-    lv_obj_t *o = btn;
-    while (o != NULL && !lv_obj_check_type(o, &lv_msgbox_class)) {
-        o = lv_obj_get_parent(o);
-    }
-    if (o != NULL) {
-        /* lv_msgbox_close(o)：同步关闭（立即删除）该对话框 */
-        lv_msgbox_close(o);
-    }
-}
-
-/** @brief 单按钮提示框："确定"点击 → 显式关闭
- *  @param e LVGL 点击事件（目标是"确定"按钮） */
-static void notice_ok_cb(lv_event_t *e)
-{
-    msgbox_close_from_btn(lv_event_get_target(e)); /* lv_event_get_target：取触发事件的对象 */
-}
-
-/**
- * @brief 关闭当前活动弹窗（无则空操作）
- *
- * 同步关闭：box_deleted_cb 随之清理压暗遮罩与 s_active_msgbox。
- * 【一键清零卡死修复 2026-10】清零流程先弹"正在清零"，1 秒后再弹"已清零"
- * ——两框叠放时 s_active_msgbox/s_msgbox_scrim（单例指针）被新框覆盖，
- * 旧框与其遮罩成孤儿永远关不掉（点确定后仍压暗、界面卡死）。
- * 弹新框前先经本函数关旧框，叠窗问题从入口根治。
- */
-static void close_active_msgbox(void)
-{
-    if (s_active_msgbox != NULL) {
-        lv_msgbox_close(s_active_msgbox); /* 同步删除，回调自动清 scrim/句柄 */
-    }
-}
-
-/**
- * @brief 确认框"确定"点击 → 先关本框，再执行业务动作
- *
- * @param e LVGL 点击事件；user_data 携带业务回调 confirm_cb_t
- */
-static void confirm_ok_cb(lv_event_t *e)
-{
-    /* lv_event_get_user_data()：取出注册事件时塞进去的自定义指针（这里是业务回调） */
-    confirm_cb_t cb = (confirm_cb_t)lv_event_get_user_data(e);
-    /* 先关闭本框（同步删除，立即生效），再执行业务动作（动作可能弹新框） */
-    msgbox_close_from_btn(lv_event_get_target(e));
-    if (cb != NULL) {
-        cb();
-    }
-}
-
-/**
- * @brief 确认框（取消 / 确定）
+ * @brief 确认框（取消 / 确定）——转发到共享模块
  *
  * @param title  标题文本
  * @param text   正文文本（说明后果，含"不可撤销"提示）
@@ -500,15 +280,15 @@ static void confirm_ok_cb(lv_event_t *e)
  */
 static void show_confirm(const char *title, const char *text, confirm_cb_t ok_cb)
 {
-    lv_obj_t *box = msgbox_begin(title, text);
-    /* ⚠ LVGL 9.6 的 footer 按钮**没有**内建关闭行为（只有 add_close_button 才挂
-     * 关闭回调），"取消"必须显式挂关闭回调，否则点它/按 K1 都关不掉框。
-     * notice_ok_cb 的语义就是"关框不动作"，与"取消"一致，直接复用。 */
-    lv_obj_t *cancel = lv_msgbox_add_footer_button(box, "取消");
-    lv_obj_add_event_cb(cancel, notice_ok_cb, LV_EVENT_CLICKED, NULL);
-    lv_obj_t *ok = lv_msgbox_add_footer_button(box, "确定");
-    lv_obj_add_event_cb(ok, confirm_ok_cb, LV_EVENT_CLICKED, (void *)ok_cb); /* 业务回调经 user_data 传入 */
-    style_msgbox(box);
+    ui_msgbox_confirm(title, text, ok_cb);
+}
+
+/**
+ * @brief 同步关闭当前活动弹窗（无则空操作）——转发到共享模块
+ */
+static void close_active_msgbox(void)
+{
+    ui_msgbox_close_active();
 }
 
 /* ============================================================
@@ -620,7 +400,9 @@ static lv_obj_t *plain_button(lv_obj_t *parent, const char *text, int32_t w, int
  * 按键反馈鸣叫由 ui_nav_handle_key 统一播放，本文件不重复响。
  * ============================================================ */
 
-#define FOCUS_MAX 10  /**< 焦点链容量（最长子页 9 控件：告警页 3×2± + 3 开关） */
+#define FOCUS_MAX 10  /**< 焦点链容量（告警页最多 9 控件：3 行×2 个 ± 按钮 + 3 开关）。
+                       *   WiFi 扫描页「重扫 + 12 行」会超出容量：focus_add 直接
+                       *   忽略多余登记，按键只在前 10 项之间遍历。 */
 #define SLIDER_STEP 5 /**< 滑条按键步进（百分点：10~100 档 20 步走完） */
 
 static lv_obj_t *s_focus_widgets[FOCUS_MAX]; /**< 焦点链：当前子页可操作控件 */
@@ -788,8 +570,8 @@ static void slider_step(int dir)
 /**
  * @brief 退出滑条调节模式：补发 RELEASED 让回调落盘
  *
- * 亮度/响度回调的策略是"拖动中只改内存缓存、松手才 settings_save_now()"
- * （省 NVS 擦写寿命）。按键路径没有真实"松手"，退出调节时合成一次
+ * 亮度/响度回调的策略是"拖动中只改内存缓存、松手才 settings_request_save()"
+ * 请求落盘（省 NVS 擦写寿命）。按键路径没有真实"松手"，退出调节时合成一次
  * RELEASED 事件即可复用同一落盘逻辑（lv_event_get_user_data 在合成事件里
  * 会取到注册回调时的 user_data，回调行为与触摸路径完全一致）。
  */
@@ -800,7 +582,7 @@ static void slider_edit_exit(void)
     }
     lv_obj_t *w = s_focus_widgets[s_focus_idx];
     s_slider_edit = false;
-    lv_obj_send_event(w, LV_EVENT_RELEASED, NULL); /* 触发 settings_save_now() 落盘 */
+    lv_obj_send_event(w, LV_EVENT_RELEASED, NULL); /* 触发 settings_request_save() 请求落盘 */
     focus_paint();
 }
 
@@ -810,8 +592,8 @@ static void slider_edit_exit(void)
  * 按控件类型分派（lv_obj_check_type 比对 LVGL 控件类对象）：
  *   · 滑条  → 进入调节模式（后续单击=减/加，长按 K2=退出）；
  *   · 开关  → 翻转 CHECKED 状态并补发 VALUE_CHANGED（回调读状态执行业务）；
- *   · 其余（按钮/msgbox footer 按钮）→ 合成一次 LV_EVENT_CLICKED。
- * 合成 CLICKED 是可靠的：lv_event_send 会把注册回调时的 user_data 注入事件，
+ *   · 其余（普通按钮等）→ 合成一次 LV_EVENT_CLICKED。
+ * 合成 CLICKED 是可靠的：lv_obj_send_event 会把注册回调时的 user_data 注入事件，
  * 业务回调拿到的参数与触摸点击完全一致（如通道按钮的通道标志、确认框的 ok_cb）。
  */
 static void focus_activate(void)
@@ -975,7 +757,7 @@ static lv_obj_t *subpage_open(sub_kind_t kind, const char *title)
     lv_obj_remove_style_all(bar);
     lv_obj_set_size(bar, LV_PCT(100), SUB_TOPBAR_H);
     lv_obj_set_scrollable(bar, false);
-    lv_obj_set_style_border_side(bar, LV_BORDER_SIDE_BOTTOM, 0);
+    lv_obj_set_style_border_side(bar, LV_BORDER_SIDE_BOTTOM, 0); /* 只画底边：充当标题栏分隔线 */
     lv_obj_set_style_border_width(bar, 1, 0);
     lv_obj_set_style_border_color(bar, COL_BORDER, 0);
 
@@ -984,6 +766,10 @@ static lv_obj_t *subpage_open(sub_kind_t kind, const char *title)
     lv_obj_align(back, LV_ALIGN_LEFT_MID, 2, 0);    /* lv_obj_align：相对父对象（标题栏）左端垂直居中 */
     press_feedback_styles(back); /* 按下反馈与普通按钮一致（Bug2） */
     lv_obj_set_style_radius(back, 6, 0);
+    /* lv_obj_add_event_cb(对象, 回调, 事件码, user_data)：把 C 回调挂到对象的
+     * 事件上。LV_EVENT_CLICKED = 点击释放时触发；第 4 参 user_data 会原样带进
+     * 回调（用 lv_event_get_user_data(e) 取回），常用于"同一回调服务多个按钮、
+     * 靠参数区分是哪一个"。 */
     lv_obj_add_event_cb(back, back_clicked_cb, LV_EVENT_CLICKED, NULL);
     {
         lv_obj_t *bl = plain_label(back, "< 返回", LVGL_PORT_FONT_14, COL_INK, false);
@@ -1236,7 +1022,9 @@ static void calib_apply_cb(lv_event_t *e)
     lv_obj_set_style_text_align(done, LV_TEXT_ALIGN_CENTER, 0);
     lv_obj_set_style_margin_top(done, 24, 0); /* margin_top：外边距（与内边距 pad 不同，撑开与上文距离） */
 
-    /* lv_timer_create：1400ms 后触发一次自动关页。
+    /* lv_timer_create(回调, 周期毫秒, user_data)：创建 LVGL 定时器，周期到就在
+     * LVGL 任务上下文里调用回调（回调内可用 lv_timer_delete 自删，实现"一次性"）。
+     * 这里 1400ms 后触发一次自动关页。
      * ① 句柄存 s_close_timer：subpage_close() 会在用户提前切页/返回时显式删掉它
      *    （防"新页面被旧定时器误关"，见 close_timer_cb 注释）；
      * ② user_data 携带目标子页类型 SUB_CALIB_DONE：回调据此校验"要关的还是
@@ -1244,25 +1032,23 @@ static void calib_apply_cb(lv_event_t *e)
     s_close_timer = lv_timer_create(close_timer_cb, 1400, (void *)(intptr_t)SUB_CALIB_DONE);
 }
 
-/**
- * @brief 电流零点一键清零（空载校零，v0.6.6：改为采样 **3 秒块均值**）
- *
- * 输出空载时点击：把电流零偏 offset 调到「抵消采样平均值」的位置，使显示
- * 立即归零。物理量 = raw×gain + offset，故 offset_new = offset_old − 采样均值。
- *
- * 【v0.6.6 需求 5 的实现变更】
- *   旧版在 UI 侧用 lv_timer 每 40ms 读一次 data_store 快照、累计 1 秒求平均。
- *   现在统一交给**测量核**：`power_measure_zero_current_start()` 在 200ms 块边界
- *   累计电流块均值，满 3 秒（15 块）后调整零偏并 deferred 落盘。
- *   为什么更好：
- *     · 块均值是电流的权威口径（与正式测量同源），不受显示平滑/抽取影响；
- *     · 3 秒 15 块样本比 1 秒约 25 个显示帧更抗毛刺；
- *     · 网页控制台的「电流清零」按钮调用同一接口，两边口径一致。
- *   UI 侧只保留一个 100ms 轮询定时器，用来在采样结束后弹结果提示。
- *
- * @param e LVGL 点击事件（未使用）
- */
 /* 清零轮询定时器声明见文件前部（s_close_timer 旁） */
+/**
+ * @brief 清零采样结束轮询（100ms）：测量核采样完成后自删定时器并弹结果
+ *
+ * 【v0.6.6 需求 5 的实现】电流零点一键清零改为在**测量核**采样：
+ * `power_measure_zero_current_start()` 在 200ms 块边界累计电流块均值，
+ * 满 3 秒（15 块）后把零偏 offset 调到「抵消采样平均值」的位置
+ * （物理量 = raw×gain + offset，故 offset_new = offset_old − 采样均值），
+ * 并 deferred 落盘。相比旧版在 UI 侧用 lv_timer 每 40ms 读一次 data_store
+ * 快照、累计 1 秒求平均，这样做更好：
+ *   · 块均值是电流的权威口径（与正式测量同源），不受显示平滑/抽取影响；
+ *   · 3 秒 15 块样本比 1 秒约 25 个显示帧更抗毛刺；
+ *   · 网页控制台的「电流清零」按钮调用同一接口，两边口径一致。
+ * UI 侧只保留本定时器（100ms），用来在采样结束后弹结果提示。
+ *
+ * @param t 触发本次轮询的定时器（采样结束后本函数自删它）
+ */
 static void zero_sample_timer_cb(lv_timer_t *t)
 {
     (void)t;
@@ -1280,6 +1066,14 @@ static void zero_sample_timer_cb(lv_timer_t *t)
     show_notice("已清零", text);
 }
 
+/**
+ * @brief 电流通道"一键清零（空载）"按钮：启动测量核的 3 秒块均值采样
+ *
+ * 采样与零偏修正都在测量核完成（见 zero_sample_timer_cb 的说明），
+ * 本回调只负责发起请求并弹出"正在清零"提示。
+ *
+ * @param e LVGL 点击事件（未使用）
+ */
 static void calib_zero_cb(lv_event_t *e)
 {
     (void)e;
@@ -1519,7 +1313,8 @@ static void sync_slider_ui(lv_obj_t *sl, lv_obj_t *lbl, int32_t v, const char *f
  * @brief 亮度滑条变化/松手 → 立即调光 + 更新数值标签 + 落盘
  *
  * 拖动中（VALUE_CHANGED）实时生效并只改内存缓存；松手（RELEASED）才
- * settings_save_now() 写 Flash——避免拖动过程高频写 NVS（Flash 有擦写寿命）。
+ * settings_request_save() 请求落盘（后台任务异步写 Flash，不阻塞 UI）——
+ * 避免拖动过程高频写 NVS（Flash 有擦写寿命）。
  *
  * @param e LVGL 事件（VALUE_CHANGED=拖动中 / RELEASED=松手，同一个回调两种触发）
  */
@@ -1706,7 +1501,7 @@ static void display_open_cb(void)
  * @brief 响度滑条变化/松手 → 立即改音量 + 更新数值标签 + 落盘
  *
  * 与亮度滑条同款策略：拖动中只改内存缓存（buzzer_set_volume 立即生效），
- * 松手才 settings_save_now() 写 Flash（省 NVS 擦写寿命）。
+ * 松手才 settings_request_save() 请求落盘（省 NVS 擦写寿命）。
  *
  * @param e LVGL 事件（VALUE_CHANGED=拖动中 / RELEASED=松手）
  */
@@ -1911,7 +1706,7 @@ static void wifi_ap_row_clicked_cb(lv_event_t *e)
  * @brief 渲染扫描结果列表（扫描完成后调用一次）
  *
  * 取 wifi_manager 的扫描缓存（最多 WIFI_UI_LIST_MAX 条），按 RSSI 降序
- * 排列后逐行创建。行高 32px：触屏目标达标，且 12 行可在内容区滚动查看。
+ * 排列后逐行创建。行高 40px（v0.6.2 起）：触屏目标达标，且 12 行可在内容区滚动查看。
  * 每行都登记到焦点链，纯按键环境下也能用 K1/K2 选中并打开密码框。
  */
 static void wifi_render_ap_list(void)
@@ -2272,7 +2067,7 @@ static void passkey_submit_cb(lv_event_t *e)
  * 版式（284×240，顶部 22px 让开共享状态栏）：
  *   标题（"连接 <SSID>"，16px 粗体）
  *   密码输入框（单行、密码模式、34px）
- *   lv_keyboard（TEXT_LOWER，116px）
+ *   lv_keyboard（TEXT_LOWER，100px）
  *   [取消] [连接]（各 50%，32px）
  *
  * @param ssid 目标热点名（浮层标题显示它，连接时使用它）
@@ -2307,6 +2102,9 @@ static void passkey_open(const char *ssid)
     lv_obj_set_style_text_align(tl, LV_TEXT_ALIGN_CENTER, 0);
 
     /* 密码框：密码模式 + 自定义掩码字符。
+     * lv_textarea_create：创建文本输入框（字符/粘贴由 lv_keyboard 或实体键盘送进）。
+     * lv_textarea_set_one_line=true 禁止换行；set_password_mode=true 让输入显示成
+     * 掩码；set_max_length 限制字符数（缓冲区长度含结尾 0，故取 -1）。
      * 掩码必须用 ASCII "*"：LVGL 默认掩码是 U+2022（•），该字形不在本工程
      * 的中文字体子集里，真机可能显示成方框（字体审计会报缺失）。 */
     s_passkey_ta = lv_textarea_create(p);
@@ -2318,6 +2116,9 @@ static void passkey_open(const char *ssid)
     lv_textarea_set_max_length(s_passkey_ta, WIFI_MANAGER_PASS_MAX_LEN - 1);
     lv_obj_set_style_text_font(s_passkey_ta, lvgl_port_get_font(LVGL_PORT_FONT_16), 0);
 
+    /* lv_keyboard_create：创建屏幕键盘（自带按键矩阵的独立控件）。
+     * lv_keyboard_set_mode 选择键位布局（TEXT_LOWER=小写字母+数字+常用符号）；
+     * lv_keyboard_set_textarea 把键盘与输入框绑定——按键字符自动写进该 textarea。 */
     lv_obj_t *kb = lv_keyboard_create(p);
     lv_obj_set_width(kb, LV_PCT(100));
     lv_obj_set_height(kb, 100); /* 4 行按键 → 每键约 24px 高，且保证底部按钮在屏内 */
@@ -2351,7 +2152,8 @@ static void passkey_open(const char *ssid)
  * @brief 刷新 WiFi 状态行与提示行（建页时与 5Hz 刷新各调一次）
  *
  * 状态行格式（wifi_manager_get_state 中文名 + IP 或热点名）：
- *   已连接   → "已连接 · IP x.x.x.x"（取不到 IP 显示 "--"）；
+ *   已连接   → "已连接 · IP x.x.x.x · -52 dBm"（取不到 IP 显示 "--"，
+ *              取不到 RSSI 时省略 dBm 段）；
  *   配网模式 → "配网模式 · 热点 <wifi_manager_get_ap_ssid>"；
  *   连接中   → "连接中 · <已保存热点名>"（无凭据时只显示状态名）；
  *   未启动 / 连接失败 → 只显示状态名。
@@ -2368,9 +2170,10 @@ static void wifi_update_status(void)
     }
     /* 【v0.6.0 复核】本函数以 5Hz 在"持有 LVGL 锁"的 UI 主循环里被调用，
      * 因此它调用的每个 wifi_manager 接口都必须是**非阻塞**的。
-     * 已逐一核对实现（wifi_manager.c）：get_state/get_ip/get_ssid/get_ap_ssid
-     * 全部是 portENTER_CRITICAL 保护的快照拷贝，不等待内部命令任务，
-     * 不会阻塞 LVGL 锁。若将来给它们加"等待应答"的语义，必须回头改本函数。 */
+     * 已逐一核对实现（wifi_manager.c）：get_state/get_ip/get_ssid/get_ap_ssid/
+     * get_rssi/get_ap_pass 全部是 portENTER_CRITICAL 保护的快照拷贝，不等待
+     * 内部命令任务，不会阻塞 LVGL 锁。若将来给它们加"等待应答"的语义，
+     * 必须回头改本函数。 */
     wifi_manager_state_t st = wifi_manager_get_state();
     const char *name = (st <= WIFI_MANAGER_STATE_FAILED) ? s_wifi_state_names[st] : "未知";
     char line[64];
@@ -2518,12 +2321,12 @@ static void wifi_forget_clicked_cb(lv_event_t *e)
 }
 
 /**
- * @brief 打开"WiFi 与热点"二级页（真实状态页：状态/IP 或热点名 + 忘记网络）
+ * @brief 打开"WiFi 与热点"二级页（状态/IP 或热点名 + 模式三档 + 搜索/忘记网络）
  *
  * 状态来自 wifi_manager（middleware 数据面）：未启动/连接中/已连接/配网模式/
  * 连接失败；已连接显示 IP、配网模式显示热点名与配网指引。
- * 纯按键可达：唯一可操作控件（忘记网络按钮）登记焦点链，
- * "返回"固定在标题栏（长按 K1），长按 K2 激活焦点按钮弹确认框。
+ * 纯按键可达：页内可操作控件（三档模式按钮 → 搜索 Wi-Fi → 忘记网络）
+ * 依次登记焦点链，"返回"固定在标题栏（长按 K1），长按 K2 激活焦点控件。
  */
 static void wifi_open_cb(void)
 {
@@ -2687,7 +2490,7 @@ static void energy_open_cb(void)
 typedef void (*numkey_ok_cb_t)(float value);
 
 /* 同一时刻只允许一个数字键盘弹窗，故这些状态用文件级静态变量即可 */
-static lv_obj_t *s_numkey_box = NULL;   /**< 弹窗本体（lv_msgbox）；NULL=未打开 */
+static lv_obj_t *s_numkey_box = NULL;   /**< 浮层本体（普通 lv_obj 全屏浮层，非 lv_msgbox）；NULL=未打开 */
 static lv_obj_t *s_numkey_ta = NULL;    /**< 弹窗内的输入框 */
 static lv_obj_t *s_numkey_hint = NULL;  /**< 校验失败提示行（复用正文区最后一行） */
 static numkey_ok_cb_t s_numkey_ok = NULL; /**< 确定回调 */
@@ -2879,15 +2682,21 @@ static void numkey_open(const char *title, const char *unit, float init, float m
 #define ALARM_ROW_P 2 /**< 过功率（W） */
 #define ALARM_ROW_CNT 3
 
-/** 阈值范围与步进（settings_set_alarm 要求阈值 >0，故下限取最小步进而非 0） */
+/** 阈值范围与步进（settings_set_alarm 要求阈值 >0，故下限取最小步进而非 0）
+ *  上限按整机设计量程取值（v0.6.9）：
+ *   · 电压 90V：分压链路理论满量程 ±121V，但辅助电源最高输入 100V，
+ *     设计测量范围取 0~90V，告警上限随之定为 90V；
+ *   · 电流 70A：1mΩ/5W 分流器的额定功率上限（70A 时约 4.9W），
+ *     XT60 接口额定 30A；复刻者换 XT90 底板可用到更高电流；
+ *   · 功率 6300W：90V × 70A（电压与电流上限的乘积）。 */
 #define ALARM_V_MIN 0.1f
-#define ALARM_V_MAX 30.0f
+#define ALARM_V_MAX 90.0f
 #define ALARM_V_STEP 0.1f
 #define ALARM_I_MIN 0.1f
-#define ALARM_I_MAX 20.0f
+#define ALARM_I_MAX 70.0f
 #define ALARM_I_STEP 0.1f
 #define ALARM_P_MIN 1.0f
-#define ALARM_P_MAX 200.0f
+#define ALARM_P_MAX 6300.0f
 #define ALARM_P_STEP 1.0f
 
 /**
@@ -2934,7 +2743,11 @@ static float *alarm_row_value(int row)
 }
 
 /**
- * @brief 刷新某行阈值数值标签（"14.10 V" / "2.05 A" / "28.9 W"）
+ * @brief 刷新某行阈值数值标签（"14.10 V" / "2.05 A" / "6300 W"）
+ *
+ * 功率阈值步进是 1W，且上限到 6300W，用 "%.0f" 既符合精度也避免
+ * "6300.00 W" 超出 72px 的数值标签宽度被裁。
+ *
  * @param row 行下标（ALARM_ROW_*）
  */
 static void alarm_update_label(int row)
@@ -2944,8 +2757,12 @@ static void alarm_update_label(int row)
         return;
     }
     char buf[24];
-    snprintf(buf, sizeof(buf), "%.2f %s", (double)(*alarm_row_value(row)),
-             row == ALARM_ROW_V ? "V" : (row == ALARM_ROW_I ? "A" : "W"));
+    if (row == ALARM_ROW_P) {
+        snprintf(buf, sizeof(buf), "%.0f W", (double)(*alarm_row_value(row)));
+    } else {
+        snprintf(buf, sizeof(buf), "%.2f %s", (double)(*alarm_row_value(row)),
+                 row == ALARM_ROW_V ? "V" : "A");
+    }
     lv_label_set_text(lbl, buf);
 }
 
@@ -3107,7 +2924,9 @@ static lv_obj_t *alarm_add_limit_row(lv_obj_t *c, int row, const char *name)
     s_alarm_value_labels[row] = plain_label(grp, "--", LVGL_PORT_FONT_16, COL_PRIMARY, true);
     lv_obj_set_width(s_alarm_value_labels[row], 72);
     lv_obj_set_style_text_align(s_alarm_value_labels[row], LV_TEXT_ALIGN_CENTER, 0);
-    /* 可点击 + 下划线提示（点击弹数字键盘，见 alarm_value_clicked_cb） */
+    /* 可点击 + 下划线提示（点击弹数字键盘，见 alarm_value_clicked_cb）。
+     * lv_obj_add_flag 给对象加标志位：label 默认不参与触摸命中，必须加
+     * LV_OBJ_FLAG_CLICKABLE 才会收到 CLICKED 事件。 */
     lv_obj_add_flag(s_alarm_value_labels[row], LV_OBJ_FLAG_CLICKABLE);
     lv_obj_set_style_border_side(s_alarm_value_labels[row], LV_BORDER_SIDE_BOTTOM, 0);
     lv_obj_set_style_border_width(s_alarm_value_labels[row], 1, 0);
@@ -3164,7 +2983,7 @@ static void alarm_add_switch_row(lv_obj_t *c, int row, const char *name, bool on
 /**
  * @brief 打开"告警设置"二级页（三阈值 ± 调节 + 三使能开关）
  *
- * 初值从 settings_get_alarm 读；读失败用安全默认（三阈值 50% 量程、全使能）。
+ * 初值从 settings_get_alarm 读；读失败用安全默认（15V / 10A / 100W，三项全使能）。
  * 任一改动经 alarm_apply 写回 settings_set_alarm（防抖落盘），
  * 子页关闭时 subpage_close 还会请求一次尽快落盘（settings_request_save，非阻塞）。
  * 【v0.6.0】阈值数值可直接点击 → 弹数字键盘输入精确值（触屏入口）。
@@ -3281,7 +3100,7 @@ typedef void (*cell_cb_t)(void); /**< 网格单元的打开动作（无参无返
  * @brief 网格点击的中间回调（LVGL 回调签名适配）
  *
  * LVGL 事件回调签名是 void(lv_event_t*)，与业务函数签名不同；用 user_data
- * 把业务函数指针传进来，由本回调转发，六个格子共用一个 LVGL 回调。
+ * 把业务函数指针传进来，由本回调转发，全部功能格共用一个 LVGL 回调。
  *
  * @param e LVGL 点击事件；user_data 携带 cell_cb_t 业务函数
  */
@@ -3335,10 +3154,11 @@ static lv_obj_t *make_cell_dispatch(lv_obj_t *row, const char *icon, const char 
 /**
  * @brief 在设置 tile 上构建设置首页（2×4 功能网格）
  *
- * 由 ui_nav 初始化时调用一次；二级页浮层以 tile 为父级，随 tile 一起被
- * 横向滑动（不跨页）。
+ * 由 ui_nav 首次构建时调用，横竖屏旋转后重建 tile 时也会再次调用；
+ * 二级页浮层以 tile 为父级，随 tile 一起被横向滑动（不跨页）。
  *
- * @param tile tileview 的设置页对象（本页所有内容的根父级）
+ * @param tile tileview 的设置页对象（lv_tileview 是 LVGL 的横向分页容器，
+ *             每页一个 tile 子对象；本页所有内容的根父级）
  */
 void screen_settings_create(lv_obj_t *tile)
 {
@@ -3368,7 +3188,7 @@ void screen_settings_create(lv_obj_t *tile)
     lv_obj_t *title = plain_label(tile, "设置", LVGL_PORT_FONT_20, COL_INK, true);
     lv_obj_set_pos(title, GRID_SIDE_PAD, 24);
 
-    /* 2×4 网格（7 个功能格 + 1 个留空位）：高度精确等于 4 行 + 3 行距，不给滚动留余地 */
+    /* 2×4 网格（8 个功能格全部占满）：高度精确等于 4 行 + 3 行距，不给滚动留余地 */
     lv_obj_t *grid = lv_obj_create(tile);
     lv_obj_remove_style_all(grid);
     lv_obj_set_size(grid, LV_PCT(100), 4 * CELL_HEIGHT + 3 * CELL_GAP_Y);
@@ -3414,7 +3234,8 @@ void screen_settings_create(lv_obj_t *tile)
 }
 
 /**
- * @brief 数据刷新（ui_nav_refresh 以 5Hz 转发快照，见 screen_settings.h）
+ * @brief 数据刷新（UI 任务以 5Hz 调用，真机 ui.c 直调 / 模拟器经 ui_nav_refresh
+ *        转发；见 screen_settings.h）
  *
  * 无论当前打开哪个二级页，都先把快照存进 s_last_snap（校准向导应用增益
  * 时要用"当前读数"，即使此刻不在校准页也保持最新）。随后按 s_sub_kind
@@ -3505,40 +3326,10 @@ void screen_settings_refresh(const data_store_snapshot_t *snap)
     }
 }
 
-/**
- * @brief 弹窗按键动作：K1=取消 / K2=确定（固定键位，无需焦点记忆）
- *
- * footer 按钮即 msgbox 底部按钮区的子对象（"取消"在前、"确定"在后，
- * 见 show_confirm / show_notice 的创建顺序）。激活方式与 focus_activate
- * 同款：合成一次 LV_EVENT_CLICKED，注册回调（含 user_data）照常执行，
- * 与手指点击完全等价。确定动作可能再弹结果提示框（如"已清零"），
- * s_active_msgbox 会随之更新，调用方拿它当"当前弹窗"用是安全的。
- *
- * @param id K1=BUTTON_ID_BOOT → 取消；K2=BUTTON_ID_USER → 确定
- */
-static void msgbox_key_action(button_id_t id)
-{
-    lv_obj_t *box = s_active_msgbox;
-    if (box == NULL) {
-        return;
-    }
-    lv_obj_t *footer = lv_msgbox_get_footer(box); /* 底部按钮区（可能为 NULL） */
-    uint32_t n = (footer != NULL) ? lv_obj_get_child_count(footer) : 0;
-    if (n == 0) {
-        /* 无按钮的异常框：任一键直接关闭，绝不把用户困在弹窗里 */
-        lv_msgbox_close(box);
-        return;
-    }
-    if (id == BUTTON_ID_USER) {
-        /* K2 = 确定 = footer 最后一个按钮 */
-        lv_obj_send_event(lv_obj_get_child(footer, n - 1), LV_EVENT_CLICKED, NULL);
-    } else {
-        /* K1 = 取消 = footer 第一个按钮（单按钮提示框时它就是"确定"，
-         * 点了同样关闭——提示框只求"看完能走"，两个键都认） */
-        lv_obj_send_event(lv_obj_get_child(footer, 0), LV_EVENT_CLICKED, NULL);
-    }
-}
+/* 【v0.6.8】弹窗按键动作已上移到 ui_msgbox.c（ui_msgbox_key：K1=取消 / K2=确定）。
+ * screen_settings_key 的弹窗分支改为转发，见下方"① 弹窗层"。 */
 
+/** @brief 当前二级页中文名称（诊断用；返回字符串常量，可跨任务只读） */
 const char *screen_settings_current_subpage_name(void)
 {
     /* 返回静态字符串（不写共享缓冲）：调用方是 app_tasks 巡检任务，
@@ -3568,8 +3359,9 @@ const char *screen_settings_current_subpage_name(void)
  */
 bool screen_settings_modal_is_open(void)
 {
-    /* passkey/numkey：v0.6.0 新增的两个全屏键盘浮层（含虚拟键盘），也是模态 */
-    return (s_subpage != NULL || s_active_msgbox != NULL || s_passkey_page != NULL ||
+    /* passkey/numkey：v0.6.0 新增的两个全屏键盘浮层（含虚拟键盘），也是模态。
+     * 【v0.6.8】对话框句柄已上移到 ui_msgbox 模块，用 ui_msgbox_is_open() 判。 */
+    return (s_subpage != NULL || ui_msgbox_is_open() || s_passkey_page != NULL ||
             s_numkey_box != NULL);
 }
 
@@ -3583,7 +3375,7 @@ bool screen_settings_subpage_is_open(void)
      * 浮层仍留在设置 tile 上（对象还活着），若不加页面限定，会在测量/波形页
      * 也判成"模态中"，把全局按键全劫持——表现为无法翻页/无法开菜单、页面
      * 在两页间反复震荡（2026-10 模拟器实证的根因）。 */
-    if ((s_subpage != NULL || s_active_msgbox != NULL) &&
+    if ((s_subpage != NULL || ui_msgbox_is_open()) &&
         ui_nav_current_page() == UI_PAGE_SETTINGS) {
         return true; /* 二级页/弹窗且在设置页：模态，按键全归本页 */
     }
@@ -3603,11 +3395,12 @@ bool screen_settings_subpage_is_open(void)
  */
 bool screen_settings_key(button_id_t id, button_event_t ev)
 {
-    /* ---- ① 弹窗层：K1=取消 / K2=确定，其余事件一律吞掉 ---- */
-    if (s_active_msgbox != NULL) {
-        if (ev == BUTTON_EVENT_SINGLE_CLICK || ev == BUTTON_EVENT_LONG_PRESS_START) {
-            msgbox_key_action(id);
-        }
+    /* ---- ① 弹窗层：K1=取消 / K2=确定，其余事件一律吞掉 ----
+     * 【v0.6.8】实现已上移到 ui_msgbox 模块；ui_nav 理论上会在进入本函数
+     * 前就把弹窗按键交给 ui_msgbox_key()（模态最优先），这里保留同一转发
+     * 作为兜底——两处行为一致，谁先命中都不影响键位语义。 */
+    if (ui_msgbox_is_open()) {
+        ui_msgbox_key(id, ev);
         /* 长按松开/双击等无动作但不外漏（防止长按结束的 RELEASE 落到翻页逻辑） */
         return true;
     }

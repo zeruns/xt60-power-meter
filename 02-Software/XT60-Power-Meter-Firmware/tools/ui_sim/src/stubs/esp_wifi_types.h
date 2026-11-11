@@ -4,13 +4,14 @@
  *
  * 真机 wifi_manager.h 里直接透传 wifi_ap_record_t（扫描结果），
  * 模拟器需要同名同形的结构体才能编译同一个 UI 源码。
- * 只保留 UI 真正读取的字段：ssid / rssi / authmode / primary。
+ * 只保留 UI 真正读取的字段：ssid / rssi / authmode / primary
+ * （bssid 为与真机结构布局对齐而保留，界面不读）。
  */
 #pragma once
 
 #include <stdint.h>
 
-/** 认证方式（仅保留界面用到的两个：开放 / WPA2-PSK） */
+/** 认证方式（枚举顺序与真机 esp_wifi_types.h 一致；界面只用到 OPEN / WPA2_PSK） */
 typedef enum {
     WIFI_AUTH_OPEN = 0,
     WIFI_AUTH_WEP,

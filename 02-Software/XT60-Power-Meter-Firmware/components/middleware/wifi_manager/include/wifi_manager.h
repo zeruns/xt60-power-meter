@@ -171,7 +171,7 @@ esp_err_t wifi_manager_get_ap_ssid(char *out, size_t out_len);
  * WiFi 设置页在配网模式下显示"热点名 + 密码"，用户照此输入即可连接热点。
  *
  * @param out 输出缓冲区，不可为 NULL
- * @param out_len 输出缓冲区长度（至少 sizeof(WIFI_MANAGER_AP_PASS)，约 12 字节）
+ * @param out_len 输出缓冲区长度（至少 sizeof(WIFI_MANAGER_AP_PASS)，即 11 字节）
  * @return ESP_OK 成功
  *         ESP_ERR_INVALID_ARG 参数非法或缓冲区太小
  */

@@ -3,13 +3,14 @@
  * @brief WiFi 管理的模拟器替身（v0.6.0 新增）
  *
  * 为什么需要：屏幕代码（screen_settings.c 的 WiFi 页 / ui_nav.c 的状态栏
- * 信号条）现在直接依赖 wifi_manager 的状态、模式、RSSI 与扫描结果。
+ * WiFi 图标）现在直接依赖 wifi_manager 的状态、模式、RSSI 与扫描结果。
  * 模拟器没有真 WiFi，这里用一组可控的假数据把这些接口补齐，
  * 让"模式三档 / 扫描列表 / 密码键盘 / 状态栏四态"都能在 PC 上走查。
  *
  * 可控开关（供场景脚本调用）：
  *   mock_wifi_set_state()/mock_wifi_set_mode()/mock_wifi_set_rssi()
  *   mock_wifi_set_scan_list() —— 预置热点列表（默认 5 条）
+ *   mock_wifi_scan_finish()   —— 结束"扫描中"状态（模拟 SCAN_DONE）
  */
 #include "wifi_manager.h"
 

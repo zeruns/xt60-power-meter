@@ -7,8 +7,8 @@
  *   │                              │
  *   │        XT60 功率计           │  Bold 40px，近黑
  *   │    ────────────              │  标题下品牌色短分隔线（40px 宽）
- *   │      作者博客：blog.zeruns    │  16px 中灰
- *   │        固件版本 v0.1.0        │  14px 浅灰
+ *   │    作者博客：blog.zeruns.com  │  16px 中灰
+ *   │        固件版本 vX.Y.Z        │  14px 浅灰（取自 esp_app_desc）
  *   │       ▓▓▓▓▓▓▓░░░░░            │  加载条（品牌色，屏宽 80%）
  *   │      正在初始化传感器…         │  阶段文字（14px 中灰）
  *   └──────────────────────────────┘
@@ -22,12 +22,12 @@
  * 横竖屏都自适应（旧版加载条用绝对坐标按 284 宽写死，竖屏时
  * 既不居中又压住版本行）。
  *
- * 进度条语义（初学者注意）：进度是"启动停留时间"的比例，不是真实
- * 初始化进度——真实初始化在 app_init 阶段已完成，ui.c 在 1800ms 停留期
- * 内按 0~100% 推进进度条并切换 4 段阶段文字（正在初始化系统…/正在加载字库…/
- * 正在初始化传感器…/正在准备界面…），给用户"系统在启动"的阶段感。
- * 进度跑完后若外设自检有失败项，ui.c 会弹故障提示框列出不可用功能
- * （自检结论不在本页呈现，本页只负责"跑条 + 阶段文字"）。
+ * 进度条语义（v0.6.9 起）：进度来自 app_init 的真实初始化进度——
+ * app_init 在显示链路就绪后提前创建 UI 任务并显示本页，之后每执行一个
+ * 初始化步骤/自检项就通过 ui_boot_set_progress() 更新一次快照；
+ * ui.c 的启动页循环读取快照并调用本文件的 setter 渲染。
+ * 进度跑完后若存在外设故障（初始化失败或自检未通过），ui.c 会弹故障
+ * 提示框列出不可用功能（结论不在本页呈现，本页只负责"跑条 + 阶段文字"）。
  *
  * 本文件只做静态版式 + 两个 setter（进度值/阶段文字），由 ui.c 的启动
  * 循环反复调用；构建一次（splash_build）后不再重建控件，只改文字和进度。
@@ -51,6 +51,11 @@
 
 static lv_obj_t *s_bar = NULL;         /**< 进度条控件（lv_bar） */
 static lv_obj_t *s_progress_lbl = NULL;  /**< 进度条下方的阶段文字 */
+static lv_obj_t *s_brand_lbl = NULL;     /**< 顶部英文小标识 */
+static lv_obj_t *s_title_lbl = NULL;     /**< 主标题（ASCII/中文两套文案） */
+static lv_obj_t *s_sub_lbl = NULL;       /**< 作者博客行 */
+static lv_obj_t *s_ver_lbl = NULL;       /**< 固件版本行 */
+static bool s_cjk = false;               /**< 当前启动页是否已切换为中文文案 */
 
 /**
  * @brief 造一个标签的快捷封装（创建 + 设文本 + 设字体 + 设颜色）
@@ -71,7 +76,61 @@ static lv_obj_t *make_label(lv_obj_t *parent, const char *text, const lv_font_t 
 }
 
 /**
- * @brief 在当前活动屏幕上构建启动画面（通栏 + 居中文字列 + 加载条 + 阶段文字）
+ * @brief 切换启动页文案语言（ASCII 内置字体 / 中文嵌入子集）
+ *
+ * v0.6.9：启动页改用**编进固件的极小子集**（splash_font_data.c，约 190 字），
+ * lvgl_port_app_init() 内同步创建，因此启动页首帧就是完整中文，不再经历
+ * "先 ASCII、等 4MB 全量字库加载完再切中文"的过程。
+ *
+ * 仍保留 ASCII 分支作为兜底：仅当子集创建失败（PSRAM 不足/tiny_ttf 异常）时
+ * 才回退，避免中文渲染成方框。所有文本与字体必须成对切换——只换文案
+ * 不换字体会出现中文方框，只换字体不换文案则排版偏小。
+ *
+ * @param cjk true=中文（嵌入子集）；false=ASCII（内置 Montserrat）
+ */
+static void splash_apply_language(bool cjk)
+{
+    if (s_brand_lbl == NULL || s_title_lbl == NULL || s_sub_lbl == NULL || s_ver_lbl == NULL) {
+        return; /* 尚未构建（splash_build 之前调用）：忽略 */
+    }
+
+    const lv_font_t *f14 = &lv_font_montserrat_14;
+    lv_obj_set_style_text_font(s_brand_lbl,
+                               cjk ? lvgl_port_get_splash_font(LVGL_PORT_FONT_12) : f14, 0);
+    lv_obj_set_style_text_font(s_title_lbl,
+                               cjk ? lvgl_port_get_splash_font_bold(LVGL_PORT_FONT_40)
+                                   : &lv_font_montserrat_32, 0);
+    lv_obj_set_style_text_font(s_sub_lbl,
+                               cjk ? lvgl_port_get_splash_font(LVGL_PORT_FONT_16) : f14, 0);
+    lv_obj_set_style_text_font(s_ver_lbl,
+                               cjk ? lvgl_port_get_splash_font(LVGL_PORT_FONT_14) : f14, 0);
+    if (s_progress_lbl != NULL) {
+        lv_obj_set_style_text_font(s_progress_lbl,
+                                   cjk ? lvgl_port_get_splash_font(LVGL_PORT_FONT_14) : f14, 0);
+    }
+
+    lv_label_set_text(s_brand_lbl,
+                      cjk ? "X T 6 0   P O W E R   M E T E R" : "XT60 POWER METER");
+    lv_label_set_text(s_title_lbl, cjk ? "XT60 功率计" : "XT60 METER");
+    lv_label_set_text(s_sub_lbl, cjk ? "作者博客：blog.zeruns.com" : "blog.zeruns.com");
+
+    char ver_text[48];
+    lv_snprintf(ver_text, sizeof(ver_text), cjk ? "固件版本 v%s" : "Firmware v%s",
+                esp_app_get_description()->version);
+    lv_label_set_text(s_ver_lbl, ver_text);
+
+    s_cjk = cjk;
+}
+
+void splash_set_cjk(bool cjk)
+{
+    if (s_cjk != cjk) {
+        splash_apply_language(cjk);
+    }
+}
+
+/**
+ * @brief 在当前活动屏幕上构建启动画面（居中文字列 + 加载条 + 阶段文字）
  *
  * 调用时机：ui.c 启动流程最开始，在 LVGL 锁内调用一次；之后仅通过
  * splash_set_progress()/splash_set_progress_text() 更新内容。
@@ -104,14 +163,14 @@ void splash_build(lv_obj_t *scr)
     lv_obj_set_style_pad_row(cont, 8, 0); /* LVGL：flex 子项之间行距 8px */
     lv_obj_set_scrollable(cont, false);
 
-    /* 英文小标识（蓝色大写字母间距感由空格模拟） */
-    lv_obj_t *brand = make_label(cont, "X T 6 0   P O W E R   M E T E R",
-                                 lvgl_port_get_font(LVGL_PORT_FONT_12), COLOR_ACCENT);
-    lv_obj_set_style_text_letter_space(brand, 1, 0); /* LVGL：字符间距 +1px，增强标识感 */
-    lv_obj_set_style_pad_bottom(brand, 6, 0); /* 与主标题之间再多留 6px */
+    /* 英文小标识（蓝色大写字母间距感由空格模拟）
+     * 中文字体由 splash_apply_language 统一换成嵌入子集（首帧即完整中文）。 */
+    s_brand_lbl = make_label(cont, "XT60 POWER METER", &lv_font_montserrat_14, COLOR_ACCENT);
+    lv_obj_set_style_text_letter_space(s_brand_lbl, 1, 0); /* LVGL：字符间距 +1px，增强标识感 */
+    lv_obj_set_style_pad_bottom(s_brand_lbl, 6, 0); /* 与主标题之间再多留 6px */
 
-    /* 主标题：Bold 40px（字体文件不含时自动回退常规字重，不会方框） */
-    make_label(cont, "XT60 功率计", lvgl_port_get_font_bold(LVGL_PORT_FONT_40), COLOR_TITLE);
+    /* 主标题：中文子集就绪时用 Bold 40px（见 splash_apply_language） */
+    s_title_lbl = make_label(cont, "XT60 METER", &lv_font_montserrat_32, COLOR_TITLE);
 
     /* 标题下品牌色短分隔线（40×3px 圆头）：替代旧顶部通栏的品牌识别职责，
      * 居中由父容器 flex 交叉轴居中保证。 */
@@ -123,15 +182,12 @@ void splash_build(lv_obj_t *scr)
     lv_obj_set_style_radius(rule, 2, 0);
     lv_obj_set_scrollable(rule, false);
 
-    make_label(cont, "作者博客：blog.zeruns.com", lvgl_port_get_font(LVGL_PORT_FONT_16),
-               COLOR_SUB);
+    s_sub_lbl = make_label(cont, "blog.zeruns.com", &lv_font_montserrat_14, COLOR_SUB);
 
     /* 版本号不写死：esp_app_get_description() 是 ESP-IDF 接口，
      * 返回编译进固件的应用描述（版本号取自项目版本配置），
-     * 每次发版不用改 UI 代码。lv_snprintf 是 LVGL 自带的安全格式化。 */
-    char ver_text[48];
-    lv_snprintf(ver_text, sizeof(ver_text), "固件版本 v%s", esp_app_get_description()->version);
-    make_label(cont, ver_text, lvgl_port_get_font(LVGL_PORT_FONT_14), COLOR_VER);
+     * 每次发版不用改 UI 代码。文案由 splash_apply_language 填。 */
+    s_ver_lbl = make_label(cont, "", &lv_font_montserrat_14, COLOR_VER);
 
     /* ③ 加载条：列内最后一项（宽 = 屏宽 80%，高 6px，圆角胶囊） */
     s_bar = lv_bar_create(cont); /* LVGL：新建进度条控件 */
@@ -151,11 +207,16 @@ void splash_build(lv_obj_t *scr)
      * 初始为空，由 ui.c 在启动各阶段调用 splash_set_progress_text() 更新。 */
     s_progress_lbl = lv_label_create(cont);
     lv_label_set_text(s_progress_lbl, "");
-    lv_obj_set_style_text_font(s_progress_lbl, lvgl_port_get_font(LVGL_PORT_FONT_14), 0);
+    lv_obj_set_style_text_font(s_progress_lbl, &lv_font_montserrat_14, 0);
     lv_obj_set_style_text_color(s_progress_lbl, COLOR_SUB, 0);
     lv_obj_set_width(s_progress_lbl, w * 90 / 100); /* 预留 90% 屏宽，够放下最长阶段文字 */
     lv_obj_set_style_text_align(s_progress_lbl, LV_TEXT_ALIGN_CENTER, 0); /* LVGL：文本居中 */
     lv_obj_set_style_pad_top(s_progress_lbl, 6, 0); /* 与加载条之间留 6px */
+
+    /* 构建完成后按嵌入子集状态统一应用文案/字体：
+     * 子集随固件启动同步创建，正常情况下首帧即为完整中文；
+     * 仅子集创建失败时保持 ASCII（splash_set_cjk(false) 兜底）。 */
+    splash_apply_language(lvgl_port_splash_fonts_ready());
 }
 
 /**

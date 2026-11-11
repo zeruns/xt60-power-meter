@@ -134,7 +134,10 @@ esp_err_t touch_cst816d_init(void)
         return err;
     }
 
-    /* ---- ② 建 I2C 主机总线 ---- */
+    /* ---- ② 建 I2C 主机总线 ----
+     * ESP-IDF 新版 I2C 主机驱动分两步：i2c_new_master_bus() 先建「总线」
+     * （绑定端口与 SCL/SDA 引脚），再往总线上挂具体器件。
+     * glitch_ignore_cnt = 7：滤掉窄于 7 个采样时钟的毛刺，是官方推荐值。 */
     const i2c_master_bus_config_t bus_cfg = {
         .i2c_port = TP_I2C_PORT,
         .sda_io_num = BOARD_PIN_TP_SDA,
@@ -149,7 +152,10 @@ esp_err_t touch_cst816d_init(void)
         return err;
     }
 
-    /* ---- ③ 添加触摸器件（7 位地址） ---- */
+    /* ---- ③ 添加触摸器件（7 位地址） ----
+     * i2c_master_bus_add_device：把从器件（地址 + 速率）注册到总线上，
+     * 得到设备句柄，之后的读写都用这个句柄；device_address 填手册给的
+     * 7 位地址（0x15），不含最高位的读写位。 */
     const i2c_device_config_t dev_cfg = {
         .dev_addr_length = I2C_ADDR_BIT_LEN_7,
         .device_address = BOARD_TP_I2C_ADDR,
@@ -181,7 +187,9 @@ esp_err_t touch_cst816d_read(touch_cst816d_point_t *out)
     uint8_t reg = TP_REG_MAP_BASE;
     uint8_t buf[TP_READ_LEN] = { 0 };
 
-    /* 写寄存器地址 0x00 → 重复起始 → 读 8 字节 */
+    /* 写寄存器地址 0x00 → 重复起始 → 读 8 字节。
+     * i2c_master_transmit_receive：一次调用完成「先写后读」的 I2C 复合时序
+     * （内部发重复起始位），最后一个是整体超时（ms）。 */
     esp_err_t err =
         i2c_master_transmit_receive(s_dev, &reg, 1, buf, TP_READ_LEN, TP_I2C_TIMEOUT_MS);
     if (err != ESP_OK) {

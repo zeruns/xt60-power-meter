@@ -21,16 +21,23 @@
     即告警——弹窗（同时显示两路温度）+ 蜂鸣 + 网页红色横幅；与过压/过流/过功率
     （可关）不同，此项属硬件保护，不可关闭
 - **波形页**（示波器风格）：
-  - 双轴折线 + 自动量程（1-2-5 标准格值序列，刻度锚定整格值，可直接心算读数）
+  - 双轴折线 + 自动量程（1-2-5 标准格值序列，刻度锚定整格值，可直接心算读数；
+    刻度去尾零：3.00V→3V、0.200A→0.2A，读数更干净）
   - 时间窗 1s / 10s / 30s / 60s / 120s / 10min，三级降采样环形缓冲
   - 黑底亮线配色、min/max 包络渲染（防混叠丢峰）、量程滞回（防跳变）
   - 底部实时 / 平均数据行：定宽列布局，数值跳动不移位
 - **UI**：测量 / 波形 / 设置三页滑动（首末页到头即止，不循环），触屏 + 纯按键双操作，快捷设置面板
   - 首页电能数据条可点击，在 Wh / Ah 之间切换显示
+  - 快速菜单的「清除电能统计数据」**二次确认**（v0.6.8，与设置页同一共享确认框）
+  - 所有弹窗宽度随屏幕方向自适应（横屏 260 / 竖屏 216），竖屏不再左右被裁
   - 支持横屏 0° + 90° / 180° / 270° 四方向（重力自动旋转 + 手动角度）
   - 自动降亮：无操作 15 / 30 / 60 秒（可设）后背光降到 10%，触摸或按任意键立即恢复
   - 设置子页的亮度/响度滑条与降亮档位会**实时跟随**网页控制台的远程改动（无需退出重进）
-  - 启动页进度条 + 外设自检，故障弹窗提示
+  - 启动页按**真实初始化步骤**显示进度（18 步初始化 + 5 项硬件自检，最少显示 600ms）；
+    启动页文案使用**编进 app 分区的极小子集**（约 197 字、34KB/字重，首帧即完整中文，
+    不依赖文件系统）；主界面用的全量字库仍由后台任务加载（约 3.3s），故障弹窗提示
+  - 启动顺序（v0.6.9）：显示链路（LCD / 触摸 / LVGL / IMU / 方向）前移到第 9~13 步，
+    `fs_storage` 后移到第 14 步——启动页不再等文件系统，屏幕约 1.09s 点亮
 - **WiFi 配网**（v0.6.0 起）：
   - 工作模式三档：自动（有凭据连路由器 / 无凭据开热点）、仅 STA、强制配网热点
   - 配网热点为 **WPA2-PSK 加密**，设备端 WiFi 设置页直接显示「热点名 + 密码」，按提示输入即可连接
@@ -58,10 +65,12 @@
   - 接口：`/api/state`（快照，含 WiFi 状态/RSSI）+ WebSocket `/ws`（15Hz 推送）、
     `GET/POST /api/config`（回读 / 下发参数与标定，含 wifi_mode/wifi_forget）、
     `/api/info`（版本 / IP / MAC / 运行时间 / 内存水位）、`/api/wifi/scan`（热点扫描）、
-    `/api/export.csv`（分钟级历史导出）、HTTP OTA 升级；PC / 移动端自适应
+    `/api/export.csv`（分钟级历史导出）；PC / 移动端自适应
+  - OTA 为**拉取式**中间件（`ota_update_start(url)` 下载到备用槽 + 启动回滚校验），
+    网页控制台当前**未注册上传入口**
 - **其他外设**：温湿度（AHT20）、电池电压监测、芯片内部温度传感器（SOC 结温）、
   加速度计自动转屏（SC7A20H）、蜂鸣器（按键音 / 提示音）、状态指示灯（分级故障指示）
-- **工程化**：双 OTA 分区 + A/B 升级回滚（HTTP 上传 + 启动回滚检查）、崩溃转储（coredump）取证、
+- **工程化**：双 OTA 分区 + A/B 升级回滚（拉取式 OTA + 启动回滚检查）、崩溃转储（coredump）取证、
   PC 端 LVGL UI 模拟器（烧录前走查 / 回归截图）、主机端纯逻辑单元测试
   - 性能（v0.6.3）：巡检与引擎日志合并且降噪（实测 2.6 → 0.8 行/秒，减少 Core0 同步串口占用）、
     网页 WebSocket 推送改用常驻缓冲（去掉每帧堆分配）、LVGL 心跳 5ms → 16ms、
@@ -76,8 +85,11 @@
 | 主控 | ESP32-S3-WROOM-1-**N16R8**（16MB Flash + 8MB 八线 PSRAM） |
 | 屏幕 | NV3030B 240×284 IPS（QSPI 4bit），CST816D 电容触摸 |
 | 计量 ADC | TI ADS131M02（24bit 双通道同步采样 ΔΣ，SPI3） |
-| 电流采样 | 1 mΩ / 5W 四端开尔文分流器，PGA 16x |
+| 电压量程 | 设计测量 **0~90V**（101:1 分压链路理论 ±121V，受辅助电源最高输入 100V 限制） |
+| 电流量程 | 峰值 **±75A**（ADC 满量程）；额定 **±30A**（5W 分流器上限 70A，XT60 接口 30A；换 XT90 底板可提高） |
+| 电流采样 | 1 mΩ / 5W 四端开尔文分流器，PGA 16x（约 8.94µA/LSB） |
 | 电压采样 | 101:1 精密分压（±0.1%），PGA 1x |
+| 告警阈值上限 | 过压 90V / 过流 70A / 过功率 6300W（设备端与网页/API 同一组上限） |
 | 传感器 | AHT20 温湿度、SC7A20HTR 三轴加速度计 |
 | 电源 | XT60 输入（SY8511B 3.3V Buck）/ USB / 锂电池（TP4057 充电） |
 
@@ -87,8 +99,9 @@
 
 ### 环境准备
 
-1. 安装 [ESP-IDF v5.5 及以上](https://docs.espressif.com/projects/esp-idf/zh_CN/latest/esp32s3/get-started/)
-   （本工程开发基线为 v6.1，Windows 下建议用 Espressif 官方安装器）；
+1. 安装 [ESP-IDF v6.1](https://docs.espressif.com/projects/esp-idf/zh_CN/latest/esp32s3/get-started/)
+   （本工程开发与验证基线；更早版本缺少本工程使用的配置项与私有 HAL 接口，不保证可构建，
+   Windows 下建议用 Espressif 官方安装器）；
 2. 克隆本仓库：
 
 ```powershell
@@ -113,6 +126,10 @@ Windows 一键脚本（内部会设置 `IDF_PATH` 并加载 `idf.py` 环境）�
 idf.py build
 ```
 
+> 两个脚本（`build_fw.bat` / `flash_fw.bat`）结束时都会打印成功/失败摘要并 `pause`，
+> 便于双击运行后查看结果；自动化场景可加 `nopause` 参数、设环境变量 `XT60_NO_PAUSE=1`
+> 或 `CI=1` 跳过暂停，脚本退出码原样透传。
+
 ### 烧录
 
 ```powershell
@@ -136,11 +153,12 @@ idf.py -p COMx monitor   # 查看串口日志（115200）
 | `bootloader.bin` | `0x0` | 二级引导程序 |
 | `partition-table.bin` | `0x8000` | 分区表 |
 | `ota_data_initial.bin` | `0xf000` | OTA 槽位初始选择 |
-| `XT60-Power-Meter-Firmware.bin` | `0x20000` | 应用固件（代码 + 内嵌网页，约 1.5MB） |
-| `storage.bin` | `0x830000` | SPIFFS 字体镜像（中文字体约 4.2MB） |
+| `XT60-Power-Meter-Firmware.bin` | `0x20000` | 应用固件（代码 + 内嵌网页 + 启动页子集，约 1.6MB） |
+| `storage.bin` | `0x830000` | SPIFFS 字体镜像（主界面全量中文字体约 4.2MB；启动页子集已编入 app） |
 
-> **改字库必须全量烧录**：字体在独立的 `storage` 分区，**OTA 只更新 app**，
-> 只走 OTA 会出现"升级成功但中文仍显示方框"。
+> **改字库必须全量烧录**：主界面字体在独立的 `storage` 分区，**OTA 只更新 app**，
+> 只走 OTA 会出现"升级成功但中文仍显示方框"。启动页文案的子集则随 app 编入，
+> 改启动页文案只需重跑 `tools/fonts/make_splash_font.py` 并重新构建（OTA 可更新）。
 >
 > 不装 ESP-IDF 也可以用网页工具 **ESPConnect**（Chrome/Edge + Web Serial）烧录，
 > 支持单文件 `XT60-Power-Meter-full.bin`（偏移 `0x0`）或按上表分文件烧。
@@ -159,14 +177,15 @@ components/
 │   ├── aht20/ imu_sc7a20h/ battery_adc/ buzzer/ status_led/ key_button/
 ├── middleware/           中间件：event_bus、data_store（seqlock）、lvgl_port、
 │                         fs_storage（SPIFFS 字体）、wifi_manager（STA/AP 配网）、
-│                         web_console（内嵌网页控制台：HTTP + WebSocket + OTA）
+│                         web_console（内嵌网页控制台：HTTP + WebSocket）、
+│                         ota_update（A/B 拉取式 OTA + 启动回滚校验）
 └── services/             业务服务：power_measure（4kSPS 测量链路）、system_state、
-                          settings（NVS 持久化）、orientation（自动转屏）、ui（三页界面）
+                          device_ctrl、settings（NVS 持久化）、orientation（自动转屏）、ui（三页界面）
 managed_components/       组件管理器托管依赖（不入库，由 lock 复现）
 docs/                     架构设计与引脚文档
 tools/
 ├── ui_sim/               PC 端 LVGL UI 模拟器（走查 + 回归截图）
-├── fonts/                中文字体生成脚本（Noto Sans SC 子集化）
+├── fonts/                字体生成脚本（主界面全量字库 + 启动页内嵌子集）
 └── ui_preview/ mcp/      辅助工具
 test/host/                纯逻辑主机端单元测试
 partitions.csv            分区表：双 4MB OTA + 64KB coredump + 8MB storage

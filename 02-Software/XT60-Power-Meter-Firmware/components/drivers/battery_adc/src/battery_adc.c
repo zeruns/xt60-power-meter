@@ -116,7 +116,9 @@ esp_err_t battery_adc_init(void)
         return ESP_ERR_INVALID_STATE;
     }
 
-    /* ---- ① 建 ADC1 单次采样单元 ---- */
+    /* ---- ① 建 ADC1 单次采样单元 ----
+     * adc_oneshot_new_unit：向 adc_oneshot 驱动申请一个 ADC 单元（ADC1），
+     * 拿到句柄后用它配置通道、发起单次采样。 */
     adc_oneshot_unit_init_cfg_t unit_cfg = {
         .unit_id = BAT_ADC_UNIT,
     };
@@ -126,7 +128,9 @@ esp_err_t battery_adc_init(void)
         return err;
     }
 
-    /* ---- ② 配置采样通道（衰减档 + 位宽） ---- */
+    /* ---- ② 配置采样通道（衰减档 + 位宽） ----
+     * atten 决定量程（12dB 档约 0~3.1V），bitwidth 决定码值范围
+     * （默认 12bit，即 0~4095）；两者必须与校准配置一致，否则换算会偏差。 */
     adc_oneshot_chan_cfg_t chan_cfg = {
         .atten = BAT_ADC_ATTEN,
         .bitwidth = BAT_ADC_BITWIDTH,
@@ -172,6 +176,7 @@ esp_err_t battery_adc_read(uint32_t *voltage_mv)
     /* 原始码值 -> 引脚毫伏 */
     int pin_mv = 0;
     if (s_calibrated) {
+        /* adc_cali_raw_to_voltage：用校准曲线把原始码值换成引脚电压（mV） */
         esp_err_t err = adc_cali_raw_to_voltage(s_cali_handle, raw_avg, &pin_mv);
         if (err != ESP_OK) {
             return err;

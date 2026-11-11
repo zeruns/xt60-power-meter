@@ -15,13 +15,17 @@
  */
 void screen_wave_create(lv_obj_t *tile);
 
-/** @brief 定时刷新曲线（建议 5Hz） */
+/** @brief 定时刷新曲线（真机固定 25Hz，由 ui.c 每 40ms 调用一次） */
 void screen_wave_refresh(void);
 
 /** @brief 打开底部波形设置滑板（K2 长按 / 触摸上滑） */
 void screen_wave_open_menu(void);
 
-/** @brief 波形页滑动处理（ui_nav indev 级滑动识别调用）：上滑开 / 下滑关 */
+/**
+ * @brief 波形页滑动处理（ui_nav indev 级滑动识别调用）：上滑开 / 下滑关
+ *
+ * 只处理竖向滑动；横向滑动仍归 tileview 翻页（本函数不参与）。
+ */
 void screen_wave_swipe_cb(lv_dir_t dir);
 
 /** @brief 关闭滑板（apply=true 时读取 roller 选择并应用） */
@@ -32,6 +36,9 @@ bool screen_wave_menu_is_open(void);
 
 /**
  * @brief 滑板打开期间的按键处理（消费返回 true，未消费返回 false）
+ *
+ * 单击 K1/K2 = 焦点 roller 上一项/下一项；双击 K2 = 切换焦点 roller；
+ * 长按 K2 = 关闭并应用、长按 K1 = 关闭并放弃修改。
  */
 bool screen_wave_menu_key(button_id_t id, button_event_t ev);
 

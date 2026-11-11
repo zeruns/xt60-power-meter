@@ -31,9 +31,11 @@
  * ────────────────────────────────────────────────────────────
  * 中文字体（tiny_ttf + SPIFFS 文件）
  * ────────────────────────────────────────────────────────────
- * 字体文件放 storage（SPIFFS）分区不占 app 程序空间；init 时一次性读入
- * PSRAM（2.2MB，8MB PSRAM 余量充足），之后渲染全走内存，运行期对 flash
- * 零访问——避免渲染中读 SPIFFS 与 flash 擦除/LCD DMA 交错触发 cache 故障。
+ * 字体文件放 storage（SPIFFS）分区不占 app 程序空间；显示链路就绪后由
+ * 后台任务一次性读入 PSRAM（约 4MB，8MB PSRAM 余量充足），之后渲染全走
+ * 内存，运行期对 flash 零访问——避免渲染中读 SPIFFS 与 flash 擦除/LCD DMA
+ * 交错触发 cache 故障。启动页另有编进 app 分区的极小子集（见 splash_font_data.c），
+ * 不依赖 SPIFFS，首帧即可显示完整中文。
  * 文件缺失时回退内置 montserrat14（仅 ASCII），界面不崩。
  */
 #include "lvgl_port.h"
@@ -41,12 +43,18 @@
 #include <stddef.h>
 #include <stdint.h>
 #include <stdio.h>
+#include <string.h>
 
 #include "esp_heap_caps.h"
 #include "esp_log.h"
+#include "esp_timer.h"
+
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
 
 #include "lcd_nv3030b.h"
 #include "touch_cst816d.h"
+#include "splash_font_data.h"
 
 static const char *TAG = "lvgl_port";
 
@@ -113,6 +121,19 @@ static lv_font_t *s_fonts[FONT_WEIGHT_MAX][LVGL_PORT_FONT_MAX] = { 0 };
 /** 从 SPIFFS 整读入 PSRAM 的字体数据（运行期常驻，单位字节） */
 static uint8_t *s_font_data[FONT_WEIGHT_MAX] = { 0 };
 static size_t s_font_data_len[FONT_WEIGHT_MAX] = { 0 };
+/** 中文字体是否已全部创建完成（volatile：供 UI 任务轮询） */
+static volatile bool s_fonts_ready = false;
+/** 字体加载任务是否已创建（避免重复创建） */
+static bool s_font_load_started = false;
+
+/* ---- 启动页专用小子库（v0.6.9） ----
+ * 由 tools/fonts/make_splash_font.py 生成、随固件编进 app 分区；
+ * 只覆盖启动页文案，创建耗时约 4ms，首帧即可显示完整中文。 */
+static lv_font_t *s_splash_font[LVGL_PORT_FONT_MAX] = { 0 }; /**< 常规：12/14/16 */
+static lv_font_t *s_splash_font_bold[LVGL_PORT_FONT_MAX] = { 0 }; /**< 粗体：40 */
+static uint8_t *s_splash_data_reg = NULL;  /**< 子集 TTF 的 PSRAM 常驻副本 */
+static uint8_t *s_splash_data_bold = NULL;
+static bool s_splash_fonts_ready = false;
 
 /**
  * @brief 把 SPIFFS 上的 TTF 整个读入 PSRAM
@@ -159,10 +180,20 @@ static esp_err_t load_font_file(const char *path, uint8_t **out_data, size_t *ou
 }
 
 /**
- * @brief 加载中文字体（SPIFFS→PSRAM→tiny_ttf，常规/粗体 × 多字号）
+ * @brief 字体异步加载任务：SPIFFS→PSRAM→tiny_ttf，逐字号创建
+ *
+ * 为什么放到后台任务而不是 lvgl_port_app_init 同步做（v0.6.9）：
+ *   实机实测 2 字重 × 8 字号 + 4MB 文件读取约 3.3s，同步执行会把屏幕
+ *   点亮时间拖到 3.2s 以上。改为异步后，显示链路约 0.6s 就绪；启动页
+ *   使用编进固件的极小子集（首帧即完整中文，见 create_splash_fonts），
+ *   本任务只负责主界面所需的全量字库，完成后置 s_fonts_ready。
+ *
+ * 锁策略：文件读取在 LVGL 锁外；每个字号创建时短暂持锁（约百毫秒），
+ * 字号之间让出 2ms，启动页仍能持续刷新进度，不会整段冻结。
  */
-static void load_fonts(void)
+static void font_load_task(void *arg)
 {
+    (void)arg;
     static const struct {
         uint8_t weight;
         const char *path;
@@ -171,34 +202,126 @@ static void load_fonts(void)
         [FONT_WEIGHT_BOLD] = { FONT_WEIGHT_BOLD, LVGL_PORT_FONT_BOLD_PATH },
     };
 
+    /* esp_timer_get_time()：返回系统启动至今的微秒数（int64_t）。
+     * 用它掐表比 tick 更细，且不受 FreeRTOS 节拍精度影响。 */
+    const int64_t t0 = esp_timer_get_time();
     int ok_count = 0;
+
     for (int w = 0; w < FONT_WEIGHT_MAX; w++) {
         if (load_font_file(faces[w].path, &s_font_data[w], &s_font_data_len[w]) != ESP_OK) {
             continue;
         }
         for (int i = 0; i < LVGL_PORT_FONT_MAX; i++) {
-            s_fonts[w][i] = lv_tiny_ttf_create_data(s_font_data[w], s_font_data_len[w], s_font_px[i]);
-            if (s_fonts[w][i] != NULL) {
-                ok_count++;
+            /* lvgl_port_lock(超时毫秒)：官方移植层提供的 LVGL 互斥锁。
+             * LVGL 不是线程安全的：任何任务想创建/修改 LVGL 对象（这里创建字体）
+             * 都必须先拿锁，做完再 lvgl_port_unlock()，否则会与 LVGL 任务打架。
+             * 这里取 2s 超时——真拿不到说明系统异常，跳过该字号而不是死等。 */
+            if (lvgl_port_lock(2000)) {
+                /* lv_tiny_ttf_create_data()：用内存里的 TTF 数据直接创建
+                 * 指定像素高度的 LVGL 字体对象；不读文件，运行期渲染全在内存完成。
+                 * 传入的数据缓冲必须在该字体生命周期内一直有效（这里是 s_font_data）。 */
+                s_fonts[w][i] =
+                    lv_tiny_ttf_create_data(s_font_data[w], s_font_data_len[w], s_font_px[i]);
+                if (s_fonts[w][i] != NULL) {
+                    /* 字体回退链：Noto 子集不含 FontAwesome 图标符号
+                     * （电池/WiFi/设置等在 U+F000 私用区），挂 montserrat14
+                     * 作为 fallback，中文与图标都不会出方块。 */
+                    s_fonts[w][i]->fallback = &lv_font_montserrat_14;
+                    ok_count++;
+                } else {
+                    ESP_LOGW(TAG, "字重 %d 创建 %dpx 字体失败", w, s_font_px[i]);
+                }
+                lvgl_port_unlock();
             } else {
-                ESP_LOGW(TAG, "字重 %d 创建 %dpx 字体失败", w, s_font_px[i]);
+                ESP_LOGW(TAG, "创建 %dpx 字体时获取 LVGL 锁超时，跳过", s_font_px[i]);
             }
+            vTaskDelay(pdMS_TO_TICKS(2)); /* 让 LVGL 任务有机会渲染启动页 */
         }
     }
 
-    /* 字体回退链：Noto 子集含汉字但不含 LVGL 的 FontAwesome 图标符号
-     * （电池/WiFi/设置等在 U+F000 私用区）。把内置 montserrat14 挂为
-     * fallback：中文走 Noto，图标符号走 montserrat，两者都不出方块。 */
-    for (int w = 0; w < FONT_WEIGHT_MAX; w++) {
-        for (int i = 0; i < LVGL_PORT_FONT_MAX; i++) {
-            if (s_fonts[w][i] != NULL) {
-                s_fonts[w][i]->fallback = &lv_font_montserrat_14;
-            }
+    /* 字体就绪后重建默认主题：msgbox/list/roller/虚拟键盘等官方控件
+     * 默认字体从 montserrat14 换成 Noto 16，避免主界面中文变方块。 */
+    if (lvgl_port_lock(2000)) {
+        if (s_display != NULL && s_fonts[FONT_WEIGHT_REG][LVGL_PORT_FONT_16] != NULL) {
+            lv_theme_default_init(s_display, lv_color_hex(0x0066CC), lv_color_hex(0x8A8F99),
+                                  false /*浅色主题*/,
+                                  s_fonts[FONT_WEIGHT_REG][LVGL_PORT_FONT_16]);
         }
+        lvgl_port_unlock();
     }
 
-    ESP_LOGI(TAG, "中文字体加载完成：%d/%d 个（2 字重 × %d 字号，SPIFFS→PSRAM 内存渲染）",
-             ok_count, FONT_WEIGHT_MAX * LVGL_PORT_FONT_MAX, LVGL_PORT_FONT_MAX);
+    s_fonts_ready = true;
+    ESP_LOGI(TAG, "中文字体加载完成：%d/%d 个，耗时 %lld ms（%s）", ok_count,
+             FONT_WEIGHT_MAX * LVGL_PORT_FONT_MAX,
+             (long long)((esp_timer_get_time() - t0) / 1000),
+             ok_count > 0 ? "主界面切换到全量中文" : "主界面回退内置 ASCII 字体");
+    vTaskDelete(NULL);
+}
+
+/**
+ * @brief 创建启动页专用字体（嵌入子集 TTF → 12/14/16 常规 + 40 粗体）
+ *
+ * 子集只有约 197 个字形（约 34KB/字重），创建 4 个实例约 4ms；
+ * 在显示链路初始化阶段同步完成，保证启动页第一帧就是完整中文。
+ * 数据复制到 PSRAM 常驻（tiny_ttf 生命周期内需保持有效）。
+ */
+static void create_splash_fonts(void)
+{
+    const int64_t t0 = esp_timer_get_time(); /* 计时起点（微秒），仅用于日志 */
+
+    /* heap_caps_malloc(大小, 能力位)：按内存类型分配。
+     * MALLOC_CAP_SPIRAM = 只从 PSRAM 分配（大块数据放这里，省内部 RAM）；
+     * 返回 NULL 表示 PSRAM 不足，走 fail 分支回退 ASCII 文案。 */
+    s_splash_data_reg = heap_caps_malloc(splash_font_reg_ttf_len, MALLOC_CAP_SPIRAM);
+    s_splash_data_bold = heap_caps_malloc(splash_font_bold_ttf_len, MALLOC_CAP_SPIRAM);
+    if (s_splash_data_reg == NULL || s_splash_data_bold == NULL) {
+        ESP_LOGE(TAG, "启动页子库 PSRAM 分配失败（%u/%u 字节）",
+                 (unsigned)splash_font_reg_ttf_len, (unsigned)splash_font_bold_ttf_len);
+        goto fail;
+    }
+    memcpy(s_splash_data_reg, splash_font_reg_ttf, splash_font_reg_ttf_len);
+    memcpy(s_splash_data_bold, splash_font_bold_ttf, splash_font_bold_ttf_len);
+
+    s_splash_font[LVGL_PORT_FONT_12] =
+        lv_tiny_ttf_create_data(s_splash_data_reg, splash_font_reg_ttf_len, 12);
+    s_splash_font[LVGL_PORT_FONT_14] =
+        lv_tiny_ttf_create_data(s_splash_data_reg, splash_font_reg_ttf_len, 14);
+    s_splash_font[LVGL_PORT_FONT_16] =
+        lv_tiny_ttf_create_data(s_splash_data_reg, splash_font_reg_ttf_len, 16);
+    s_splash_font_bold[LVGL_PORT_FONT_40] =
+        lv_tiny_ttf_create_data(s_splash_data_bold, splash_font_bold_ttf_len, 40);
+
+    if (s_splash_font[LVGL_PORT_FONT_12] == NULL || s_splash_font[LVGL_PORT_FONT_14] == NULL ||
+        s_splash_font[LVGL_PORT_FONT_16] == NULL ||
+        s_splash_font_bold[LVGL_PORT_FONT_40] == NULL) {
+        ESP_LOGE(TAG, "启动页子库创建失败 -> 启动页回退 ASCII");
+        goto fail;
+    }
+
+    for (int i = 0; i < LVGL_PORT_FONT_MAX; i++) {
+        if (s_splash_font[i] != NULL) {
+            s_splash_font[i]->fallback = &lv_font_montserrat_14;
+        }
+        if (s_splash_font_bold[i] != NULL) {
+            s_splash_font_bold[i]->fallback = &lv_font_montserrat_14;
+        }
+    }
+    s_splash_fonts_ready = true;
+    ESP_LOGI(TAG, "启动页子库就绪：%u/%u 字节，4 个字库实例，耗时 %lld ms",
+             (unsigned)splash_font_reg_ttf_len, (unsigned)splash_font_bold_ttf_len,
+             (long long)((esp_timer_get_time() - t0) / 1000));
+    return;
+
+fail:
+    s_splash_fonts_ready = false;
+    if (s_splash_data_reg != NULL) {
+        free(s_splash_data_reg);
+        s_splash_data_reg = NULL;
+    }
+    if (s_splash_data_bold != NULL) {
+        free(s_splash_data_bold);
+        s_splash_data_bold = NULL;
+    }
 }
 
 /**
@@ -267,6 +390,8 @@ esp_err_t lvgl_port_app_init(void)
     cfg.task_priority = LVGL_PORT_TASK_PRIO;
     cfg.task_stack = LVGL_PORT_TASK_STACK;
     cfg.task_affinity = LVGL_PORT_TASK_CORE;
+    /* 没有新定时器时，LVGL 任务最多睡多久再醒来检查一次（毫秒）。
+     * 500ms 是上限；有新绘制请求时 lv_timer_handler 会被提前唤醒。 */
     cfg.task_max_sleep_ms = 500;
     cfg.timer_period_ms = LVGL_PORT_TICK_MS;
     /* 【v0.6.3 性能】LVGL 任务栈改回**内部 RAM**。
@@ -286,8 +411,8 @@ esp_err_t lvgl_port_app_init(void)
         return err;
     }
 
-    /* ---- ② 中文字体（须在 lv_init 之后创建） ---- */
-    load_fonts();
+    /* ---- ② 启动页嵌入子库（同步，约 4ms；不依赖 SPIFFS） ---- */
+    create_splash_fonts();
 
     /* ---- ③ 注册显示（软件旋转架构）----
      * 面板物理方向永久固定 284x240 横屏（MADCTL 0x68，init 写一次后不再动）。
@@ -332,22 +457,19 @@ esp_err_t lvgl_port_app_init(void)
         return ESP_FAIL;
     }
 
-    /* 渲染完成计数：官方在刷屏回调返回后触发 FLUSH_FINISH 事件 */
+    /* 渲染完成计数：官方在刷屏回调返回后触发 FLUSH_FINISH 事件。
+     * lv_display_add_event_cb(显示设备, 回调, 事件码, 用户数据)：把回调挂到
+     * LVGL 显示对象上；事件由 LVGL 任务在对应时机调用，回调里不要做耗时操作。 */
     lv_display_add_event_cb(s_display, disp_flush_finish_cb, LV_EVENT_FLUSH_FINISH, NULL);
 
-    /* ---- ④ 用中文字体重建默认主题 ----
-     * msgbox/list/roller/键盘等官方控件默认字体原本是 montserrat14（不含中文，
-     * 显示成方块）。重建后这些控件默认使用 16px Noto（其 fallback 已挂
-     * montserrat14，图标仍正常）。主题重建会触发一次全树样式刷新，此时还没有
-     * 任何业务界面。 */
-    if (s_fonts[FONT_WEIGHT_REG][LVGL_PORT_FONT_16] != NULL) {
-        lv_theme_default_init(s_display, lv_color_hex(0x0066CC), lv_color_hex(0x8A8F99),
-                              false /*浅色主题*/, s_fonts[FONT_WEIGHT_REG][LVGL_PORT_FONT_16]);
-    }
-
-    /* ---- ⑤ 触摸输入设备（自研驱动 + 旋转映射） ----
+    /* ---- ④ 触摸输入设备（自研驱动 + 旋转映射） ----
      * 官方 lvgl_port_add_touch() 需要 esp_lcd_touch 句柄；本工程用自研
      * CST816D 驱动，故自行创建 indev（理由见 lvgl_port.h 文件头）。 */
+    /* lv_indev_create()：创建一个 LVGL 输入设备对象；
+     * lv_indev_set_type(对象, LV_INDEV_TYPE_POINTER)：声明它是"指针类"输入
+     * （触摸/鼠标），LVGL 会按坐标做控件命中和点击判定；
+     * lv_indev_set_read_cb(对象, 回调)：LVGL 每次处理输入时调用该回调取当前
+     * 触摸状态与坐标（见 indev_read_cb）。 */
     s_indev = lv_indev_create();
     if (s_indev == NULL) {
         ESP_LOGE(TAG, "创建触摸输入设备失败");
@@ -356,8 +478,47 @@ esp_err_t lvgl_port_app_init(void)
     lv_indev_set_type(s_indev, LV_INDEV_TYPE_POINTER);
     lv_indev_set_read_cb(s_indev, indev_read_cb);
 
+    /* ---- ⑤ 中文字体加载任务由 app_tasks_start() 启动 ----
+     * 不在本函数里创建：显示链路要第一时间返回，让启动页先亮；
+     * 等初始化与测量任务启动后再由 lvgl_port_start_font_load() 拉起后台任务。 */
+
     s_inited = true;
-    ESP_LOGI(TAG, "LVGL 适配层就绪（软件旋转；物理面板固定 284x240）");
+    ESP_LOGI(TAG, "LVGL 适配层就绪（软件旋转；物理面板固定 284x240；字库待启动）");
+    return ESP_OK;
+}
+
+/**
+ * @brief 启动中文字体后台加载任务（v0.6.9）
+ *
+ * 在 app_tasks_start() 中、启动页与测量任务都就绪后调用：
+ * 此时加载字体不会推迟屏幕点亮，也不会延迟 4kHz 采样启动。
+ * 任务栈必须放内部 RAM（SPIFFS 读取期间会短暂关闭 cache）。
+ */
+esp_err_t lvgl_port_start_font_load(void)
+{
+    if (s_font_load_started) {
+        return ESP_OK;
+    }
+    if (s_display == NULL) {
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    /* xTaskCreatePinnedToCoreWithCaps：创建任务并指定栈所在内存类型。
+     * 参数依次为（函数, 任务名, 栈字节数, 参数, 优先级, 句柄, 核心号, 栈能力位）。
+     * 这里强制 MALLOC_CAP_INTERNAL：本任务要读 SPIFFS，而 SPIFFS 读写期间
+     * 会临时关闭 flash cache，此时 CPU 访问不了 PSRAM；若栈在 PSRAM 会立刻
+     * 触发 cache 错误并复位（踩过的坑）。优先级 2 让字库加载不抢 UI/测量。 */
+    BaseType_t tok = xTaskCreatePinnedToCoreWithCaps(font_load_task, "font_load", 8192, NULL, 2,
+                                                    NULL, 0, MALLOC_CAP_INTERNAL);
+    if (tok != pdPASS) {
+        ESP_LOGE(TAG, "字体加载任务创建失败 -> 回退内置 ASCII 字体");
+        /* 必须置 ready，否则 UI 会一直等字体；主界面用 montserrat14 降级显示 */
+        s_fonts_ready = true;
+        return ESP_ERR_NO_MEM;
+    }
+
+    s_font_load_started = true;
+    ESP_LOGI(TAG, "全量中文字体后台加载任务已启动（主界面等待其完成；启动页已用嵌入子集）");
     return ESP_OK;
 }
 
@@ -462,4 +623,44 @@ const lv_font_t *lvgl_port_get_font(lvgl_port_font_size_t size)
 const lv_font_t *lvgl_port_get_font_bold(lvgl_port_font_size_t size)
 {
     return get_font(FONT_WEIGHT_BOLD, size);
+}
+
+/**
+ * @brief 启动页子集字体取用实现（v0.6.9）
+ *
+ * 子库只创建了启动页真正用到的字号（常规 12/14/16、粗体 40），其余字号
+ * 落到全量字体链：后台任务就绪前是 Montserrat（仅 ASCII），就绪后是 Noto。
+ * 这样即使调用方传了子库没有的字号，也绝不会拿到 NULL。
+ */
+static const lv_font_t *get_splash_font(int weight, lvgl_port_font_size_t size)
+{
+    if (size < 0 || size >= LVGL_PORT_FONT_MAX || weight < 0 || weight >= FONT_WEIGHT_MAX) {
+        return NULL;
+    }
+    lv_font_t *font = (weight == FONT_WEIGHT_BOLD) ? s_splash_font_bold[size]
+                                                   : s_splash_font[size];
+    if (font != NULL) {
+        return font;
+    }
+    return get_font(weight, size);
+}
+
+const lv_font_t *lvgl_port_get_splash_font(lvgl_port_font_size_t size)
+{
+    return get_splash_font(FONT_WEIGHT_REG, size);
+}
+
+const lv_font_t *lvgl_port_get_splash_font_bold(lvgl_port_font_size_t size)
+{
+    return get_splash_font(FONT_WEIGHT_BOLD, size);
+}
+
+bool lvgl_port_splash_fonts_ready(void)
+{
+    return s_splash_fonts_ready;
+}
+
+bool lvgl_port_fonts_ready(void)
+{
+    return s_fonts_ready;
 }

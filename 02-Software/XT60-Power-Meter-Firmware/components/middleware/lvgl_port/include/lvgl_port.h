@@ -12,13 +12,15 @@
  *    本头文件直接 `#include "esp_lvgl_port.h"`，因此 `lvgl_port_lock() /
  *    lvgl_port_unlock()` 等即为**官方实现**，调用方无需改动。
  * 3. 本组件只保留“应用特有”的部分：
- *      · 中文字体：SPIFFS 上的 Noto Sans SC 子集，启动时整读入 PSRAM 后用
- *        tiny_ttf 建多档字号（见 lvgl_port.c 文件头说明，运行期零 flash 访问）；
+ *      · 中文字体：启动页用编进固件的极小子集（splash_font_data.c，首帧即
+ *        完整中文）；主界面用 SPIFFS 上的全量 Noto Sans SC 子集，由后台
+ *        任务整读入 PSRAM 后用 tiny_ttf 建多档字号（运行期零 flash 访问）；
  *      · 显示注册：复用官方 lvgl_port_add_disp()，但以 `sw_rotate=1` 保护面板
  *        由 MADCTL 完成的“硬旋转”（否则官方会调用本面板不支持的 swap_xy
  *        并改写 MADCTL，导致镜像/花屏）；
  *      · 首帧计数：供 UI 层在“首帧真正渲染后”再打开背光，避免开机先见黑屏；
- *      · 旋转档位：封装面板 MADCTL + LVGL 分辨率 + 触摸坐标映射三者同步；
+ *      · 旋转档位：封装 LVGL 软件旋转 + 逻辑分辨率 + 触摸坐标映射三者的同步
+ *        （运行期不向面板写 MADCTL，见 lvgl_port.c 文件头的 sw_rotate 说明）；
  *      · 电容触摸输入：由本组件自行注册 LVGL indev（见下方命名冲突说明）。
  *
  * ─────────────────────────────────────────────────────────────
@@ -66,12 +68,11 @@ typedef enum {
  * 内部流程：
  *   ① 调官方 lvgl_port_init()：初始化 LVGL、创建 LVGL 任务（绑定 Core 0）
  *      与心跳定时器；
- *   ② 加载中文字体（SPIFFS → PSRAM → tiny_ttf，多档字号）；
+ *   ② 同步创建启动页嵌入子集字体（不读 SPIFFS，约 4ms）；
  *   ③ 调官方 lvgl_port_add_disp() 注册显示（由官方分配缓冲并接管传输完成回调）；
- *   ④ 用中文字体重建默认主题（官方控件默认字体改为中文）；
- *   ⑤ 注册电容触摸输入设备（自研驱动 + 旋转映射）。
- *
- * 前置条件：fs_storage（字体所在分区）与 lcd_nv3030b / touch_cst816d 已初始化。
+ *   ④ 注册电容触摸输入设备（自研驱动 + 旋转映射）。
+ * 全量中文字体由 lvgl_port_start_font_load() 在 app_tasks_start() 里后台加载，
+ * 加载完成后重建默认主题，主界面再使用全量 Noto 字体。
  *
  * @return ESP_OK 成功；其余为错误码
  */
@@ -92,6 +93,61 @@ const lv_font_t *lvgl_port_get_font(lvgl_port_font_size_t size);
 const lv_font_t *lvgl_port_get_font_bold(lvgl_port_font_size_t size);
 
 /**
+ * @brief 获取启动页专用的嵌入子集字体（v0.6.9）
+ *
+ * 子集只有约 197 个字形（约 34KB/字重，启动页文案 + 初始化进度标签），编进 app 分区，
+ * lvgl_port_app_init() 内同步创建，**不依赖 SPIFFS 与后台字库任务**；
+ * 因此启动页第一帧就能显示完整中文，不必先等 4MB 全量字库。
+ *
+ * 子集未就绪或该字号缺失时自动回退到全量字体链（最终回退 Montserrat），
+ * 不返回 NULL（参数非法除外）。
+ *
+ * @param size 字号：启动页用到 12（标识）/14（版本/进度）/16（副标题），
+ *             粗体 40（主标题）
+ * @return 字体指针
+ */
+const lv_font_t *lvgl_port_get_splash_font(lvgl_port_font_size_t size);
+
+/** @brief 获取启动页专用子集的粗体（主标题 40px） */
+const lv_font_t *lvgl_port_get_splash_font_bold(lvgl_port_font_size_t size);
+
+/**
+ * @brief 启动页嵌入子集是否就绪
+ *
+ * 正常情况下 lvgl_port_app_init() 返回时即为 true（同步创建，耗时约 4ms）；
+ * 只有 PSRAM 分配失败或 tiny_ttf 创建失败时才为 false，此时启动页回退
+ * ASCII 文案（由 ui.c 判断后调用 splash_set_cjk(false)）。
+ */
+bool lvgl_port_splash_fonts_ready(void);
+
+/**
+ * @brief 中文字体是否已异步加载完成（v0.6.9）
+ *
+ * lvgl_port_app_init() 本身**不加载**全量中文：后台字库任务由
+ * lvgl_port_start_font_load()（在 app_tasks_start() 内）拉起，启动前
+ * lvgl_port_get_font() 全部回退内置 Montserrat（仅 ASCII）。
+ * 启动页据此选择「ASCII 文案」或「中文文案」，主界面也应等本函数返回
+ * true 后再构建，避免中文显示成方框。
+ *
+ * @return true=中文字体已就绪（或加载失败已降级）；false=仍在加载
+ */
+bool lvgl_port_fonts_ready(void);
+
+/**
+ * @brief 启动中文字体后台加载任务（v0.6.9）
+ *
+ * 由 app_tasks_start() 在显示链路确认无误后调用：
+ *   · 此时启动页已经显示（ASCII），初始化也已完成，字体加载不再拖慢
+ *     屏幕点亮与测量任务启动；
+ *   · 加载完成后 lvgl_port_fonts_ready() 返回 true，启动页切中文、
+ *     UI 任务随后构建主界面。
+ *
+ * @return ESP_OK 已启动/或此前已启动；ESP_ERR_INVALID_STATE 显示未就绪；
+ *         ESP_ERR_NO_MEM 任务创建失败（此时自动降级为 ASCII 字体）
+ */
+esp_err_t lvgl_port_start_font_load(void);
+
+/**
  * @brief 查询显示器已完成上屏的 flush 次数
  *
  * 用途：开机时背光保持关闭，UI 任务在「首帧真正渲染」后再打开背光，
@@ -105,9 +161,10 @@ uint32_t lvgl_port_flush_count(void);
  * @brief 切换显示旋转（同步面板方向、LVGL 分辨率与触摸坐标映射）
  *
  * 这是「触摸方向自动跟随屏幕旋转」的统一入口：内部会
- *   ① 调 lcd_nv3030b_set_rotation() 写 MADCTL；
- *   ② 记录档位并更新触摸映射；
- *   ③ 更新 LVGL 显示设备的分辨率。
+ *   ① 获取 LVGL 锁后调 lv_display_set_rotation() 切换软件旋转，
+ *      逻辑分辨率随之更新（并发 RESOLUTION_CHANGED 事件）；
+ *   ② 调 lcd_nv3030b_set_rotation() 记录档位（运行期不向面板写 MADCTL）；
+ *   ③ 触摸方向由 LVGL 依据旋转自动换算，本层只返回固定的物理坐标。
  * 供后续 IMU 自动转屏 / 用户设置复用。
  *
  * @param rot 目标档位（见 lcd_nv3030b_rotation_t）

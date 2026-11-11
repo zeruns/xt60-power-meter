@@ -16,20 +16,43 @@
 #include "esp_err.h"
 
 /**
- * @brief 构建全部界面并启动 UI 任务（绑定 Core 0）
+ * @brief 创建 UI 任务并立即进入启动页阶段（绑定 Core 0）
  *
- * 依赖 middleware/lvgl_port 已初始化。
+ * 依赖 middleware/lvgl_port 已初始化，且按键驱动已就绪（任务启动时会注册回调）。
+ * 与旧版不同：主界面不再固定延时后构建，而是等到 ui_boot_finish() 被调用，
+ * 因此本函数可在 app_init 的显示链路就绪后提前调用，让启动页尽早点亮。
  *
- * @return ESP_OK 成功；ESP_ERR_NO_MEM 任务创建失败
+ * @return ESP_OK 成功；ESP_ERR_NO_MEM 任务创建失败；ESP_ERR_INVALID_STATE 已创建
  */
 esp_err_t ui_init(void);
 
 /**
+ * @brief 更新启动页真实进度（线程安全，由 app_init 的初始化循环调用）
+ *
+ * 只写一份共享快照（已步数/总步数/阶段文字），不直接操作 LVGL 对象；
+ * UI 任务在启动页循环里读取快照并渲染，避免跨任务直接改控件。
+ * 若 UI 任务尚未构建启动页，快照会保留，构建完成后立即应用。
+ *
+ * @param done  已完成步数（0 ~ total）
+ * @param total 总步数（至少 1）
+ * @param label 当前阶段短文本（如 "测量前端 17/23"，UTF-8，最长 47 字节）
+ */
+void ui_boot_set_progress(uint32_t done, uint32_t total, const char *label);
+
+/**
+ * @brief 通知启动页初始化结束，UI 任务随后构建主界面
+ *
+ * 由 app_tasks_start() 在测量任务启动后调用（仅显示链路无故障时）。
+ * UI 任务尚未创建时为空操作，保证故障降级路径安全。
+ */
+void ui_boot_finish(void);
+
+/**
  * @brief 告警弹窗是否正打开（模态中）
  *
- * 供 ui_nav 的滑动识别抑制手势：告警弹窗期间不允许横滑环形翻页/
- * 上滑开快速菜单（弹窗挂在顶层图层，翻页会把承载页抽走）。
- * 模拟器无 ui.c，由 stubs.c 返回 false。
+ * 【历史声明：仓库内已无定义与调用】v0.6.8 起模态判定统一由 ui_msgbox 模块
+ * 的 ui_msgbox_is_open() 提供（覆盖告警框、确认框、提示框），ui_nav 的手势
+ * 抑制也已改用后者。本声明保留在原处未清理，请勿在新代码中引用。
  *
  * @return true=告警弹窗在屏上
  */

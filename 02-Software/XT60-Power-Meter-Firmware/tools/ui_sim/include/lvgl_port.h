@@ -5,9 +5,10 @@
  * 真机版基于 ESP 官方组件 espressif/esp_lvgl_port；模拟器在 PC 上以单线程
  * 渲染循环复刻同类能力：
  *   · 字体：从工程内同一份 Noto Sans SC TTF（notosc_reg/bold.ttf）用
- *     lv_tiny_ttf 建同样 7 档字号 —— 与真机加载路径一致，保证字形光栅化结果相同；
+ *     lv_tiny_ttf 建同样 8 档字号 —— 与真机加载路径一致，保证字形光栅化结果相同；
  *   · 锁：单线程下为直通实现（返回 true / 空操作）；
- *   · 旋转：记录档位并同步 LVGL 分辨率（模拟器支持竖屏/横屏演示）。
+ *   · 旋转：记录档位并同步 LVGL 逻辑分辨率（真机同样由 LVGL 软件旋转完成，
+ *     运行期不向面板写 MADCTL，面板物理方向固定为横屏）。
  */
 #pragma once
 
@@ -36,6 +37,14 @@ esp_err_t lvgl_port_app_init(void);
 
 const lv_font_t *lvgl_port_get_font(lvgl_port_font_size_t size);
 const lv_font_t *lvgl_port_get_font_bold(lvgl_port_font_size_t size);
+
+/** 启动页嵌入子集（模拟器与全量字库同源，便于验证中文文案/版式） */
+const lv_font_t *lvgl_port_get_splash_font(lvgl_port_font_size_t size);
+const lv_font_t *lvgl_port_get_splash_font_bold(lvgl_port_font_size_t size);
+bool lvgl_port_splash_fonts_ready(void);
+
+/** 模拟器字体在初始化时同步加载完成，恒为 true（真机为后台异步加载） */
+bool lvgl_port_fonts_ready(void);
 uint32_t lvgl_port_flush_count(void);
 
 esp_err_t lvgl_port_set_rotation(lcd_nv3030b_rotation_t rot);

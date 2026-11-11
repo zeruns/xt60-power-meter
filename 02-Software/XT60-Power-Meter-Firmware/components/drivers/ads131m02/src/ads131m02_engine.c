@@ -19,7 +19,8 @@
  *     本引擎用 spi_hal/LL 装载一次性帧格式，把「启动」压成 ISR 内的寄存器写。
  *   · **不用 GDMA 完成中断做消费同步**：GDMA 驱动 ISR 在 flash 里，cache
  *     关闭窗口（NVS 擦写）会被挂起；改为消费者忙等 spi_ll_usr_is_done
- *     （inline、帧仅 5µs），完成中断只在维护路径用信号量辅助。
+ *     （inline、帧仅 5µs）。维护路径同样不用完成中断：DRDY ISR 直启维护帧后
+ *     给一个「已启动」信号量，任务被唤醒后仍靠忙等确认传输真正结束。
  *   · **描述符每次 kick 重臂**（单描述符复用）：比链式环简单，且 owner 位
  *     检查天然防止未就绪启动。
  *
@@ -200,6 +201,9 @@ static void IRAM_ATTR drdy_isr(void *arg)
     atomic_fetch_add_explicit(&s_drdy_count, 1, memory_order_relaxed);
 
     BaseType_t woken = pdFALSE;
+    /* 二值信号量：ISR 里 give、任务里 take，用来把「DRDY 到了」这个事件
+     * 从中断上下文传递给采样任务；give 后若唤醒了更高优先级任务，
+     * woken 会被置 pdTRUE，ISR 末尾据此决定是否立即切任务。 */
     xSemaphoreGiveFromISR(s_drdy_sem, &woken);
 
     /* 维护帧直启（M3）：任务已置 s_maint_tx 请求，在 DRDY 边沿精确 kick 一帧。
@@ -232,6 +236,8 @@ static void IRAM_ATTR drdy_isr(void *arg)
             atomic_fetch_add_explicit(&s_drop_count, 1, memory_order_relaxed);
         }
     }
+    /* 中断退出前按需触发一次任务切换（woken 为 pdTRUE 说明刚才唤醒的任务
+     * 优先级高于被中断的任务），保证采样任务尽快取走这一帧。 */
     portYIELD_FROM_ISR(woken);
 }
 
@@ -362,6 +368,8 @@ esp_err_t ads_engine_init(int mosi, int miso, int sclk, int clk_hz, int input_de
     gdma_get_group_channel_id(s_tx_chan, &gid, (int *)&s_tx_ll_chan);
     gdma_get_group_channel_id(s_rx_chan, &gid, (int *)&s_rx_ll_chan);
 
+    /* xSemaphoreCreateBinary：创建二值信号量（只有「有 / 无」两态），
+     * 用作 ISR → 任务的单事件通知；返回 NULL 表示堆内存不足。 */
     s_drdy_sem = xSemaphoreCreateBinary();
     if (s_drdy_sem == NULL) {
         return ESP_ERR_NO_MEM;
@@ -408,6 +416,8 @@ bool ads_engine_set_stream(bool on)
          * 流式本就关闭（was=false），但 DRDY ISR 仍在每个边沿 give 信号量并
          * 饱和为 1，若不 drain，第一个命令帧会吃到陈旧信号、在非帧边界 kick，
          * 导致命令不被芯片识别（实测寄存器读回全 0x0503）。 */
+        /* 超时参数给 0 = 不等待、只查询：把信号量里可能残留的「陈旧 DRDY」
+         * 逐个取空（循环到 take 返回非 pdTRUE 为止）。 */
         while (xSemaphoreTake(s_drdy_sem, 0) == pdTRUE) {
         }
     }

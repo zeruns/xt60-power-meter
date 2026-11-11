@@ -3,6 +3,7 @@ idf_component_register(
     SRCS
         "src/ui.c"
         "src/ui_nav.c"
+        "src/screens/ui_msgbox.c"
         "src/screens/splash.c"
         "src/screens/screen_measure.c"
         "src/screens/screen_wave.c"

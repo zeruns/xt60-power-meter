@@ -5,7 +5,8 @@
 
 ## 开发环境
 
-- **ESP-IDF v6.1**（开发基线；v5.5 及以上可构建，但请以 v6.1 验证后再提交）
+- **ESP-IDF v6.1**（开发与验证基线；更早版本缺少本工程使用的 Kconfig 项与私有 HAL 接口，
+  不保证可构建，请以 v6.1 验证后再提交）
 - Windows：Espressif 官方安装器；Linux / macOS：按官方文档安装并 `export IDF_PATH`
 - 可选工具：
   - 主机单元测试：任一主机端 C 编译器（gcc / clang / tcc，Windows 可用 MSYS2 / MinGW-w64）
@@ -29,11 +30,17 @@ export IDF_PATH=/path/to/esp-idf
 
 已加载 IDF 环境的终端也可直接 `idf.py build` / `idf.py flash`。
 
+> 两个 Windows 脚本结束时都会打印成功/失败摘要并 `pause`；自动化场景可加 `nopause`
+> 参数、设 `XT60_NO_PAUSE=1` 或 `CI=1` 跳过暂停，退出码原样透传（`tools/ci/run_ci.ps1`
+> 已设置 `XT60_NO_PAUSE=1`）。
+
 **烧录范围提醒**（详见 [docs/build_and_flash.md](docs/build_and_flash.md)）：
 `idf.py flash` 会烧 5 个镜像（bootloader / 分区表 / otadata / app / storage）。
-其中 `storage.bin` 装的是 SPIFFS 中文字体，**OTA 不会更新它**——
+其中 `storage.bin` 装的是 SPIFFS 中的**主界面全量中文字体**，**OTA 不会更新它**——
 只要改过字库（`tools/fonts/make_fonts.py`），就必须**插 USB 全量烧录**，
 否则会出现"升级成功但中文仍显示方框"。只改业务代码时可用 `idf.py app-flash` 省时间。
+启动页文案用的是编进 app 的极小子集（`tools/fonts/make_splash_font.py`），
+改启动页文案只需重跑脚本并重新构建 app，不必全量烧录。
 
 ## UI 改动必须先跑模拟器回归
 

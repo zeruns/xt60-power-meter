@@ -3,7 +3,9 @@
  * @brief 模拟器桩：显示驱动接口（与真机同名同形，仅保留 UI/设置页需要的部分）
  *
  * 说明：真机版还包含 esp_lcd 面板句柄等接口（依赖 ESP-IDF，模拟器不可用），
- * 但 UI 层只用到旋转档位/分辨率/背光亮度这几个能力，故此桩只需覆盖这些。
+ * 但 UI / 适配层只用到旋转档位/分辨率/背光亮度这几个能力，故此桩只需覆盖这些。
+ * 模拟器没有面板，旋转仅用于换算逻辑分辨率；真机面板物理方向固定为横屏，
+ * 其余角度由 LVGL 软件旋转实现。
  * 保持与真机一致的类型名与函数签名，UI 代码可同源编译。
  */
 #pragma once
@@ -28,8 +30,10 @@ typedef enum {
     LCD_NV3030B_ROT_270,   /**< 横屏倒置 */
 } lcd_nv3030b_rotation_t;
 
+/** 只记录档位（模拟器无面板；真机运行期同样只记录，屏幕方向由 LVGL 软件旋转） */
 esp_err_t lcd_nv3030b_set_rotation(lcd_nv3030b_rotation_t rot);
 lcd_nv3030b_rotation_t lcd_nv3030b_get_rotation(void);
+/** 按档位换算逻辑分辨率：竖屏 240×284，横屏 284×240 */
 void lcd_nv3030b_get_resolution(lcd_nv3030b_rotation_t rot, int *width, int *height);
 
 /**

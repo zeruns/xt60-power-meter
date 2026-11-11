@@ -18,8 +18,9 @@
  *    · 实时数据——按「信息重要性」分四层排版：功率最大（Hero），电压/电流次大，
  *      累计电能/容量/运行时间中等，电池+WiFi 信号再次，SOC 结温/机内温湿度最小。
  *      数值小数位与设备端屏幕完全一致（复用设备端 fmt_val 的动态小数位规则）。
- *    · 波形图——canvas 手绘，网格加密为 8×4（参考设备端 DSO 风格的 4×8 格），
- *      支持 V/I/P 叠加、1s~10min 时间窗、暂停、拖动回看、十字光标、锁定量程；
+ *    · 波形图——canvas 手绘，网格为 10×5（横向 10 格时间、纵向 5 格量程，
+ *      参考设备端 DSO 风格），支持 V/I/P 叠加、1s~10min 时间窗、暂停、拖动回看、
+ *      十字光标、锁定量程；
  *      底部改为三张「通道统计卡」：当前值最大显示，最小/最大/平均用不同颜色区分，
  *      每项都带单位。
  *    · 设置——WiFi 配网（模式切换 + 搜索列表选点 + 密码连接 + 忘记网络）、
@@ -446,21 +447,22 @@ const char web_console_page_html[] =
 "  <section class='card'>\n"
 "    <h2>越限告警</h2>\n"
 "    <div class='hint'>勾选「使能」后对应阈值才生效；拖动滑动条或直接输入数字皆可，\n"
-"      两处数值实时同步。触发时设备端蜂鸣并弹出提示，网页端顶部显示红色横幅。</div>\n"
+"      两处数值实时同步（上限 90V / 70A / 6300W，与整机量程一致）。\n"
+"      触发时设备端蜂鸣并弹出提示，网页端顶部显示红色横幅。</div>\n"
 "    <div class='chips'>\n"
 "      <label class='chip'><input type='checkbox' id='s_v_en'>过压使能</label>\n"
 "      <label class='chip'><input type='checkbox' id='s_i_en'>过流使能</label>\n"
 "      <label class='chip'><input type='checkbox' id='s_p_en'>过功率使能</label>\n"
 "    </div>\n"
 "    <div class='field' style='margin-top:14px'><label>过压阈值（V）</label>\n"
-"      <div class='slide'><input type='range' id='s_v_rng' min='0.1' max='30' step='0.1'>\n"
-"        <input class='num mono' id='s_v_lim' type='number' step='0.1' inputmode='decimal'></div></div>\n"
+"      <div class='slide'><input type='range' id='s_v_rng' min='0.1' max='90' step='0.1'>\n"
+"        <input class='num mono' id='s_v_lim' type='number' min='0.1' max='90' step='0.1' inputmode='decimal'></div></div>\n"
 "    <div class='field' style='margin-top:12px'><label>过流阈值（A）</label>\n"
-"      <div class='slide'><input type='range' id='s_i_rng' min='0.1' max='20' step='0.1'>\n"
-"        <input class='num mono' id='s_i_lim' type='number' step='0.1' inputmode='decimal'></div></div>\n"
+"      <div class='slide'><input type='range' id='s_i_rng' min='0.1' max='70' step='0.1'>\n"
+"        <input class='num mono' id='s_i_lim' type='number' min='0.1' max='70' step='0.1' inputmode='decimal'></div></div>\n"
 "    <div class='field' style='margin-top:12px'><label>过功率阈值（W）</label>\n"
-"      <div class='slide'><input type='range' id='s_p_rng' min='1' max='200' step='1'>\n"
-"        <input class='num mono' id='s_p_lim' type='number' step='1' inputmode='numeric'></div></div>\n"
+"      <div class='slide'><input type='range' id='s_p_rng' min='1' max='6300' step='1'>\n"
+"        <input class='num mono' id='s_p_lim' type='number' min='1' max='6300' step='1' inputmode='numeric'></div></div>\n"
 "    <div class='row'><button id='b_alarm'>应用告警设置</button></div>\n"
 "    <div class='result mono' id='r_alarm'></div>\n"
 "  </section>\n"
@@ -1424,7 +1426,7 @@ const char web_console_page_html[] =
 "  }\n"
 "\n"
 "  function initSliders(){\n"
-"    /* 告警阈值：滑动条范围与设备端步进范围一致（V 0.1~30 / I 0.1~20 / P 1~200） */\n"
+"    /* 告警阈值：滑动条范围与设备端步进范围一致（V 0.1~90 / I 0.1~70 / P 1~6300） */\n"
 "    bindSlider('s_v_rng','s_v_lim');\n"
 "    bindSlider('s_i_rng','s_i_lim');\n"
 "    bindSlider('s_p_rng','s_p_lim');\n"
@@ -1555,9 +1557,9 @@ const char web_console_page_html[] =
 "    obj.alarm_v_en=$('s_v_en').checked?1:0;\n"
 "    obj.alarm_i_en=$('s_i_en').checked?1:0;\n"
 "    obj.alarm_p_en=$('s_p_en').checked?1:0;\n"
-"    obj.alarm_v_limit=parseFloat($('s_v_lim').value);\n"
-"    obj.alarm_i_limit=parseFloat($('s_i_lim').value);\n"
-"    obj.alarm_p_limit=parseFloat($('s_p_lim').value);\n"
+"    obj.alarm_v_limit=clamp(parseFloat($('s_v_lim').value),0.1,90);\n"
+"    obj.alarm_i_limit=clamp(parseFloat($('s_i_lim').value),0.1,70);\n"
+"    obj.alarm_p_limit=clamp(parseFloat($('s_p_lim').value),1,6300);\n"
 "    postConfig(obj, 'r_alarm');\n"
 "  });\n"
 "\n"
