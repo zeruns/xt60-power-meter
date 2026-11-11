@@ -6,7 +6,7 @@
 
 [![License: CERN OHL-S v2](https://img.shields.io/badge/hardware-CERN%20OHL--S--2.0-blue)](LICENSE) [![Firmware: MIT](https://img.shields.io/badge/firmware-MIT-green)](02-Software/XT60-Power-Meter-Firmware/LICENSE) ![MCU](https://img.shields.io/badge/MCU-ESP32--S3-orange) ![ADC](https://img.shields.io/badge/ADC-ADS131M02%2024bit-yellow) ![Firmware](https://img.shields.io/badge/firmware-v0.6.9-brightgreen)
 
-> - 🎬 **Demo video**: to be added (Bilibili link)
+> - 🎬 **Demo video**: [https://www.bilibili.com/video/BV1pNWU6qE3P/](https://www.bilibili.com/video/BV1pNWU6qE3P/)
 > - 📦 **OSHWHub / LCEDA open-hardware project**: [https://oshwhub.com/zeruns/xt60-power-meter-esp32](https://oshwhub.com/zeruns/xt60-power-meter-esp32)
 > - 🔗 **Gitee repository**: [https://gitee.com/zeruns/xt60-power-meter](https://gitee.com/zeruns/xt60-power-meter)
 > - 🔗 **GitHub repository**: [https://github.com/zeruns/xt60-power-meter](https://github.com/zeruns/xt60-power-meter)
