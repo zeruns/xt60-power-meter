@@ -3,15 +3,16 @@
 > XT60 接口直插测量直流电压、电流、功率与电能，1.83 寸 IPS 彩屏实时显示读数和波形；
 > 内置锂电池可充电，支持 WiFi 网页控制台。**硬件、固件、外壳全开源。**
 
-[![License: CERN OHL-S v2](https://img.shields.io/badge/hardware-CERN%20OHL--S--2.0-blue)](LICENSE)[![Firmware: MIT](https://img.shields.io/badge/firmware-MIT-green)](02-Software/XT60-Power-Meter-Firmware/LICENSE)![MCU](https://img.shields.io/badge/MCU-ESP32--S3-orange)![ADC](https://img.shields.io/badge/ADC-ADS131M02%2024bit-yellow)![Firmware](https://img.shields.io/badge/firmware-v0.6.9-brightgreen)
+[![License: CERN OHL-S v2](https://img.shields.io/badge/hardware-CERN%20OHL--S--2.0-blue)](LICENSE) [![Firmware: MIT](https://img.shields.io/badge/firmware-MIT-green)](02-Software/XT60-Power-Meter-Firmware/LICENSE) ![MCU](https://img.shields.io/badge/MCU-ESP32--S3-orange) ![ADC](https://img.shields.io/badge/ADC-ADS131M02%2024bit-yellow) ![Firmware](https://img.shields.io/badge/firmware-v0.6.9-brightgreen)
 
-> 🎬 **演示视频**：待补充（B 站链接）
-> 📦 **立创开源硬件平台工程**：[https://oshwhub.com/zeruns/xt60-power-meter-esp32](https://oshwhub.com/zeruns/xt60-power-meter-esp32)
-> 🔗 **Gitee仓库地址**：[https://gitee.com/zeruns/xt60-power-meter](https://gitee.com/zeruns/xt60-power-meter)
-> 🔗 **GitHub 仓库地址**：待补充
-> 💬 电子交流社区：[https://bbs.eeclub.top/](https://bbs.eeclub.top/)
-> 📖 作者博客：[https://blog.zeruns.com/](https://blog.zeruns.com/)
-> 🇬🇧 **English**: [README.en.md](README.en.md)
+> - 🎬 **演示视频**：待补充（B 站链接）
+> - 📦 **立创开源硬件平台工程**：[https://oshwhub.com/zeruns/xt60-power-meter-esp32](https://oshwhub.com/zeruns/xt60-power-meter-esp32)
+> - 🔗 **Gitee仓库地址**：[https://gitee.com/zeruns/xt60-power-meter](https://gitee.com/zeruns/xt60-power-meter)
+> - 🔗 **GitHub 仓库地址**：[https://github.com/zeruns/xt60-power-meter](https://github.com/zeruns/xt60-power-meter)
+> - 💬 电子交流社区：[https://bbs.eeclub.top/](https://bbs.eeclub.top/)
+> - 📖 作者博客：[https://blog.zeruns.com/](https://blog.zeruns.com/)
+> - 💬 电子/单片机技术交流QQ群：[307449735](https://qm.qq.com/q/VLwqDaY508)
+> - 🇬🇧 **English**: [README.en.md](README.en.md)
 
 
 
